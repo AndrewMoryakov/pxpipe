@@ -128,6 +128,43 @@ describe('gateway end-to-end routing (stubbed fetch)', () => {
     expect(cap.url).toBe(`${FAKE_BASE}/openai/responses`);
   });
 
+  it('routes ChatGPT-authenticated Codex Responses traffic to the OpenAI upstream and transforms it', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await createProxy({
+      upstream: 'https://api.anthropic.example.test',
+      openAIUpstream: 'https://chatgpt.example.test',
+      transform: { charsPerToken: 1, minCompressChars: 1 },
+    })(
+      new Request('http://localhost/backend-api/codex/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer chatgpt-token' },
+        body: JSON.stringify({
+          model: 'gpt-5.6-terra',
+          instructions: 'System instructions. '.repeat(700),
+          input: 'hi',
+        }),
+      }),
+    );
+    expect(cap.url).toBe('https://chatgpt.example.test/backend-api/codex/responses');
+    expect(cap.headers?.get('authorization')).toBe('Bearer chatgpt-token');
+  });
+
+  it('forwards the ChatGPT Codex model catalogue to the OpenAI upstream', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    await createProxy({
+      upstream: 'https://api.anthropic.example.test',
+      openAIUpstream: 'https://chatgpt.example.test',
+    })(
+      new Request('http://localhost/backend-api/codex/models?client_version=0.144.0', {
+        headers: { authorization: 'Bearer chatgpt-token' },
+      }),
+    );
+    expect(cap.url).toBe('https://chatgpt.example.test/backend-api/codex/models?client_version=0.144.0');
+    expect(cap.headers?.get('authorization')).toBe('Bearer chatgpt-token');
+  });
+
   it('passes unrecognized Anthropic-family paths through untouched', async () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);

@@ -176,16 +176,20 @@ describe('serveFragment', () => {
     dash.handleCompressionToggle({ enabled: true });
   });
 
-  it('renders and mutates GPT 5.5/5.6 chips via the single model scope', async () => {
+  it('renders Claude and GPT chips together and mutates GPT 5.5/5.6 via the single model scope', async () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null); // reset to built-in default (Fable 5 + GPT 5.6)
       const on = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(on).toContain('Image GPT models');
+      expect(on).toContain('Image models (Claude + GPT)');
+      expect(on).toContain('Fable 5 ✓');
       // GPT 5.6 is on by default; GPT 5.5 is opt-in (off until toggled).
       expect(on).toContain('GPT 5.6 ✓');
+      expect(on).toContain('GPT 5.6 Terra</button>');
+      expect(on).toContain('GPT 5.6 Sol</button>');
       expect(on).toContain('GPT 5.5</button>');
+      expect(on).not.toContain('display:none');
       // GPT 5.6 renders to the left of GPT 5.5.
       expect(on.indexOf('GPT 5.6')).toBeLessThan(on.indexOf('GPT 5.5'));
       expect(getAllowedModelBases()).toContain('gpt-5.6');

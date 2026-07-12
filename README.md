@@ -55,6 +55,39 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+### Codex with a ChatGPT subscription
+
+Codex signed in through ChatGPT normally uses a WebSocket directly to
+`chatgpt.com`, so setting `OPENAI_BASE_URL` alone does not send its requests
+through pxpipe. Use a Codex profile that selects pxpipe as a custom provider
+and explicitly disables WebSockets; Codex then uses the normal Responses API
+over SSE, which pxpipe can transform.
+
+Start pxpipe with ChatGPT as its OpenAI upstream:
+
+```powershell
+$env:OPENAI_UPSTREAM = 'https://chatgpt.com'
+pnpm dev:node
+```
+
+Create `~/.codex/pxpipe.config.toml`:
+
+```toml
+model_provider = "pxpipe"
+
+[model_providers.pxpipe]
+name = "pxpipe via ChatGPT"
+base_url = "http://127.0.0.1:47821/backend-api/codex"
+requires_openai_auth = true
+supports_websockets = false
+wire_api = "responses"
+```
+
+Then run `codex --profile pxpipe`. `requires_openai_auth = true` reuses the
+existing ChatGPT sign-in; do not put ChatGPT tokens in the pxpipe config. The
+active model must be included in `PXPIPE_MODELS` (the default `gpt-5.6` also
+matches Codex aliases such as `gpt-5.6-terra`).
+
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:

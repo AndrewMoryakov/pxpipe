@@ -82,10 +82,9 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7' },
   { id: 'claude-sonnet-5', label: 'Sonnet 5' },
   { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-];
-
-const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'gpt-5.6', label: 'GPT 5.6' },
+  { id: 'gpt-5.6-terra', label: 'GPT 5.6 Terra' },
+  { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol' },
   { id: 'gpt-5.5', label: 'GPT 5.5' },
 ];
 
@@ -95,16 +94,13 @@ export function renderModelsFragment(
   enabled: boolean,
 ): string {
   const on = new Set(active);
-  const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG].map((m) => [m.id, m.label]),
-  );
+  const labelOf = new Map(MODEL_CATALOG.map((m) => [m.id, m.label]));
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split by family for the two sections.
+  // models always show as toggles.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
     ...MODEL_CATALOG.map((m) => m.id),
-    ...GPT_MODEL_CATALOG.map((m) => m.id),
     ...configured,
     ...active,
   ]) {
@@ -122,19 +118,13 @@ export function renderModelsFragment(
       `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
     );
   };
-  const claudeChips = ids.filter((id) => !id.startsWith('gpt')).map(chipFor).join('');
-  const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
+  const chips = ids.map(chipFor).join('');
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   return (
     `<div class="models">` +
-    `<span class="models-label">Image Claude models</span>` +
-    claudeChips +
-    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
-    `</div>` +
-    `<div class="models" style="display:none">` +
-    `<span class="models-label">Image GPT models</span>` +
-    gptChips +
-    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
+    `<span class="models-label">Image models (Claude + GPT)</span>` +
+    chips +
+    `<span class="hint">everything else is sent as normal text · runtime only · one scope for all families · persist with PXPIPE_MODELS</span>${moot}` +
     `</div>`
   );
 }

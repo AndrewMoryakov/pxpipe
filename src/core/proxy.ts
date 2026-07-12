@@ -515,7 +515,18 @@ function isOpenAIChatPath(pathname: string): boolean {
 function isOpenAIResponsesPath(pathname: string): boolean {
   return pathname === '/v1/responses'
     || pathname === '/openai/v1/responses'
-    || pathname === '/openai/responses';
+    || pathname === '/openai/responses'
+    || pathname === '/backend-api/codex/responses';
+}
+
+/** ChatGPT endpoints used by Codex when `requires_openai_auth = true` is set
+ * on a custom provider. They must go to OPENAI_UPSTREAM, never the Anthropic
+ * default. Only `responses` is transformed; the models catalogue is forwarded
+ * byte-for-byte so Codex can refresh its model list without noisy 404s. */
+function isChatGPTCodexPath(pathname: string): boolean {
+  return pathname === '/backend-api/codex/responses'
+    || pathname === '/backend-api/codex/models'
+    || pathname.startsWith('/backend-api/codex/models/');
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
@@ -524,6 +535,7 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
+    || isChatGPTCodexPath(pathname)
     || (isModelsPath && looksOpenAIAuth);
 }
 
