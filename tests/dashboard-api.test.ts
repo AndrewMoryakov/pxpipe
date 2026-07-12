@@ -15,6 +15,7 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
+import { renderPage } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -176,31 +177,35 @@ describe('serveFragment', () => {
     dash.handleCompressionToggle({ enabled: true });
   });
 
-  it('renders Claude and GPT chips together and mutates GPT 5.5/5.6 via the single model scope', async () => {
+  it('renders opt-in GPT chips, including Codex Terra, and mutates the single model scope', async () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
       delete process.env.PXPIPE_MODELS;
-      setAllowedModelBases(null); // reset to built-in default (Fable 5 + GPT 5.6)
-      const on = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(on).toContain('Image models (Claude + GPT)');
-      expect(on).toContain('Fable 5 ✓');
-      // GPT 5.6 is on by default; GPT 5.5 is opt-in (off until toggled).
-      expect(on).toContain('GPT 5.6 ✓');
-      expect(on).toContain('GPT 5.6 Terra</button>');
-      expect(on).toContain('GPT 5.6 Sol</button>');
-      expect(on).toContain('GPT 5.5</button>');
-      expect(on).not.toContain('display:none');
-      // GPT 5.6 renders to the left of GPT 5.5.
-      expect(on.indexOf('GPT 5.6')).toBeLessThan(on.indexOf('GPT 5.5'));
-      expect(getAllowedModelBases()).toContain('gpt-5.6');
+      setAllowedModelBases(null); // reset to built-in Fable-only default
+      const off = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(off).toContain('Image GPT models');
+      expect(off).not.toContain('<div class="models" style="display:none">');
+      expect(off).toContain('>GPT 5.6</button>');
+      expect(off).toContain('GPT 5.6 Terra</button>');
+      expect(off).toContain('GPT 5.6 Sol</button>');
+      expect(off).toContain('GPT 5.5</button>');
+      expect(off.indexOf('GPT 5.6 Terra')).toBeLessThan(off.indexOf('GPT 5.6 Sol'));
+      expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
+      expect(getAllowedModelBases()).toContain('claude-fable-5');
+      expect(getAllowedModelBases()).not.toContain('grok-4.5');
+      expect(getAllowedModelBases()).not.toContain('gpt-5.6-sol');
       expect(getAllowedModelBases()).not.toContain('gpt-5.5');
 
+      dash.handleModelsToggle('gpt-5.6-terra', true);
+      dash.handleModelsToggle('gpt-5.6-sol', true);
       dash.handleModelsToggle('gpt-5.5', true);
       const onBoth = await (await dash.serveFragment('models', url, 1234)).text();
       expect(onBoth).toContain('GPT 5.5 ✓');
-      expect(onBoth).toContain('GPT 5.6 ✓');
+      expect(onBoth).toContain('GPT 5.6 Terra ✓');
+      expect(onBoth).toContain('GPT 5.6 Sol ✓');
       expect(getAllowedModelBases()).toContain('gpt-5.5');
-      expect(getAllowedModelBases()).toContain('gpt-5.6');
+      expect(getAllowedModelBases()).toContain('gpt-5.6-terra');
+      expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -222,6 +227,65 @@ describe('serveFragment', () => {
     expect(stats).toContain('requests');
   });
 
+  it('shows the OpenAI Responses composition in request Details', async () => {
+    dash.update({
+      method: 'POST', path: '/v1/responses', model: 'gpt-5.6-sol', status: 200,
+      durationMs: 1,
+      usage: { input_tokens: 500000, output_tokens: 10, cached_tokens: 490000 },
+      info: {
+        compressed: true, imageCount: 1, imagePngs: [new Uint8Array([1])],
+        imageDims: [{ width: 10, height: 10 }], imageTokens: 15000,
+        baselineImagedTokens: 56000, bucketChars: { history: 200000 },
+        responsesComposition: {
+          instructions: 1000, systemDeveloper: 2000, userAssistant: 450000,
+          functionCalls: 1000, functionOutputs: 20000, reasoningEncrypted: 5000,
+          compactionOpaque: 3000, toolsJson: 12000, other: 1000,
+          totalLocal: 495000, imageParts: 0,
+          completedFunctionPairs: 25, recentNativeFunctionPairs: 6,
+          oldFunctionPairs: 19, openFunctionCalls: 1,
+          imageableFunctionCalls: 900, imageableFunctionOutputs: 19000,
+          collapsedFunctionPairs: 10, collapsedFunctionCalls: 500,
+          collapsedFunctionOutputs: 12000,
+        },
+      } as never,
+    });
+    const html = await (await dash.serveFragment('context-map', new URL('http://localhost/fragments/context-map'), 1)).text();
+    expect(html).toContain('Original Responses composition');
+    expect(html).toContain('Reasoning / encrypted items');
+    expect(html).toContain('Native tool JSON');
+    expect(html).toContain('Function outputs eligible in old closed pairs');
+    expect(html).toContain('Function outputs actually imaged this request');
+    expect(html).toContain('Adjacent completed pairs');
+    expect(html).toContain('Open calls kept native');
+    expect(html).toContain('56.0k tok');
+    expect(html).toContain('sent to gpt-5.6-sol');
+    expect(html).toContain('Model reply (output)');
+    expect(html).toContain('never calls Anthropic /count_tokens');
+  });
+
+  it('renders keyboard-accessible hover help for stat question marks', async () => {
+    const header = await (await dash.serveFragment('header', url, 4711)).text();
+    expect(header).toContain('class="q" tabindex="0"');
+    expect(header).toContain('data-tip=');
+    expect(header).toContain('aria-label=');
+  });
+
+  it('uses source text parallel to each captured PNG', async () => {
+    const ids = dash.captureImage({
+      imagePngs: [new Uint8Array([1]), new Uint8Array([2])],
+      imageDims: [{ width: 10, height: 10 }, { width: 20, height: 20 }],
+      imageSourceText: 'legacy shared',
+      imageSourceTexts: ['slab source', 'history section source'],
+    } as never);
+    const html = await (await dash.serveFragment(
+      'latest',
+      new URL(`http://localhost/fragments/latest?source=1&pin=${ids[1]}`),
+      1,
+    )).text();
+    expect(html).toContain('history section source');
+    expect(html).not.toContain('slab source');
+  });
+
   it('escapes HTML in latest source text', async () => {
     dash.captureImage({
       imagePngs: [new Uint8Array([137, 80, 78, 71])],
@@ -237,6 +301,14 @@ describe('serveFragment', () => {
   it('404s unknown fragments', async () => {
     const res = await dash.serveFragment('nope', url, 1);
     expect(res.status).toBe(404);
+  });
+});
+
+describe('dashboard page help UI', () => {
+  it('ships visible hover/focus tooltip CSS for question-mark controls', () => {
+    const html = renderPage(47821);
+    expect(html).toContain('.q:hover::after, .q:focus-visible::after');
+    expect(html).toContain('content: attr(data-tip)');
   });
 });
 

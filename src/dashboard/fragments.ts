@@ -82,10 +82,19 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7' },
   { id: 'claude-sonnet-5', label: 'Sonnet 5' },
   { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+];
+
+const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  // Terra is used by the local Codex provider. Keep it explicit so it is
+  // discoverable in the GPT section rather than falling into "other" models.
   { id: 'gpt-5.6', label: 'GPT 5.6' },
   { id: 'gpt-5.6-terra', label: 'GPT 5.6 Terra' },
   { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol' },
   { id: 'gpt-5.5', label: 'GPT 5.5' },
+];
+
+const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
 export function renderModelsFragment(
@@ -94,13 +103,17 @@ export function renderModelsFragment(
   enabled: boolean,
 ): string {
   const on = new Set(active);
-  const labelOf = new Map(MODEL_CATALOG.map((m) => [m.id, m.label]));
+  const labelOf = new Map(
+    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
+  );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // models always show as toggles.
+  // families always show as toggles, then split by family for the two sections.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
     ...MODEL_CATALOG.map((m) => m.id),
+    ...GPT_MODEL_CATALOG.map((m) => m.id),
+    ...GROK_MODEL_CATALOG.map((m) => m.id),
     ...configured,
     ...active,
   ]) {
@@ -118,13 +131,30 @@ export function renderModelsFragment(
       `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
     );
   };
-  const chips = ids.map(chipFor).join('');
+  const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
+  const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
+  const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
+  const otherChips = ids
+    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
+    .map(chipFor)
+    .join('');
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   return (
     `<div class="models">` +
-    `<span class="models-label">Image models (Claude + GPT)</span>` +
-    chips +
-    `<span class="hint">everything else is sent as normal text · runtime only · one scope for all families · persist with PXPIPE_MODELS</span>${moot}` +
+    `<span class="models-label">Image Claude models</span>` +
+    claudeChips +
+    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">Image Grok models</span>` +
+    grokChips +
+    otherChips +
+    `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">Image GPT models</span>` +
+    gptChips +
+    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
     `</div>`
   );
 }
@@ -201,10 +231,11 @@ function statTile(
   cls = '',
   tip = '',
 ): string {
-  const t = tip ? ` title="${escapeHtml(tip)}"` : '';
-  const q = tip ? `<span class="q">?</span>` : '';
+  const q = tip
+    ? `<span class="q" tabindex="0" aria-label="${escapeHtml(tip)}" data-tip="${escapeHtml(tip)}">?</span>`
+    : '';
   return (
-    `<div class="tile"${t}>` +
+    `<div class="tile">` +
     `<div class="tile-label">${label}${q}</div>` +
     `<div class="tile-value ${cls}">${value}</div>` +
     `<div class="tile-sub">${sub}</div>` +
@@ -345,9 +376,26 @@ export interface ContextMapData {
   // on the same cache state as the image path; no wall-clock-only inference.
   output: number;
   imageCount: number;
+  baselineImagedTokens?: number;
   buckets: Partial<Record<string, number>>; // bucket → chars rendered to PNG
   imageIds: number[]; // image-ring ids for the gallery
   compressed: boolean;
+  model?: string;
+  responsesComposition?: {
+    instructions: number; systemDeveloper: number; userAssistant: number;
+    functionCalls: number; functionOutputs: number; reasoningEncrypted: number;
+    compactionOpaque: number; toolsJson: number; other: number;
+    totalLocal: number; imageParts: number;
+    completedFunctionPairs?: number; recentNativeFunctionPairs?: number;
+    oldFunctionPairs?: number; openFunctionCalls?: number;
+    orphanFunctionOutputs?: number; malformedFunctionItems?: number;
+    imageableFunctionCalls?: number; imageableFunctionOutputs?: number;
+    collapsedFunctionPairs?: number; collapsedFunctionCalls?: number;
+    collapsedFunctionOutputs?: number;
+  };
+  /** Difference between the provider text counterfactual and local o200k buckets.
+   * Can include envelope, tokenizer, and server-side additions. */
+  responsesUnexplainedTokens?: number;
   restored?: boolean; // rebuilt from JSONL after a restart — PNG thumbnails are gone
 }
 
@@ -395,9 +443,39 @@ export function renderContextMapFragment(
     )
     .join('');
 
+  const rc = c.responsesComposition;
+  const responseRows: ReadonlyArray<readonly [string, number]> = rc
+    ? [
+        ['Instructions', rc.instructions],
+        ['System / developer items', rc.systemDeveloper],
+        ['User / assistant text kept native', rc.userAssistant],
+        ['Native tool JSON', rc.toolsJson],
+        ['Function calls', rc.functionCalls],
+        ['Function outputs', rc.functionOutputs],
+        ['Function outputs eligible in old closed pairs', rc.imageableFunctionOutputs ?? 0],
+        ['Function outputs actually imaged this request', rc.collapsedFunctionOutputs ?? 0],
+        ['Reasoning / encrypted items', rc.reasoningEncrypted],
+        ['Compaction / opaque items', rc.compactionOpaque],
+        ['Other Responses items', rc.other],
+      ]
+    : [];
+  const responseBreakdown = rc
+    ? `<div class="split-note" style="margin-top:12px"><strong>Original Responses composition (local o200k estimate)</strong></div>` +
+      responseRows.filter(([, n]) => n > 0).map(([label, n]) =>
+        `<div class="ctx-row"><span class="ctx-lbl">${label}</span><span class="ctx-val">${kFmt(n)} tok</span></div>`,
+      ).join('') +
+      `<div class="ctx-row"><span class="ctx-lbl">Imageable text baseline</span><span class="ctx-val">${kFmt(c.baselineImagedTokens ?? 0)} tok</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Adjacent completed pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Open calls kept native</span><span class="ctx-val">${rc.openFunctionCalls ?? 0}</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Native image parts</span><span class="ctx-val">${rc.imageParts}</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Provider tokens not explained locally</span><span class="ctx-val">${kFmt(c.responsesUnexplainedTokens ?? 0)} tok</span></div>` +
+      `<div class="split-note">This diagnostic uses local o200k counts only; it never calls Anthropic /count_tokens.</div>`
+    : '';
+
   const ids = c.imageIds ?? [];
+  const modelLabel = c.model ? escapeHtml(c.model) : 'the model';
   const gallery = ids.length
-    ? `<div class="pages-title">${ids.length} image page${ids.length === 1 ? '' : 's'} sent to Claude — click one to read the exact text behind it:</div>` +
+    ? `<div class="pages-title">${ids.length} image page${ids.length === 1 ? '' : 's'} sent to ${modelLabel} — click one to read the exact text behind it:</div>` +
       `<div class="pages">` +
       ids
         .map(
@@ -450,10 +528,11 @@ export function renderContextMapFragment(
     `<div class="split-col split-txt">` +
     `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
     `<div class="ctx-row"><span class="ctx-lbl">Your latest messages</span><span class="ctx-val">verbatim</span></div>` +
-    `<div class="ctx-row"><span class="ctx-lbl">Claude's reply (output)</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
+    `<div class="ctx-row"><span class="ctx-lbl">Model reply (output)</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
     `<div class="split-note">never imaged — safe for IDs, hashes and exact numbers.</div>` +
     `</div>` +
     `</div>` +
+    responseBreakdown +
     gallery +
     `</div>`
   );
@@ -804,7 +883,18 @@ const CSS = `
   .tile-sub { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
   .q { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
     border-radius: 50%; background: var(--surface-2); border: 1px solid var(--border-strong);
-    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; }
+    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; position: relative; outline: none; }
+  .q:hover, .q:focus-visible { color: var(--flame-ink); border-color: var(--flame); }
+  .q::after { content: attr(data-tip); position: absolute; z-index: 50; left: 50%; bottom: calc(100% + 8px);
+    width: min(280px, 75vw); transform: translate(-50%, 4px); padding: 8px 10px; border-radius: 7px;
+    background: var(--ink); color: var(--surface); box-shadow: var(--shadow); font-size: 11px; font-weight: 500;
+    line-height: 1.4; text-align: left; pointer-events: none; opacity: 0; visibility: hidden;
+    transition: opacity .12s, transform .12s, visibility .12s; }
+  .q::before { content: ''; position: absolute; z-index: 51; left: 50%; bottom: calc(100% + 3px);
+    transform: translateX(-50%); border: 5px solid transparent; border-top-color: var(--ink);
+    pointer-events: none; opacity: 0; visibility: hidden; transition: opacity .12s, visibility .12s; }
+  .q:hover::after, .q:focus-visible::after { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
+  .q:hover::before, .q:focus-visible::before { opacity: 1; visibility: visible; }
 
   /* drawer */
   .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);

@@ -10,33 +10,39 @@ import {
   renderTextToPngs,
   reflow,
   shrinkColsToContent,
+  renderCellWidth,
+  renderCellHeight,
   PAD_X,
-  CELL_W,
+  PAD_Y,
+  READABLE_CHARS_PER_IMAGE,
   type RenderedImage,
 } from './render.js';
 import {
   resolveGptProfile,
-  DEFAULT_GPT_STRIP_COLS,
   type GptVisionCost,
 } from './gpt-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
+  countVisualRows,
   estimateImageCount,
   sha8,
+  ANTHROPIC_PIXELS_PER_TOKEN,
+  IMAGE_COST_SAFETY_MARGIN,
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
   planGptCollapse,
-  responsesItemsToTurns,
+  planResponsesPairCollapse,
   chatMessagesToTurns,
+  GPT_HISTORY_DEFAULTS,
   type GptCollapsePlan,
   type GptHistoryOptions,
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
-import { factSheetText } from './factsheet.js';
+import { appendIdsBlock, factSheetText } from './factsheet.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -100,6 +106,36 @@ export function openAIVisionTokens(model: string, w: number, h: number): number 
   if (Math.max(W, H) > 2048) { const r = 2048 / Math.max(W, H); W = Math.floor(W * r); H = Math.floor(H * r); }
   if (Math.min(W, H) > 768) { const r = 768 / Math.min(W, H); W = Math.floor(W * r); H = Math.floor(H * r); }
   return c.base + c.perTile * (Math.ceil(W / 512) * Math.ceil(H / 512));
+}
+
+/** True when this Responses/Chat request is actually served by a Claude model.
+ *  Codex-style clients speak OpenAI Responses while some models are Anthropic.
+ *  Cost math must then price images and cache the Anthropic way, not the GPT way. */
+export function isClaudeModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('claude') || m.includes('anthropic');
+}
+
+export function isGrokModel(model: string | null | undefined): boolean {
+  return (model ?? '').toLowerCase().startsWith('grok-');
+}
+
+/** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
+ *  across several page sizes (768x336 → 268, 764x980 → 748, etc.). */
+export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
+
+/** Per-image vision-token cost for the model actually serving the request.
+ *  Claude: Anthropic pixel formula. Grok: measured tok/MPix. GPT/o-series:
+ *  OpenAI tile/patch formula. Model-based, not endpoint-based. */
+export function visionTokensForModel(model: string, w: number, h: number): number {
+  if (isClaudeModel(model)) {
+    return Math.ceil((w * h / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
+  }
+  if (isGrokModel(model)) {
+    const pixels = Math.max(0, w) * Math.max(0, h);
+    return Math.max(1, Math.ceil((pixels / 1_000_000) * GROK_TOKENS_PER_MEGAPIXEL));
+  }
+  return openAIVisionTokens(model, w, h);
 }
 
 type OpenAIRole = 'system' | 'developer' | 'user' | 'assistant' | 'tool' | string;
@@ -186,7 +222,7 @@ interface OpenAIResolvedOptions {
   compress: boolean;
   compressTools: boolean;
   minCompressChars: number;
-  cols: number;
+  cols?: number;
   multiCol: number;
   charsPerToken: number;
   reflow: boolean;
@@ -198,7 +234,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   compress: true,
   compressTools: true,
   minCompressChars: 2000,
-  cols: DEFAULT_GPT_STRIP_COLS,
+  cols: undefined,
   multiCol: 1,
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
@@ -210,12 +246,44 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     compress: opts.compress ?? DEFAULTS.compress,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
-    cols: opts.cols ?? DEFAULTS.cols,
+    cols: opts.cols,
     multiCol: opts.multiCol ?? DEFAULTS.multiCol,
     charsPerToken: opts.charsPerToken ?? DEFAULTS.charsPerToken,
     reflow: opts.reflow ?? DEFAULTS.reflow,
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
     gptHistory: opts.gptHistory,
+  };
+}
+
+
+/** History-collapse options for both Chat and Responses. Profile geometry is
+ *  the single source of truth; Grok allows more pages because leftover plain
+ *  history is expensive on its pixel bill + weak cache discount. */
+function configuredHistoryMaxImages(model: string): number {
+  const fallback = isGrokModel(model) ? 24 : GPT_HISTORY_DEFAULTS.maxImages;
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_GPT_HISTORY_MAX_IMAGES : undefined;
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  // Responses providers impose their own total image caps. Keep a defensive ceiling
+  // while allowing long Sol sessions to opt into substantially more coverage.
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(100, parsed)) : fallback;
+}
+
+function gptHistoryOpts(
+  model: string,
+  o: OpenAIResolvedOptions,
+  profile: ReturnType<typeof resolveGptProfile>,
+): Partial<GptHistoryOptions> {
+  return {
+    ...o.gptHistory,
+    reflow: o.reflow,
+    cols: o.gptHistory?.cols ?? profile.stripCols,
+    maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
+    style: o.gptHistory?.style ?? profile.style,
+    maxImages: o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model),
+    // Production path for every family: isolated IDS rows in the image plus the
+    // adjacent text factsheet. Opt out per request with gptHistory.idsBlock: false.
+    idsBlock: o.gptHistory?.idsBlock ?? true,
   };
 }
 
@@ -232,6 +300,13 @@ function emptyInfo(reason?: string): TransformInfo {
     dynamicBlockCount: 0,
     droppedChars: 0,
   };
+}
+
+/** Append IDS block so precision tokens get isolated pure-image rows (all models).
+ *  Production also attaches factSheetText next to images (see slab/history below).
+ *  IDS alone is not enough for Grok exact recall on live multi-seed. */
+function prepareImagedRenderText(text: string): string {
+  return appendIdsBlock(text);
 }
 
 function maybeReflow(text: string, enabled: boolean): string {
@@ -423,6 +498,70 @@ function countOutgoingTextChars(req: OpenAIChatRequest): number {
  *  input_text parts) + flat tool name/description/parameters. input_image base64
  *  is excluded on purpose — it is image cost, not text (responsesContentText
  *  already drops non-text parts). */
+type ResponsesComposition = NonNullable<TransformInfo['responsesComposition']>;
+
+/** Local o200k decomposition of the original Responses request. This is
+ * diagnostic only and never calls Anthropic/provider count_tokens. */
+function measureResponsesComposition(
+  req: ResponsesRequest,
+  inputWasString: boolean,
+  originalInputString: string | undefined,
+  inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
+): ResponsesComposition {
+  const c: ResponsesComposition = {
+    instructions: gptTextTokens(typeof req.instructions === 'string' ? req.instructions : ''),
+    systemDeveloper: 0,
+    userAssistant: 0,
+    functionCalls: 0,
+    functionOutputs: 0,
+    reasoningEncrypted: 0,
+    compactionOpaque: 0,
+    toolsJson: Array.isArray(req.tools) ? gptTextTokens(JSON.stringify(req.tools)) : 0,
+    other: 0,
+    totalLocal: 0,
+    imageParts: 0,
+  };
+  if (inputWasString) {
+    c.userAssistant += gptTextTokens(originalInputString ?? '');
+  }
+  const countImages = (content: unknown): number => {
+    if (!Array.isArray(content)) return 0;
+    return content.filter((p) => {
+      const type = (p as { type?: unknown } | null)?.type;
+      return type === 'input_image' || type === 'image' || type === 'output_image';
+    }).length;
+  };
+  for (const item of inputItems) {
+    const o = item as Record<string, unknown>;
+    const type = typeof o.type === 'string' ? o.type : '';
+    const role = typeof o.role === 'string' ? o.role : '';
+    c.imageParts += countImages(o.content);
+    if (role === 'system' || role === 'developer') {
+      c.systemDeveloper += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
+    } else if (role === 'user' || role === 'assistant') {
+      c.userAssistant += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
+    } else if (type === 'function_call') {
+      c.functionCalls += gptTextTokens(JSON.stringify(o));
+    } else if (type === 'function_call_output') {
+      c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+    } else if (type === 'reasoning') {
+      // Includes encrypted_content when present; this is often a large Codex-native bucket.
+      c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
+    } else if (
+      type === 'compaction' || type === 'compaction_trigger' ||
+      type === 'context_compaction' || type === 'item_reference'
+    ) {
+      c.compactionOpaque += gptTextTokens(JSON.stringify(o));
+    } else if (!role && type) {
+      c.other += gptTextTokens(JSON.stringify(o));
+    }
+  }
+  c.totalLocal = c.instructions + c.systemDeveloper + c.userAssistant +
+    c.functionCalls + c.functionOutputs + c.reasoningEncrypted +
+    c.compactionOpaque + c.toolsJson + c.other;
+  return c;
+}
+
 function countResponsesOutgoingTextChars(req: ResponsesRequest): number {
   let n = 0;
   if (typeof req.instructions === 'string') n += req.instructions.length;
@@ -463,18 +602,62 @@ function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<st
   return out;
 }
 
-/** Shared gate: compute image vs text token cost and decide profitability. */
+/** Shared gate: image vs text token cost → profitability.
+ *
+ *  Text defaults to o200k (same baseline as savings math). Pass a non-default
+ *  `charsPerToken` to force the length/cpt lever (tests use 1). Images bill full
+ *  pages at maxHeight and the last page at residual height — charging every page
+ *  as a full strip over-states cost and blocks profitable collapses. */
 function evalOpenAIGate(
   model: string,
   renderedText: string,
   cols: number,
   charsPerToken: number,
 ): { imageTokens: number; textTokens: number; profitable: boolean } {
-  const stripW = 2 * PAD_X + cols * CELL_W;
-  const estImages = estimateImageCount(renderedText, cols, 1);
-  const perStrip = openAIVisionTokens(model, stripW, resolveGptProfile(model).maxHeightPx);
-  const imageTokens = estImages * perStrip;
-  const textTokens = renderedText.length / charsPerToken;
+  const profile = resolveGptProfile(model);
+  const style = profile.style;
+  const cellW = renderCellWidth(style);
+  const cellH = renderCellHeight(style);
+  const stripW = 2 * PAD_X + cols * cellW;
+  const maxLines = Math.max(1, Math.floor((profile.maxHeightPx - 2 * PAD_Y) / cellH));
+  const maxCharsPerImage = Math.min(
+    READABLE_CHARS_PER_IMAGE,
+    Math.max(1, cols) * maxLines,
+  );
+  const linesPerImage = Math.min(
+    maxLines,
+    Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols))),
+  );
+  const estImages = estimateImageCount(
+    renderedText,
+    cols,
+    1,
+    maxCharsPerImage,
+    maxLines,
+  );
+  // Last page: residual soft-wrapped rows, not a full strip.
+  const visualRows = countVisualRows(renderedText, cols);
+  const lastPageLines = estImages <= 1
+    ? Math.min(linesPerImage, Math.max(1, visualRows))
+    : Math.min(
+        linesPerImage,
+        Math.max(1, visualRows - (estImages - 1) * linesPerImage),
+      );
+  const lastPageHeight = Math.min(
+    profile.maxHeightPx,
+    2 * PAD_Y + lastPageLines * cellH,
+  );
+  const fullPageTokens = visionTokensForModel(model, stripW, profile.maxHeightPx);
+  const lastPageTokens = visionTokensForModel(model, stripW, lastPageHeight);
+  const imageTokens =
+    estImages <= 1
+      ? lastPageTokens
+      : (estImages - 1) * fullPageTokens + lastPageTokens;
+  // Default: o200k. Non-default charsPerToken keeps the force/override lever.
+  const textTokens =
+    charsPerToken === DEFAULTS.charsPerToken
+      ? Math.max(1, gptTextTokens(renderedText) || Math.ceil(renderedText.length / charsPerToken))
+      : renderedText.length / Math.max(1e-6, charsPerToken);
   return { imageTokens, textTokens, profitable: imageTokens < textTokens };
 }
 
@@ -511,7 +694,7 @@ function gptTextTokens(text: string): number {
  *  what GPT actually bills as input for the slab pxpipe imaged. */
 function gptImageTokens(model: string, images: RenderedImage[]): number {
   let n = 0;
-  for (const img of images) n += openAIVisionTokens(model, img.width, img.height);
+  for (const img of images) n += visionTokensForModel(model, img.width, img.height);
   return n;
 }
 
@@ -565,6 +748,11 @@ function foldGptHistory(
   info.imageDims = [
     ...(info.imageDims ?? []),
     ...allImages.map((i) => ({ width: i.width, height: i.height })),
+  ];
+  info.imageSourceTexts = [
+    ...(info.imageSourceTexts ?? []),
+    ...plan.imageSources,
+    ...plan.imageSourcesAfter,
   ];
   if (plan.droppedChars > 0) info.droppedChars = (info.droppedChars ?? 0) + plan.droppedChars;
   info.collapsedTurns = plan.collapsedTurns;
@@ -657,8 +845,13 @@ export async function transformOpenAIChatCompletions(
     ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
     : '';
   const header = CHAT_HEADER.replace('\n====', reflowNote + '\n====');
-  const renderedText = header + combined;
-  const cols = Math.min(shrinkColsToContent(renderedText, o.cols), resolveGptProfile(req.model).stripCols);
+  const renderedText = prepareImagedRenderText(header + combined);
+  const profile = resolveGptProfile(req.model);
+  const maxCols = o.cols ?? profile.stripCols;
+  const cols = Math.min(
+    shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
+    profile.stripCols,
+  );
 
   const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
   info.gateEval = {
@@ -675,7 +868,7 @@ export async function transformOpenAIChatCompletions(
     return { body, info };
   }
 
-  const images = await renderTextToPngs(renderedText, cols, {}, resolveGptProfile(req.model).maxHeightPx);
+  const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
     return { body, info };
@@ -700,6 +893,10 @@ export async function transformOpenAIChatCompletions(
   info.firstImageHeight = images[0]!.height;
   info.imagePngs = images.map((img) => img.png);
   info.imageDims = images.map((img) => ({ width: img.width, height: img.height }));
+  // One slab render may page into multiple PNGs; each page links to the same
+  // rendered source. History sources are appended later by foldGptHistory.
+  info.imageSourceText = renderedText.slice(0, 65_536);
+  info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   // Verbatim fact-sheet: precision-critical tokens (paths, ids, versions, flags)
   // pulled from the pre-image text so exact strings survive OCR loss. Deterministic
@@ -732,12 +929,12 @@ export async function transformOpenAIChatCompletions(
     const turns = chatMessagesToTurns(req.messages);
     const profitable = (text: string, cols: number) =>
       evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
-    const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, {
-      ...o.gptHistory,
-      reflow: o.reflow,
-      cols: o.gptHistory?.cols ?? resolveGptProfile(req.model).stripCols,
-      maxHeightPx: o.gptHistory?.maxHeightPx ?? resolveGptProfile(req.model).maxHeightPx,
-    });
+    const plan = await planGptCollapse(
+      turns,
+      firstUserIdx + 1,
+      profitable,
+      gptHistoryOpts(req.model, o, profile),
+    );
     foldGptHistory(info, req.model, plan);
     const allImages = [...plan.images, ...plan.imagesAfter];
     if (allImages.length > 0) {
@@ -819,6 +1016,10 @@ export async function transformOpenAIResponses(
     return { body, info };
   }
 
+  info.responsesComposition = measureResponsesComposition(
+    req, inputWasString, originalInputString, inputItems,
+  );
+
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
   const systemTexts: string[] = [];
@@ -864,8 +1065,13 @@ export async function transformOpenAIResponses(
     ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
     : '';
   const header = RESPONSES_HEADER.replace('\n====', reflowNote + '\n====');
-  const renderedText = header + combined;
-  const cols = Math.min(shrinkColsToContent(renderedText, o.cols), resolveGptProfile(req.model).stripCols);
+  const renderedText = prepareImagedRenderText(header + combined);
+  const profile = resolveGptProfile(req.model);
+  const maxCols = o.cols ?? profile.stripCols;
+  const cols = Math.min(
+    shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
+    profile.stripCols,
+  );
 
   const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
   info.gateEval = {
@@ -882,7 +1088,7 @@ export async function transformOpenAIResponses(
     return { body, info };
   }
 
-  const images = await renderTextToPngs(renderedText, cols, {}, resolveGptProfile(req.model).maxHeightPx);
+  const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
     return { body, info };
@@ -905,6 +1111,10 @@ export async function transformOpenAIResponses(
   info.firstImageHeight = images[0]!.height;
   info.imagePngs = images.map((img) => img.png);
   info.imageDims = images.map((img) => ({ width: img.width, height: img.height }));
+  // One slab render may page into multiple PNGs; each page links to the same
+  // rendered source. History sources are appended later by foldGptHistory.
+  info.imageSourceText = renderedText.slice(0, 65_536);
+  info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
   const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
@@ -963,49 +1173,56 @@ export async function transformOpenAIResponses(
     }
   }
 
-  // Collapse the OLD conversation prefix into history image(s). The inserted slab
-  // item is protected; the transcript OpenCode resends every turn is the real cost.
-  // Skip for bare-string input (single message, nothing to collapse).
+  // Responses protocol state is not an ordinary contiguous conversation prefix:
+  // Codex interleaves message/reasoning items with native function_call/output items.
+  // Collapse ONLY old, unambiguously completed pairs. Recent completed pairs, open
+  // calls, reasoning/compaction, messages, and malformed/orphan items stay native.
   if (o.collapseHistory && !inputWasString) {
-    const turns = responsesItemsToTurns(inputItems);
     const profitable = (text: string, cols: number) =>
       evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
-    const plan = await planGptCollapse(turns, firstUserIdx + 1, profitable, {
-      ...o.gptHistory,
-      reflow: o.reflow,
-      cols: o.gptHistory?.cols ?? resolveGptProfile(req.model).stripCols,
-      maxHeightPx: o.gptHistory?.maxHeightPx ?? resolveGptProfile(req.model).maxHeightPx,
-    });
+    const plan = await planResponsesPairCollapse(
+      inputItems,
+      profitable,
+      gptHistoryOpts(req.model, o, profile),
+    );
+    const ps = plan.pairState;
+    const rc = info.responsesComposition!;
+    rc.completedFunctionPairs = ps.completedPairs;
+    rc.recentNativeFunctionPairs = ps.recentCompletedPairs;
+    rc.oldFunctionPairs = ps.oldCompletedPairs;
+    rc.openFunctionCalls = ps.openCalls;
+    rc.orphanFunctionOutputs = ps.orphanOutputs;
+    rc.malformedFunctionItems = ps.malformedItems;
+    rc.imageableFunctionCalls = ps.imageableFunctionCallTokens;
+    rc.imageableFunctionOutputs = ps.imageableFunctionOutputTokens;
+    rc.collapsedFunctionPairs = ps.collapsedPairs;
+    rc.collapsedFunctionCalls = ps.collapsedFunctionCallTokens;
+    rc.collapsedFunctionOutputs = ps.collapsedFunctionOutputTokens;
+
     foldGptHistory(info, req.model, plan);
-    const allImages = [...plan.images, ...plan.imagesAfter];
-    if (allImages.length > 0) {
-      // [intro][before-images][pinned request as TEXT][after-images][outro] —
-      // chronological, with the live ask legible (not OCR-only) in its real slot.
-      const content: ResponsesContentPart[] = [
-        { type: 'input_text', text: HISTORY_TRANSCRIPT_INTRO },
-      ];
-      for (const img of plan.images) content.push(responsesImagePart(img));
-      if (plan.pinText !== undefined) {
-        content.push({ type: 'input_text', text: pinnedRequestBlock(plan.pinText) });
-        for (const img of plan.imagesAfter) content.push(responsesImagePart(img));
+    if (plan.segments.length > 0) {
+      const replacements = new Map<number, ResponsesInputItem>();
+      for (const segment of plan.segments) {
+        const content: ResponsesContentPart[] = [
+          { type: 'input_text', text: HISTORY_TRANSCRIPT_INTRO },
+          ...segment.images.map(responsesImagePart),
+        ];
+        const sheet = factSheetText(segment.text);
+        if (sheet) content.push({ type: 'input_text', text: sheet });
+        content.push({ type: 'input_text', text: HISTORY_TRANSCRIPT_OUTRO });
+        replacements.set(segment.insertAt, { role: 'user', content });
       }
-      // Verbatim fact-sheet for the imaged transcript (exact ids survive OCR loss).
-      const histFactSheet = factSheetText(plan.text);
-      if (histFactSheet) content.push({ type: 'input_text', text: histFactSheet });
-      content.push({ type: 'input_text', text: HISTORY_TRANSCRIPT_OUTRO });
-      const synthetic: ResponsesInputItem = { role: 'user', content };
-      const guard: ResponsesInputItem = {
-        role: 'developer',
-        content: buildLiveRequestGuard(plan.pinText),
-      };
-      req.input = [
-        ...inputItems.slice(0, plan.start),
-        synthetic,
-        guard,
-        ...inputItems.slice(plan.endExclusive),
-      ];
+
+      const removed = new Set(plan.selectedIndices);
+      const rewritten: Array<ResponsesInputItem | Record<string, unknown>> = [];
+      for (let i = 0; i < inputItems.length; i++) {
+        const replacement = replacements.get(i);
+        if (replacement) rewritten.push(replacement);
+        if (!removed.has(i)) rewritten.push(inputItems[i]!);
+      }
+      req.input = rewritten;
       info.historyImageSha = await sha8(
-        allImages.map((i) => bytesToBase64(i.png)).join(''),
+        plan.images.map((image) => bytesToBase64(image.png)).join(''),
       );
     }
   }
