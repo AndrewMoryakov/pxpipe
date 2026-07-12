@@ -170,6 +170,13 @@ export const SLAB_CHARS_PER_TOKEN = 2.0;
 // when full docs move into the imaged Tool Reference (read-gate audit, 2026-07-03).
 const READ_FIRST_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 
+/** Provider-defined typed tools have their own schema contracts. In particular,
+ * some reject the generic `description` field that custom Anthropic tools use.
+ * Preserve them byte-for-byte until their type-specific contract is supported. */
+function isProviderTypedTool(tool: ToolDef): boolean {
+  return typeof (tool as unknown as Record<string, unknown>).type === 'string';
+}
+
 /** Empirical cpt for the history-collapse path (same Opus 4.7 telemetry as SLAB_CHARS_PER_TOKEN).
  *  History is even denser (tool_use JSON dominates), so 2.0 is doubly conservative. */
 export const HISTORY_CHARS_PER_TOKEN = 2.0;
@@ -1541,6 +1548,11 @@ export async function transformRequest(
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      // Claude Code can send built-in typed tools such as
+      // `advisor_20260301`. They are not custom tool definitions, and adding a
+      // stub description makes Anthropic reject the request. Keep their exact
+      // wire shape and exclude them from the custom-tool reference image.
+      if (isProviderTypedTool(t)) return t;
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare

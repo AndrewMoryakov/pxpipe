@@ -744,6 +744,35 @@ describe('transform', () => {
     expect(refHeader).toContain("this user's local proxy");
   });
 
+  it('preserves provider-typed tools that reject custom description fields', async () => {
+    const advisor = {
+      type: 'advisor_20260301',
+      name: 'advisor',
+      container: { id: 'preserve-this-wire-shape' },
+    };
+    const req = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        advisor,
+        {
+          name: 'CustomTool',
+          description: 'A custom tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+      ],
+    });
+
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    const out = JSON.parse(new TextDecoder().decode(body));
+
+    expect(out.tools[0]).toEqual(advisor);
+    expect(out.tools[1].description).toContain('Tool Reference');
+    expect(info.imageSourceText).not.toContain('## Tool: advisor');
+    expect(info.imageSourceText).toContain('## Tool: CustomTool');
+  });
+
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]
