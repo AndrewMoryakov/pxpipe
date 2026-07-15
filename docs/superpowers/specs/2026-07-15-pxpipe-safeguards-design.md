@@ -151,14 +151,21 @@ closure (line ~710). Change: compute `effectiveOpenAIUpstream(routes.openai)`
 **per request** where `upstreamBase` is chosen, so a hot-swap takes effect on
 the next request with no restart.
 
-**Persistence decision (see §9 Open questions):** the recommendation is
-**session-only** (in-memory) hot-swap — the *durable* fix is the env/launcher
-command surfaced alongside the button. Rationale: a persisted routing override
-that silently wins over ops `OPENAI_UPSTREAM` on the next boot is a surprising,
-security-sensitive behavior for an unauthenticated panel. Model-scope
-persistence (a user preference) is a different risk class than upstream routing
-(ops config). The launcher `/healthz` check (below) makes a lost hot-swap after
-restart loud rather than silent.
+**Persistence decision — DECIDED: session-only (in-memory), not persisted.**
+The hot-swap fixes the *running* process; the *durable* fix is a visible,
+standard config source — `OPENAI_UPSTREAM` at the User env level
+(`setx OPENAI_UPSTREAM "https://chatgpt.com"`) or in the launcher — surfaced as
+the `durableHint` alongside the button. Rationale: a persisted routing override
+would be a bespoke, invisible config source that silently outranks the explicit
+`OPENAI_UPSTREAM` on the next boot — the *same* invisible-config failure class
+that caused the original incident, and it would bite a future intentional
+upstream change (e.g. switching to a gateway). Model-scope persistence (a user
+*preference*) is a different risk class than upstream routing (ops config), so
+the two intentionally differ. `setx` is registry-backed, inspectable
+(`reg query "HKCU\Environment"`, the System Properties GUI, any new shell), and
+a launcher `set` still overrides it for launcher-started instances — a visible
+baseline, not a hidden trap. The launcher `/healthz` check (below) makes a lost
+hot-swap after restart loud rather than silent, so nothing fails quietly.
 
 ### 4.3 `src/node.ts` — host wiring
 
@@ -167,13 +174,23 @@ restart loud rather than silent.
   the existing `anthropic/openai upstream →` lines), each with its
   `durableHint`. `warn`/`info` are dashboard-only to keep the banner signal
   high.
-- **`GET /api/health.json`** (+ alias **`GET /healthz`**): returns
-  `{ findings, state, ok: findings.every(f => f.severity !== 'error') }`. The
-  launcher curls this after start and refuses to declare success on a
-  non-`ok` result. This directly closes failure mode #3.
-- **`EADDRINUSE` handler:** `server.on('error', …)` catches the bind failure
-  and prints an actionable message — which PID holds `:47821` and the exact
-  stop command — instead of a raw stack trace to `.err`.
+- **`GET /api/health.json`**: returns
+  `{ findings, state, ok: findings.every(f => f.severity !== 'error') }`.
+- **`GET /healthz`**: same evaluation but returns **HTTP 200 when `ok`, HTTP 503
+  when any `error` finding is present** (with a short text/JSON body). This lets
+  the launcher check a *status code* (`curl -f`) rather than parse JSON in a
+  `.cmd` — matching conventional healthz semantics.
+- **`EADDRINUSE` handler:** `server.on('error', …)` catches the bind failure,
+  prints an actionable message — which PID holds `:47821` and the exact stop
+  command — instead of a raw stack trace to `.err`, and **exits non-zero** so
+  the launcher can detect the failed start via exit code.
+- **Launcher (`pxpipe-run.cmd`) verification:** after starting node, poll
+  `curl -f http://127.0.0.1:47821/healthz` (short retry for bind) and check
+  node's exit code; print a red `✗` line with the diagnosis on failure, a green
+  `✓ upstream <host>` on success. `/healthz` confirms the *config* of whatever
+  is live on the port; the exit code catches "my instance never started"
+  (EADDRINUSE, old bad instance still holding the port). Together they close
+  failure mode #3.
 
 ### 4.4 Dashboard (Phase B) — `/fragments/health` + Fix button
 
@@ -236,23 +253,29 @@ evaluateHealth clears the finding → panel goes green.` The panel keeps showing
 ## 8. Phasing
 
 - **Phase A (first standalone release):** `health.ts` + `codex-upstream-mismatch`
-  (traffic-driven) + startup banner + `/api/health.json` + `/healthz` +
-  actionable `EADDRINUSE`. Pure logic + host wiring; no UI, no live swap,
-  nothing that mutates routing. Immediately makes the incident self-evident and
-  gives the launcher a verification hook.
+  (traffic-driven) + startup banner + `/api/health.json` + `/healthz` (200/503) +
+  actionable `EADDRINUSE` (non-zero exit) + `pxpipe-run.cmd` verification
+  (`curl -f /healthz` + exit-code check). Pure logic + host wiring; no UI, no
+  live swap, nothing that mutates routing. Immediately makes the incident
+  self-evident and gives the launcher a verification hook.
 - **Phase B (next):** `upstream-override.ts` (live hot-swap) + `/fragments/health`
   panel + **Fix** button + durable-command hint.
 - **Phase C (deferred):** `pxpipe doctor` CLI, generalized invariant framework,
   explicit-flag port takeover.
 
-## 9. Open questions
+## 9. Resolved decisions
 
-1. **Upstream-override persistence.** Recommendation: **session-only** (§4.2).
-   Confirm, or choose Variant-A persistence (persisted override wins over env
-   until a dashboard Reset) as we did for model-scope.
-2. **Launcher integration.** Should Phase A also update `pxpipe-run.cmd` to curl
-   `/healthz` after start and print a red line on non-`ok`? (Recommended —
-   small, and it operationalizes the whole detection story.)
+1. **Upstream-override persistence — DECIDED: session-only** (in-memory), not
+   persisted. The durable path is `OPENAI_UPSTREAM` at User env level
+   (`setx`) or the launcher — a visible, standard, inspectable config source —
+   not a bespoke override file that would silently outrank explicit env. See
+   §4.2 for the full rationale. `setx` caveats to carry into the plan/docs:
+   it applies to the auto-launcher only after next logon/reboot, and true
+   removal is `reg delete "HKCU\Environment" /v OPENAI_UPSTREAM /f` (never
+   `setx ""`, which leaves an empty value that resolves to a broken upstream).
+2. **Launcher integration — DECIDED: yes, in Phase A.** `pxpipe-run.cmd` polls
+   `curl -f /healthz` (200/503) and checks node's exit code, printing a red
+   diagnosis on failure / green `✓ upstream <host>` on success. See §4.3 / §8.
 
 ## 10. Relationship to the live incident
 
