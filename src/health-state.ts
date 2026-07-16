@@ -9,7 +9,7 @@ import type { HealthCounters } from './health-counters.js';
 
 export function buildHealthState(
   config: ProxyConfig,
-  compression: { isCompressionEnabled(): boolean },
+  compression: { getCompressionEnabled(): boolean },
   counters: HealthCounters,
   nowMs: number,
 ): HealthState {
@@ -20,7 +20,7 @@ export function buildHealthState(
     // Phase A: no runtime upstream override exists yet — always false.
     openaiUpstreamOverridden: false,
     modelScope: getAllowedModelBases(),
-    compressionEnabled: compression.isCompressionEnabled(),
+    compressionEnabled: compression.getCompressionEnabled(),
     recent: counters.snapshot(nowMs),
   };
 }

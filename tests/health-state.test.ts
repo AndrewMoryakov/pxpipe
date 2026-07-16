@@ -4,7 +4,7 @@ import { HealthCounters } from '../src/health-counters.js';
 import { evaluateHealth } from '../src/core/health.js';
 import { setAllowedModelBases } from '../src/core/applicability.js';
 
-const compressionOn = { isCompressionEnabled: () => true };
+const compressionOn = { getCompressionEnabled: () => true };
 
 describe('buildHealthState', () => {
   beforeEach(() => setAllowedModelBases(null)); // reset runtime override between tests
@@ -25,7 +25,7 @@ describe('buildHealthState', () => {
 
   it('reflects the live model scope and compression state', () => {
     setAllowedModelBases(['gpt-5.6-terra']);
-    const s = buildHealthState({}, { isCompressionEnabled: () => false }, new HealthCounters(), 1000);
+    const s = buildHealthState({}, { getCompressionEnabled: () => false }, new HealthCounters(), 1000);
     expect(s.modelScope).toEqual(['gpt-5.6-terra']);
     expect(s.compressionEnabled).toBe(false);
   });
