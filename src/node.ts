@@ -1131,6 +1131,18 @@ async function main(): Promise<void> {
       });
   });
 
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[pxpipe] ⛔ port ${opts.port} is already in use — another pxpipe (or process) is bound to ${opts.host}:${opts.port}.`);
+      console.error(`[pxpipe]    Find it:  Get-NetTCPConnection -LocalPort ${opts.port} -State Listen | Select-Object OwningProcess`);
+      console.error(`[pxpipe]    Stop it:  Stop-Process -Id <PID> -Force`);
+      console.error(`[pxpipe]    Then re-run the launcher.`);
+    } else {
+      console.error(`[pxpipe] server error: ${err.message}`);
+    }
+    process.exit(1);
+  });
+
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const isLoopbackHost =
@@ -1149,6 +1161,18 @@ async function main(): Promise<void> {
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
+    try {
+      const findings = evaluateHealth(buildHealthState(config, dashboard, healthCounters, Date.now()));
+      for (const f of findings) {
+        if (f.severity !== 'error' && f.severity !== 'warn') continue;
+        const mark = f.severity === 'error' ? '⛔' : '⚠️';
+        console.warn(`[pxpipe] ${mark} ${f.title}`);
+        console.warn(`[pxpipe]    ${f.detail}`);
+        if (f.remediation) console.warn(`[pxpipe]    fix: ${f.remediation.durableHint}`);
+      }
+    } catch {
+      /* never block startup on a health-print failure */
+    }
   });
 
   // server.close() only stops accepting new connections and waits for open
