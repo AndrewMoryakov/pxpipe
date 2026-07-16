@@ -1666,6 +1666,12 @@ export class DashboardState {
     });
   }
 
+  /** Whether the compression kill-switch is currently on. Read by the health
+   *  subsystem to report passthrough state. */
+  isCompressionEnabled(): boolean {
+    return this.compressionEnabled;
+  }
+
   /** POST /api/compression — flip the runtime kill switch.
    *  Body: { enabled: boolean }. Returns the new state. In-memory only;
    *  restart resets to the default (on). */
