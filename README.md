@@ -99,6 +99,19 @@ existing ChatGPT sign-in; do not put ChatGPT tokens in the pxpipe config. The
 active model must be included in `PXPIPE_MODELS` (the default `gpt-5.6` also
 matches Codex aliases such as `gpt-5.6-terra`).
 
+### Verifying a running instance
+
+After starting pxpipe, confirm it is healthy and correctly routed:
+
+```powershell
+pwsh -File scripts/pxpipe-healthcheck.ps1        # exit 0 = healthy, 1 = problem
+```
+
+It checks `GET /healthz` (200 = ok, 503 = a real problem such as Codex traffic
+404ing because the OpenAI upstream is not `chatgpt.com`) and prints the fix. A
+launcher can gate on its exit code. The same diagnosis is printed by pxpipe at
+startup and served as JSON at `/api/health.json`.
+
 ## The honest part
 
 - **It is lossy.** Exact 12-char hex strings in dense imaged content:
