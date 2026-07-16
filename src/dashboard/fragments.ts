@@ -178,6 +178,24 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
+/** Models that read pxpipe-imaged content measurably worse (FINDINGS.md, see
+ *  applicability.ts). Enabling one from the dashboard prompts a confirm with the
+ *  concrete numbers; a lit one shows a ⚠ marker. Fable/Sonnet/Terra/Lun and the
+ *  broad gpt-5.6 are not flagged (no evidence they're weak; Terra is the Codex
+ *  production model). Keyed by exact chip id. */
+const WEAK_READERS: Readonly<Record<string, string>> = {
+  'claude-opus-4-8':
+    'Opus 4.8 reads pxpipe-imaged context worse: 6/15 dense-hex vs Fable 100/100 (~2pp arithmetic). pxpipe images context, so dense/precise data can be misread. Enable anyway?',
+  'claude-opus-4-7':
+    'Opus 4.7 reads pxpipe-imaged context worse (like 4.8: ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100). Enable anyway?',
+  'gpt-5.5':
+    'GPT-5.5 degrades on imaged history/context — recall of older turns can suffer. Enable anyway?',
+  'gpt-5.6-sol':
+    'GPT-5.6 Sol on imaged content: 98/100 arithmetic but 79/93 gist, 4/15 guard confabulations, 0/15 dense-hex. Enable anyway?',
+  'grok-4.5':
+    'Grok 4.5 on imaged content: 82/100 arithmetic, 83/98 gist, 13/18 state tracking. Enable anyway?',
+};
+
 export function renderModelsFragment(
   active: string[],
   configured: string[],
@@ -206,11 +224,16 @@ export function renderModelsFragment(
   const chipFor = (id: string): string => {
     const lit = on.has(id);
     const label = labelOf.get(id) ?? id;
+    const warn = WEAK_READERS[id];
+    // Confirm only when ENABLING a weak reader (off → on); disabling never prompts.
+    const confirmAttr = warn && !lit ? ` hx-confirm="${escapeHtml(warn)}"` : '';
+    // Persistent marker on a lit weak reader so a risky choice stays visible.
+    const warnMark = warn && lit ? ' ⚠' : '';
     return (
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
-      `aria-pressed="${lit}" ` +
+      `aria-pressed="${lit}"${confirmAttr} ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
-      `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
+      `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}${warnMark}</button>`
     );
   };
   const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
