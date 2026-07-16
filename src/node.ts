@@ -32,6 +32,9 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 import { getAllowedModelBases, setAllowedModelBases } from './core/applicability.js';
+import { evaluateHealth, summarizeHealth } from './core/health.js';
+import { HealthCounters } from './health-counters.js';
+import { buildHealthState } from './health-state.js';
 import {
   modelScopeFile,
   loadPersistedModelScope,
@@ -956,6 +959,9 @@ async function main(): Promise<void> {
     eventsFile: opts.eventsFile,
     sidecarDir: bodySidecarDir,
   }, undefined, () => codexUsage.snapshot());
+  // Rolling counter of recent /backend-api/codex/* traffic, feeding the
+  // evidence-driven codex-upstream health check (see /healthz below).
+  const healthCounters = new HealthCounters();
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
@@ -992,6 +998,13 @@ async function main(): Promise<void> {
       return {};
     },
     onRequest: async (e) => {
+      // Feed the health counter first — cheap and must never be skipped by an
+      // early return further down. Best-effort; never throw into onRequest.
+      try {
+        healthCounters.record(e.path, e.status, Date.now());
+      } catch {
+        /* ignore */
+      }
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
       // info.firstImagePng, so capturing has to happen on the raw event.
       dashboard.update(e);
@@ -1079,6 +1092,26 @@ async function main(): Promise<void> {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
         // api.anthropic.com (which would 404 them).
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+        // Health endpoints — host-level (compose config + counters + dashboard),
+        // handled before the dashboard router. Fail-open: any throw → 200 with
+        // an empty report rather than a 500.
+        if (url.pathname === '/healthz' || url.pathname === '/api/health.json') {
+          let ok = true;
+          let payload = '{"ok":true,"findings":[],"state":null}';
+          try {
+            const state = buildHealthState(config, dashboard, healthCounters, Date.now());
+            const findings = evaluateHealth(state);
+            ok = summarizeHealth(findings).ok;
+            payload = JSON.stringify({ ok, findings, state }, null, 2);
+          } catch {
+            /* fail-open: keep ok=true, empty report */
+          }
+          const status = url.pathname === '/healthz' ? (ok ? 200 : 503) : 200;
+          res.statusCode = status;
+          res.setHeader('content-type', 'application/json');
+          res.end(payload);
+          return;
+        }
         const route = dashboardPath(url.pathname);
         if (route) {
           const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port, scopeFile);
