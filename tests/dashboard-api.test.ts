@@ -10,7 +10,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { DashboardState, dashboardPath } from '../src/dashboard.js';
+import {
+  DashboardState,
+  dashboardPath,
+  officialInputUsdPerMtokForModel,
+} from '../src/dashboard.js';
 import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
@@ -177,6 +181,77 @@ describe('serveFragment', () => {
     dash.handleCompressionToggle({ enabled: true });
   });
 
+  it('starts calibration only from an explicit manual disable and counts its two phases', () => {
+    // Ordinary traffic is never retroactively labelled as calibration.
+    dash.update({ usage: { input_tokens: 10 }, info: { compressed: false } } as never);
+    expect(dash.getManualCalibration().active).toBe(false);
+
+    dash.handleCompressionToggle({ enabled: false });
+    dash.update({
+      path: '/v1/messages', model: 'claude-opus-4-8', usage: { input_tokens: 10 },
+      info: { compressed: false, firstUserSha8: 'session-a' },
+    } as never);
+    expect(dash.getManualCalibration()).toMatchObject({
+      active: true,
+      phase: 'baseline',
+      baselineRequests: 1,
+      imagedRequests: 0,
+      scopeModel: 'claude-opus-4-8',
+      scopeSession: 'session-a',
+      skippedMismatches: 0,
+    });
+
+    // A different model/session is explicitly excluded from the cohort.
+    dash.update({
+      path: '/v1/messages', model: 'claude-sonnet-5', usage: { input_tokens: 10 },
+      info: { compressed: false, firstUserSha8: 'session-b' },
+    } as never);
+
+    dash.handleCompressionToggle({ enabled: true });
+    dash.update({
+      path: '/v1/messages', model: 'claude-opus-4-8', usage: { input_tokens: 10 },
+      info: { compressed: true, firstUserSha8: 'session-a' },
+    } as never);
+    // Codex/OpenAI traffic never changes Claude calibration counters.
+    dash.update({
+      path: '/v1/responses', model: 'gpt-5.6', usage: { input_tokens: 10 },
+      info: { compressed: true, firstUserSha8: 'session-a' },
+    } as never);
+    expect(dash.getManualCalibration()).toMatchObject({
+      active: true,
+      phase: 'imaged',
+      baselineRequests: 1,
+      imagedRequests: 1,
+      skippedMismatches: 1,
+    });
+  });
+
+  it('keeps a requested retained session selected while newer agents send traffic', async () => {
+    dash.update({
+      path: '/v1/messages', model: 'claude-opus-4-8', usage: { input_tokens: 10 },
+      info: { compressed: true, firstUserSha8: 'session-a' },
+    } as never);
+    dash.update({
+      path: '/v1/messages', model: 'claude-opus-4-8', usage: { input_tokens: 10 },
+      info: { compressed: true, firstUserSha8: 'session-b' },
+    } as never);
+
+    const latest = await dash.serveCurrentSessionJson().json();
+    const pinned = await dash.serveCurrentSessionJson('session-a').json();
+    expect(latest).toMatchObject({ sessionId: 'session-b' });
+    expect(pinned).toMatchObject({ sessionId: 'session-a' });
+  });
+
+  it('transitions Sonnet 5 from its introductory price at the documented UTC boundary', () => {
+    expect(officialInputUsdPerMtokForModel(
+      'claude-sonnet-5', Date.parse('2026-08-31T23:59:59.999Z'),
+    )).toBe(2);
+    expect(officialInputUsdPerMtokForModel(
+      'claude-sonnet-5', Date.parse('2026-09-01T00:00:00.000Z'),
+    )).toBe(3);
+    expect(officialInputUsdPerMtokForModel('claude-sonnet-4-6')).toBe(3);
+  });
+
   it('renders opt-in GPT chips, including Codex Terra, and mutates the single model scope', async () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
@@ -263,11 +338,11 @@ describe('serveFragment', () => {
     expect(html).toContain('never calls Anthropic /count_tokens');
   });
 
-  it('renders keyboard-accessible hover help for stat question marks', async () => {
+  it('renders a keyboard-reachable methodology link and audit drawer', async () => {
     const header = await (await dash.serveFragment('header', url, 4711)).text();
-    expect(header).toContain('class="q" tabindex="0"');
-    expect(header).toContain('data-tip=');
-    expect(header).toContain('aria-label=');
+    expect(header).toContain('href="#audit-drawer"');
+    expect(header).toContain('<details class="drawer" id="audit-drawer">');
+    expect(header.indexOf('href="#audit-drawer"')).toBeLessThan(header.indexOf('id="audit-drawer"'));
   });
 
   it('uses source text parallel to each captured PNG', async () => {
@@ -305,10 +380,32 @@ describe('serveFragment', () => {
 });
 
 describe('dashboard page help UI', () => {
-  it('ships visible hover/focus tooltip CSS for question-mark controls', () => {
+  it('ships progressive-disclosure navigation and visible keyboard focus', () => {
     const html = renderPage(47821);
-    expect(html).toContain('.q:hover::after, .q:focus-visible::after');
-    expect(html).toContain('content: attr(data-tip)');
+    expect(html).toContain('aria-label="Dashboard sections"');
+    expect(html).toContain('href="#overview"');
+    expect(html).toContain('href="#audit-drawer"');
+    expect(html).toContain('<details class="settings-panel">');
+    expect(html).toContain('Model scope &amp; routing settings');
+    expect(html).toContain('.page-nav a:focus-visible');
+    expect(html).toContain('function ppRevealHash()');
+    expect(html).toContain("target.tagName === 'DETAILS'");
+    expect(html).toContain('id="help-model-settings"');
+    expect(html).toContain('id="help-recent-requests"');
+    expect(html).toContain('id="help-context-breakdown"');
+    expect(html).toContain('id="help-source-inspector"');
+    expect(html).toContain('id="help-top-sessions"');
+    expect(html).toContain('id="help-full-history"');
+    expect(html).toContain('summary aria-label="Help:');
+    expect(html).toContain('.help-tip > summary:focus-visible');
+    expect(html).toContain("opened.matches('details.help-tip[open]')");
+    expect(html).toContain("ev.key !== 'Escape'");
+    expect(html).toContain('hashRevealPending: !!location.hash');
+    expect(html).toContain('hx-vals=\'js:{session: window.pp.session || ""}\'');
+    expect(html).toContain('function ppWatchLatest()');
+    expect(html).toContain("details[id]').forEach");
+    expect(html).toContain('d.toggleAttribute(\'open\', state.open)');
+    expect(html).toContain('position: sticky; top: 0; z-index: 200');
   });
 });
 
@@ -346,7 +443,41 @@ describe('GPT savings split', () => {
     expect(stats.actual_input_weighted).toBe(8200);
     expect(stats.baseline_input_weighted).toBe(12400);
     expect(stats.saved_input_tokens).toBe(4200);
+    expect(stats.measured_claude_saved_input_equivalents).toBe(0);
+    expect(stats.modeled_openai_saved_input_equivalents).toBe(4200);
+    expect(stats.usage_bearing_responses).toBe(1);
     expect(stats.saved_pct_input_only).toBeGreaterThan(0);
+  });
+
+  it('separates measured Claude from modeled OpenAI savings and counts usage-bearing responses', async () => {
+    dash.update(structuredClone(gptUpdate) as never); // modeled OpenAI: 4,200
+    dash.update({
+      method: 'POST',
+      path: '/v1/messages',
+      model: 'claude-sonnet-5',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 400, output_tokens: 10 },
+      info: {
+        compressed: true,
+        baselineTokens: 1000,
+        baselineCacheableTokens: 800,
+        baselineProbeStatus: 'ok',
+        firstUserSha8: 'claudesess1',
+      },
+    } as never); // measured Claude: 800×1.25 + 200 - 400 = 800
+    dash.update({
+      method: 'GET', path: '/health', status: 200, durationMs: 1,
+    } as never); // no usage: must not enter the paid-response count
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.saved_input_tokens).toBe(5000); // legacy combined total
+    expect(stats.measured_claude_saved_input_equivalents).toBe(800);
+    expect(stats.modeled_openai_saved_input_equivalents).toBe(4200);
+    expect(stats.measured_anthropic_savings_requests).toBe(1);
+    expect(stats.estimated_openai_savings_requests).toBe(1);
+    expect(stats.usage_bearing_responses).toBe(2);
+    expect(stats.all_usage_requests).toBe(stats.usage_bearing_responses);
   });
 
   it('populates As-text / Sent / Cache-hits / Saved recent columns for GPT', async () => {

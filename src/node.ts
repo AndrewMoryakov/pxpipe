@@ -31,6 +31,14 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { getAllowedModelBases, setAllowedModelBases } from './core/applicability.js';
+import {
+  modelScopeFile,
+  loadPersistedModelScope,
+  savePersistedModelScope,
+  clearPersistedModelScope,
+} from './model-scope-store.js';
+import { CodexUsageIndex } from './codex-usage.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -108,11 +116,22 @@ function parseCli(argv: string[]): RuntimeConfig {
     port: Number(process.env.PORT ?? 47821),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
     host: process.env.HOST?.trim() || '127.0.0.1',
-    upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
-    openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+    // Env-driven upstream URLs are .trim()-ed here (and again in
+    // resolveUpstreams) to defend against whitespace sneaking in from the
+    // surrounding shell. A stray space in OPENAI_UPSTREAM /
+    // ANTHROPIC_UPSTREAM / PXPIPE_GATEWAY_BASE_URL — typically from a
+    // cmd.exe `set VAR=...` line, a copy-paste with a trailing space, or a
+    // shell-quoting bug in a launcher script — would otherwise build URLs
+    // like "https://api.openai.com /v1/...". fetch() then throws
+    // "Failed to parse URL" with no actionable log line and the operator
+    // is left guessing. Trimming at the env boundary keeps the failure
+    // mode loud (the proxy still returns 401/502 from upstream) instead
+    // of silent.
+    upstream: (process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com').trim(),
+    openAIUpstream: (process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com').trim(),
     openAIApiKey: process.env.OPENAI_API_KEY,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
-    gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
+    gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL?.trim(),
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
     eventsFile:
       process.env.PXPIPE_LOG ??
@@ -324,6 +343,7 @@ async function dispatchDashboard(
   req: IncomingMessage,
   url: URL,
   port: number,
+  scopeFile: string,
 ): Promise<Response | undefined> {
   const method = req.method ?? 'GET';
   switch (route.kind) {
@@ -399,7 +419,19 @@ async function dispatchDashboard(
         } catch {
           return new Response('bad request body', { status: 400 });
         }
-        if (model) dashboard.handleModelsToggle(model, on);
+        if (model) {
+          dashboard.handleModelsToggle(model, on);
+          // Variant A: persist the new scope so it survives restart and
+          // overrides PXPIPE_MODELS until Reset. Best-effort inside the store.
+          savePersistedModelScope(scopeFile, getAllowedModelBases());
+        }
+        return dashboard.serveFragment('models', url, port);
+      }
+      // /fragments/models/reset clears the persisted choice and the runtime
+      // override, falling back to PXPIPE_MODELS env / built-in default.
+      if (route.name === 'models/reset' && method === 'POST') {
+        setAllowedModelBases(null);
+        clearPersistedModelScope(scopeFile);
         return dashboard.serveFragment('models', url, port);
       }
       if (method !== 'GET') return undefined;
@@ -918,13 +950,24 @@ async function main(): Promise<void> {
   // served via the route interception in front of the proxy handler. The
   // SessionsPaths handle lets the dashboard surface session/disk/stats data
   // without reaching back into module-scope globals.
+  const codexUsage = new CodexUsageIndex();
+  codexUsage.start();
   const dashboard = new DashboardState({
     eventsFile: opts.eventsFile,
     sidecarDir: bodySidecarDir,
-  });
+  }, undefined, () => codexUsage.snapshot());
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
+
+  // Variant A model-scope persistence: if the user saved a dashboard chip
+  // choice, seed it into the runtime override so it OVERRIDES PXPIPE_MODELS
+  // (allowedModelBases() prefers a non-null runtime override over env). Absent
+  // or corrupt file → null → PXPIPE_MODELS env / built-in default. `[]` is a
+  // real persisted choice (compress nothing), so only null falls through.
+  const scopeFile = modelScopeFile(opts.eventsFile);
+  const persistedScope = loadPersistedModelScope(scopeFile);
+  if (persistedScope !== null) setAllowedModelBases(persistedScope);
 
   const config: ProxyConfig = {
     provider: opts.provider,
@@ -1038,7 +1081,7 @@ async function main(): Promise<void> {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const route = dashboardPath(url.pathname);
         if (route) {
-          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
+          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port, scopeFile);
           if (webRes) {
             await writeWebResponse(webRes, res);
             return;
@@ -1089,6 +1132,7 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     console.log(`[pxpipe] ${sig} — shutting down`);
+    codexUsage.stop();
     // Flush+close the tracker so we don't drop the last few events on exit.
     if (tracker instanceof FileTracker) tracker.close();
     server.close(() => process.exit(0));

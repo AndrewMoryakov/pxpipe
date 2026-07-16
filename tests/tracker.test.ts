@@ -37,6 +37,8 @@ describe('toTrackEvent', () => {
         output_tokens: 7,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 100,
+        cached_tokens: 30,
+        cache_write_tokens: 12,
       },
     };
     const out = toTrackEvent(ev);
@@ -63,6 +65,8 @@ describe('toTrackEvent', () => {
     expect(out.input_tokens).toBe(42);
     expect(out.cache_read_tokens).toBe(100);
     expect(out.cache_create_tokens).toBe(0);
+    expect(out.cached_tokens).toBe(30);
+    expect(out.cache_write_tokens).toBe(12);
     // ts is ISO8601
     expect(out.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });

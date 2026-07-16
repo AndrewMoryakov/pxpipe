@@ -66,6 +66,9 @@ export interface ProxyEvent {
   /** Ground-truth char counts from the response stream, independent of usage.output_tokens.
    *  Absent when the body couldn't be scanned (5xx, unknown content-type). See OutputMeasurement. */
   measurement?: OutputMeasurement;
+  /** Upstream response media/encoding metadata for scanner diagnostics. */
+  responseContentType?: string;
+  responseContentEncoding?: string;
 }
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
@@ -80,6 +83,16 @@ function readModelField(body: Uint8Array): string | null {
     return m ? m[1]! : null;
   } catch {
     return null;
+  }
+}
+
+/** Responses defaults to non-streaming when `stream` is absent. */
+function readStreamField(body: Uint8Array): boolean {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(body)) as { stream?: unknown };
+    return parsed.stream === true;
+  } catch {
+    return false;
   }
 }
 
@@ -135,22 +148,63 @@ function processSseEvent(
     return;
   }
   const obj = j as Record<string, unknown>;
+  // The Responses wire format identifies events in the JSON `type` field.
+  // Some providers also emit an SSE `event:` line, but ChatGPT's
+  // /backend-api/codex/responses commonly does not. Prefer the official JSON
+  // discriminator when present and use the SSE name as a compatibility fallback.
+  const eventType = typeof obj.type === 'string' ? obj.type : event;
 
   // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
   const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
   if (openAIUsage) state.usage = openAIUsage;
   // OpenAI Responses API streams usage nested under `response` on the terminal
-  // `response.completed` (or `.incomplete`) event — not at the top level.
-  if (event === 'response.completed' || event === 'response.incomplete') {
+  // terminal Responses event — not at the top level.
+  if (
+    eventType === 'response.completed'
+    || eventType === 'response.incomplete'
+    || eventType === 'response.failed'
+  ) {
     const resp = obj.response as
-      | { usage?: unknown; incomplete_details?: { reason?: unknown } }
+      | {
+          usage?: unknown;
+          incomplete_details?: { reason?: unknown };
+          error?: { code?: unknown; message?: unknown };
+        }
       | undefined;
     const respUsage = normalizeUsage(resp?.usage);
     if (respUsage) state.usage = respUsage;
-    // Responses API has no stop_reason; normalize the terminal status/reason instead.
+    // Responses API has no stop_reason; normalize terminal status/reason.
+    // Preserve a refusal observed in an earlier delta rather than overwriting it.
     const reason = resp?.incomplete_details?.reason;
+    const failureCode = resp?.error?.code;
     state.stopReason = typeof reason === 'string' ? reason
-      : event === 'response.incomplete' ? 'incomplete' : 'stop';
+      : eventType === 'response.incomplete' ? 'incomplete'
+      : eventType === 'response.failed'
+        ? (typeof failureCode === 'string' ? failureCode : 'failed')
+        : state.stopReason ?? 'stop';
+  }
+  // Responses streaming deltas are not Chat Completions `choices[]` chunks.
+  // Count their visible/reasoning/tool payloads directly from the JSON event.
+  if (eventType === 'response.refusal.delta' || eventType === 'response.refusal.done') {
+    // `.done` repeats the completed refusal text; only deltas are additive.
+    if (eventType === 'response.refusal.delta' && typeof obj.delta === 'string') {
+      m.textChars += obj.delta.length;
+    }
+    state.stopReason = 'refusal';
+  } else if (eventType === 'response.output_text.delta' && typeof obj.delta === 'string') {
+    m.textChars += obj.delta.length;
+  } else if (
+    (eventType === 'response.reasoning_text.delta'
+      || eventType === 'response.reasoning_summary_text.delta')
+    && typeof obj.delta === 'string'
+  ) {
+    m.thinkingChars += obj.delta.length;
+  } else if (
+    (eventType === 'response.function_call_arguments.delta'
+      || eventType === 'response.custom_tool_call_input.delta')
+    && typeof obj.delta === 'string'
+  ) {
+    m.toolUseChars += obj.delta.length;
   }
   measureOpenAIChoices(obj, m);
   // OpenAI chat chunks: the final chunk carries choices[].finish_reason (earlier chunks ship null).
@@ -162,14 +216,14 @@ function processSseEvent(
     }
   }
 
-  if (event === 'message_start') {
+  if (eventType === 'message_start') {
     const msg = obj.message as { usage?: Usage } | undefined;
     const usage = normalizeUsage(msg?.usage);
     if (usage) state.usage = usage;
-  } else if (event === 'content_block_start') {
+  } else if (eventType === 'content_block_start') {
     const cb = obj.content_block as { type?: string } | undefined;
     if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
-  } else if (event === 'content_block_delta') {
+  } else if (eventType === 'content_block_delta') {
     const d = obj.delta as
       | { type?: string; text?: string; thinking?: string; partial_json?: string }
       | undefined;
@@ -180,7 +234,7 @@ function processSseEvent(
     } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
       m.toolUseChars += d.partial_json.length;
     }
-  } else if (event === 'message_delta') {
+  } else if (eventType === 'message_delta') {
     // Anthropic ships the final stop_reason here ("end_turn", "refusal", …).
     const d = obj.delta as { stop_reason?: unknown } | undefined;
     if (typeof d?.stop_reason === 'string') state.stopReason = d.stop_reason;
@@ -233,6 +287,18 @@ function normalizeUsage(raw: unknown): Usage | undefined {
     (u.prompt_tokens_details as Record<string, unknown> | undefined);
   if (details && typeof details.cached_tokens === 'number') {
     out.cached_tokens = details.cached_tokens;
+  }
+  // Some OpenAI-compatible providers additionally expose prompt-cache writes.
+  // Like cached_tokens, this is a diagnostic subset of input_tokens: consumers
+  // must not add it to the input total a second time.
+  if (details && typeof details.cache_write_tokens === 'number') {
+    out.cache_write_tokens = details.cache_write_tokens;
+  }
+  const outputDetails =
+    (u.output_tokens_details as Record<string, unknown> | undefined) ??
+    (u.completion_tokens_details as Record<string, unknown> | undefined);
+  if (outputDetails && typeof outputDetails.reasoning_tokens === 'number') {
+    out.reasoning_output_tokens = outputDetails.reasoning_tokens;
   }
 
   return Object.keys(out).length > 0 ? out : undefined;
@@ -312,7 +378,11 @@ function readStopReasonFromJson(j: unknown): string | undefined {
  * Streams are scanned to EOF (final output_tokens is in message_delta; redacted_thinking
  * blocks can appear anywhere). 4xx bodies are capped at ERROR_BODY_MAX. 5xx is skipped.
  */
-function teeForUsage(res: Response): {
+function teeForUsage(
+  res: Response,
+  assumeResponsesSse = false,
+  assumeResponsesJson = false,
+): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
   errorBodyPromise: Promise<string | undefined>;
@@ -389,7 +459,10 @@ function teeForUsage(res: Response): {
     let buf = '';
 
     try {
-      if (ct.includes('text/event-stream')) {
+      // ChatGPT's /backend-api/codex/responses currently omits Content-Type.
+      // The request's top-level `stream` field selects SSE vs JSON for that
+      // route; explicit unknown media types still fail closed.
+      if (ct.includes('text/event-stream') || (ct === '' && assumeResponsesSse)) {
         // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
         const m: OutputMeasurement = {
           textChars: 0,
@@ -405,6 +478,8 @@ function teeForUsage(res: Response): {
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
+          // EventSource permits CRLF; normalize before looking for blank lines.
+          buf = buf.replace(/\r\n/g, '\n');
           // SSE events are terminated by a blank line.
           let evEnd: number;
           while ((evEnd = buf.indexOf('\n\n')) >= 0) {
@@ -412,13 +487,23 @@ function teeForUsage(res: Response): {
             buf = buf.slice(evEnd + 2);
             processSseEvent(block, m, state);
           }
+          // A malformed/headerless non-SSE response must not make the audit
+          // branch buffer without bound. Ordinary Responses events are far
+          // smaller; fail closed and drain if no delimiter arrives within 4 MiB.
+          if (buf.length > 4 * 1024 * 1024) {
+            while (true) {
+              const { done: drained } = await reader.read();
+              if (drained) break;
+            }
+            return { usage: undefined, measurement: undefined, stopReason: undefined };
+          }
         }
         buf += decoder.decode();
         if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
         return { usage: state.usage, measurement: m, stopReason: state.stopReason };
       }
 
-      if (ct.includes('application/json')) {
+      if (ct.includes('application/json') || (ct === '' && assumeResponsesJson)) {
         // Buffer fully, capped at 4 MiB.
         const MAX = 4 * 1024 * 1024;
         while (buf.length < MAX) {
@@ -564,14 +649,27 @@ async function countTokensUpstream(
   }
 }
 
-/** Resolve upstream URLs from config. Pure — unit-testable. */
+/**
+ * Resolve upstream URLs from config. Pure — unit-testable.
+ *
+ * Every env-derived input is trimmed of leading/trailing whitespace before
+ * URL construction, and trailing slashes are stripped so `base + path` joins
+ * cleanly. The trim is defensive: a stray space in OPENAI_UPSTREAM /
+ * ANTHROPIC_UPSTREAM / PXPIPE_GATEWAY_BASE_URL (commonly introduced by
+ * cmd.exe `set VAR=...`, a copy-paste with a trailing space, or a shell
+ * quoting bug in a launcher script) would otherwise build URLs like
+ * "https://api.openai.com /v1/..." — fetch() then throws
+ * "Failed to parse URL" with no actionable log line, and the operator is
+ * left guessing. Trimming at the URL boundary keeps the failure mode loud
+ * (the proxy still returns a real 401/502 from upstream) instead of silent.
+ */
 export function resolveUpstreams(config: ProxyConfig): {
   anthropic: string;
   openai: string;
   stripOpenAIV1: boolean;
 } {
   if (config.provider === 'cloudflare-ai-gateway') {
-    const base = (config.gatewayBaseUrl ?? '').replace(/\/+$/, '');
+    const base = (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '');
     if (!base) {
       throw new Error(
         "provider 'cloudflare-ai-gateway' requires gatewayBaseUrl (PXPIPE_GATEWAY_BASE_URL)",
@@ -580,8 +678,8 @@ export function resolveUpstreams(config: ProxyConfig): {
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
   }
   return {
-    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
-    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, ''),
+    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
+    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
     stripOpenAIV1: false,
   };
 }
@@ -610,8 +708,11 @@ export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
+  // Same trim policy as resolveUpstreams: keep provider-prefixed passthroughs
+  // (e.g. /openai/*, /google-ai-studio/*) safe from env whitespace — see the
+  // JSDoc on resolveUpstreams for the full rationale.
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
-    ? (config.gatewayBaseUrl ?? '').replace(/\/+$/, '')
+    ? (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '')
     : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
   const applyGatewayHeaders = (h: Headers): Headers => {
@@ -627,6 +728,8 @@ export function createProxy(config: ProxyConfig = {}) {
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
+    let responseContentType: string | undefined;
+    let responseContentEncoding: string | undefined;
 
     const fire = (
       status: number,
@@ -697,6 +800,8 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodyGz,
           measurement,
           stopReason,
+          responseContentType,
+          responseContentEncoding,
         });
       };
       void finalize();
@@ -725,6 +830,7 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    let responsesStreaming = false;
 
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
@@ -733,6 +839,7 @@ export function createProxy(config: ProxyConfig = {}) {
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
+        if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
         // /v1/messages is only a wire schema: Claude Code can target a non-
         // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
@@ -830,10 +937,16 @@ export function createProxy(config: ProxyConfig = {}) {
     }
 
     const firstByteMs = Date.now() - t0;
+    responseContentType = upstreamRes.headers.get('content-type') ?? undefined;
+    responseContentEncoding = upstreamRes.headers.get('content-encoding') ?? undefined;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
     const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
-      teeForUsage(upstreamRes);
+      teeForUsage(
+        upstreamRes,
+        isOpenAIResponses && responsesStreaming,
+        isOpenAIResponses && !responsesStreaming,
+      );
 
     // Fire event in background once all four resolve (all share the same stream read).
     void Promise.all([

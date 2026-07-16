@@ -3,6 +3,7 @@
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
+import { groupCodexQuotaWindows } from '../codex-usage.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -44,32 +45,109 @@ function formatDuration(s: number): string {
   return (h ? h + 'h ' : '') + (m || h ? m + 'm ' : '') + sec + 's';
 }
 
+function formatReset(epochSeconds: number | null | undefined): string {
+  if (!epochSeconds || !Number.isFinite(epochSeconds)) return 'reset unknown';
+  return `resets ${new Date(epochSeconds * 1000).toLocaleString('en-GB', {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  })}`;
+}
+
+function formatObservedAt(iso: string | null | undefined): string {
+  if (!iso) return 'time unknown';
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return 'time unknown';
+  return d.toLocaleString('en-GB', {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
+
 function shortPath(p: string | null | undefined): string {
   if (!p) return '-';
   const parts = String(p).split('/');
   return parts[parts.length - 1] || p;
 }
 
-// ---- compression toggle (kill switch) ------------------------------------
+/** Accessible, touch-friendly contextual help. Native <details> keeps the
+ * explanation usable without hover and GLUE_JS preserves open state on HTMX refresh. */
+function helpTip(id: string, title: string, what: string, why: string, read: string): string {
+  return (
+    `<details class="help-tip" id="help-${escapeHtml(id)}">` +
+    `<summary aria-label="Help: ${escapeHtml(title)}" title="Explain this block">?</summary>` +
+    `<div class="help-popover" role="note">` +
+    `<strong>${escapeHtml(title)}</strong>` +
+    `<p><b>What it is.</b> ${escapeHtml(what)}</p>` +
+    `<p><b>Why it matters.</b> ${escapeHtml(why)}</p>` +
+    `<p><b>How to read it.</b> ${escapeHtml(read)}</p>` +
+    `</div></details>`
+  );
+}
 
-export function renderToggleFragment(enabled: boolean): string {
+// ---- compression toggle (kill switch + manual calibration) ----------------
+
+/**
+ * An operator-controlled A/B note. This deliberately is not a sampler: the
+ * proxy never changes a request's path for calibration. It only records the
+ * phase entered after the operator explicitly uses the kill switch.
+ */
+export interface ManualCalibrationStatus {
+  active: boolean;
+  /** `baseline` means the operator manually disabled compression. */
+  phase: 'baseline' | 'imaged' | null;
+  baselineRequests: number;
+  imagedRequests: number;
+  /** Locked by the first eligible baseline row; prevents mixed-model/session cohorts. */
+  scopeModel: string | null;
+  scopeSession: string | null;
+  skippedMismatches: number;
+}
+
+export function renderToggleFragment(
+  enabled: boolean,
+  calibration: ManualCalibrationStatus = {
+    active: false,
+    phase: null,
+    baselineRequests: 0,
+    imagedRequests: 0,
+    scopeModel: null,
+    scopeSession: null,
+    skippedMismatches: 0,
+  },
+): string {
+  const toggleHelp = helpTip(
+    'compression-switch', 'Compression switch',
+    'The runtime kill switch that decides whether eligible requests are imaged or sent upstream unchanged.',
+    'It gives you immediate control and is also the only way to start a manual calibration baseline. PXPIPE never disables compression automatically for sampling.',
+    'Compression on applies the selected model scope. Compression off means passthrough for every request. The switch resets to on after a proxy restart.',
+  );
   // NOTE: "PASSTHROUGH MODE", "Disable compression", "Enable compression" are asserted by tests.
   const banner = enabled
     ? ''
-    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every request goes to Claude unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
+    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Eligible requests go unchanged to their configured upstream: no images, no attributed savings. This is the manual baseline phase; pxpipe did not select or reroute any request automatically.</div>`;
   // Button POSTs the OPPOSITE of current state; 2s poll keeps it fresh.
   const confirm = enabled
-    ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
+    ? ` hx-confirm="Start a MANUAL baseline phase?\n\nCompression will be turned off only because you explicitly approve it. Send comparable requests as normal text, then enable compression to collect the image phase. pxpipe never samples or switches requests automatically. Restarting the proxy turns compression back on and clears this in-memory calibration note."`
     : '';
+  const scope = calibration.scopeModel && calibration.scopeSession
+    ? `${escapeHtml(calibration.scopeModel)} · session ${escapeHtml(calibration.scopeSession.slice(0, 8))}`
+    : 'waiting for the first Claude request to lock model + session';
+  const skipped = calibration.skippedMismatches > 0
+    ? ` · ${numFmt(calibration.skippedMismatches)} out-of-scope rows ignored`
+    : '';
+  const calibrationNote = !calibration.active
+    ? `<span class="hint">manual calibration is idle · disable compression to explicitly start a normal-text baseline · no automatic passthrough sampling</span>`
+    : calibration.phase === 'baseline'
+      ? `<span class="hint"><strong>Manual comparison: baseline phase</strong> · ${numFmt(calibration.baselineRequests)} in-scope Claude request${calibration.baselineRequests === 1 ? '' : 's'} · ${scope}${skipped} · re-enable compression when ready</span>`
+      : `<span class="hint"><strong>Manual comparison: image phase</strong> · ${numFmt(calibration.baselineRequests)} normal-text vs ${numFmt(calibration.imagedRequests)} imaged · ${scope}${skipped} · same model/session, but still sequential and observational</span>`;
   return (
     banner +
     `<div class="switch">` +
-    `<span class="switch-state ${enabled ? 'on' : 'off'}"><span class="switch-dot"></span>${enabled ? 'Compression on' : 'Compression off'}</span>` +
+    `<span class="switch-state ${enabled ? 'on' : 'off'}"><span class="switch-dot"></span>${enabled ? 'Compression on' : 'Compression off'}</span>${toggleHelp}` +
     `<button class="switch-btn" type="button" hx-post="/fragments/toggle" hx-target="#frag-toggle" hx-vals='{"enabled": ${!enabled}}'${confirm}>` +
     (enabled ? 'Disable compression' : 'Enable compression') +
     `</button>` +
     `<span class="hint">kill switch · resets to on when you restart</span>` +
     `</div>`
+    + `<div class="switch calibration-note">${calibrationNote}</div>`
   );
 }
 
@@ -85,11 +163,14 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 ];
 
 const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  // Terra is used by the local Codex provider. Keep it explicit so it is
-  // discoverable in the GPT section rather than falling into "other" models.
+  // Terra/Sol/Lun are the GPT 5.6 sibling variants (Terra is the local Codex
+  // provider's model). Each is an explicit chip so it toggles independently,
+  // rather than only being reachable via the broad `gpt-5.6` base. The broad
+  // chip stays as a one-click "all 5.6 siblings" shortcut.
   { id: 'gpt-5.6', label: 'GPT 5.6' },
   { id: 'gpt-5.6-terra', label: 'GPT 5.6 Terra' },
   { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol' },
+  { id: 'gpt-5.6-lun', label: 'GPT 5.6 Lun' },
   { id: 'gpt-5.5', label: 'GPT 5.5' },
 ];
 
@@ -127,6 +208,7 @@ export function renderModelsFragment(
     const label = labelOf.get(id) ?? id;
     return (
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
+      `aria-pressed="${lit}" ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
       `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
     );
@@ -139,22 +221,45 @@ export function renderModelsFragment(
     .map(chipFor)
     .join('');
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
+  const claudeHelp = helpTip(
+    'claude-model-scope', 'Image Claude models',
+    'The Claude model families currently eligible for context imaging.',
+    'Model scope prevents experimental or unsupported models from being transformed unintentionally.',
+    'A highlighted chip with a check mark is enabled. Your choice is saved and survives restart until you press Reset (which falls back to PXPIPE_MODELS or the built-in default).',
+  );
+  const grokHelp = helpTip(
+    'grok-model-scope', 'Image Grok models',
+    'Opt-in model bases routed through the OpenAI Responses-compatible imaging path.',
+    'These models do not use Anthropic count_tokens or cache_control accounting.',
+    'Enable only models you intentionally want PXPIPE to image. Savings for this path are locally modeled, not provider-measured.',
+  );
+  const gptHelp = helpTip(
+    'gpt-model-scope', 'Image GPT models',
+    'GPT model bases currently eligible for context imaging on the Responses path.',
+    'It controls transformation only; it does not change the configured upstream model or provider.',
+    'Checked chips are enabled. Their reduction is locally modeled and kept separate from Claude provider-measured savings.',
+  );
   return (
     `<div class="models">` +
-    `<span class="models-label">Image Claude models</span>` +
+    `<span class="models-label">Image Claude models</span>${claudeHelp}` +
     claudeChips +
-    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
+    `<span class="hint">everything else is sent as normal text · your choice is saved until Reset</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image Grok models</span>` +
+    `<span class="models-label">Image Grok models</span>${grokHelp}` +
     grokChips +
     otherChips +
-    `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
+    `<span class="hint">opt-in only · OpenAI Responses path · your choice is saved until Reset</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image GPT models</span>` +
+    `<span class="models-label">Image GPT models</span>${gptHelp}` +
     gptChips +
-    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
+    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · your choice is saved until Reset</span>${moot}` +
+    `</div>` +
+    `<div class="models models-reset">` +
+    `<button class="chip" type="button" ` +
+    `hx-post="/fragments/models/reset" hx-target="#frag-models">Reset to default</button>` +
+    `<span class="hint">clears your saved choice · falls back to PXPIPE_MODELS or the built-in default</span>` +
     `</div>`
   );
 }
@@ -165,48 +270,67 @@ export function renderModelsFragment(
 const INPUT_USD_PER_MTOK = 10.0;
 void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the server's pricing block.
 
-// Lifetime hero. Reads the SAME cumulative weighted totals as the header strip
-// (serveStats), so the headline and the "$ saved" tiles can never disagree, and
-// the number stops swinging on tiny per-session samples. Cache-weighted on
-// purpose ("lifeweight"): it answers "did pxpipe move my real, cache-discounted
-// bill since this proxy started", not a raw token count.
-export function renderSessionSummaryFragment(s: StatsPayload): string {
-  const measured = s.compressed_requests ?? 0;
-  if (measured <= 0) {
+// Compact, explicitly scoped summary for the most recently active session.
+// The Overview above it owns the since-restart aggregate.
+export function renderSessionSummaryFragment(s: CurrentSessionPayload): string {
+  const help = helpTip(
+    'current-session',
+    'Current session',
+    'A cache-aware comparison for the most recently active PXPIPE session only.',
+    'It separates the work happening now from totals accumulated since the proxy restarted.',
+    'Positive percentages mean less estimated input than the same context as text. Negative percentages mean imaging cost more. Output is excluded because PXPIPE does not change it.',
+  );
+  const percentHelp = helpTip(
+    'current-session-percent', 'Current-session percentage',
+    'The cache-aware input difference for the selected session’s comparable responses.',
+    'It shows the direction and relative size of PXPIPE’s attributed input effect while you work.',
+    'It changes only when a new comparable response enters this selected session. It is not a provider bill, and output is intentionally excluded.',
+  );
+  const effectiveInputHelp = helpTip(
+    'current-session-effective-input', 'Effective input comparison',
+    'Actual input sent through PXPIPE compared with the same context estimated as plain text.',
+    'Both values apply the same cache-create and cache-read weights, so they are comparable.',
+    'The first number is actual imaged-path input; the second is the text counterfactual. Smaller actual input produces a positive percentage.',
+  );
+  if (!s.sessionId) {
     return (
-      `<div class="hero hero-empty">` +
-      `<div class="hero-eyebrow">Since start</div>` +
-      `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your running savings show up right here.</div>` +
+      `<div class="hero hero-empty" data-session-id="">` +
+      `<div class="block-label-row"><div class="hero-eyebrow">Current session</div>${help}</div>` +
+      `<div class="hero-headline">Waiting for session traffic…</div>` +
+      `<div class="hero-sub">Send a request through PXPIPE. This panel will then show only the most recently active session.</div>` +
       `</div>`
     );
   }
-  // Cache-aware reduction — same basis as the Details panel + Saved column.
-  // Raw count_tokens would over-claim: most of the text baseline would have been
-  // cheap cache-reads (~0.1×), not full-price tokens. Weighting both sides at their
-  // real cache rate is the only comparison that can't contradict the Saved column.
-  // Input-only: pxpipe never touches output, so lumping it in just dampened the %.
-  const baselineW = s.baseline_input_weighted ?? 0; // same context as text, cache-aware
-  const actualW = s.actual_input_weighted ?? 0; // what we actually sent, cache-aware
-  const outMult = s.pricing_assumptions?.output_multiplier || 5;
-  const rawOutput = (s.output_weighted ?? 0) / outMult; // reply — never compressed
+  const baselineW = s.baselineInputWeighted ?? 0;
+  const actualW = s.actualInputWeighted ?? 0;
+  const measured = s.baselineMeasuredCount ?? 0;
+  if (measured <= 0 || baselineW <= 0) {
+    return (
+      `<div class="hero hero-empty" data-session-id="${escapeHtml(s.sessionId)}">` +
+      `<div class="block-label-row"><div class="hero-eyebrow">Current session · ${escapeHtml(s.sessionId.slice(0, 8))}</div>${help}</div>` +
+      `<div class="hero-headline">Waiting for a comparable response…</div>` +
+      `<div class="hero-sub">Traffic exists, but this session does not yet have both an actual input count and a text counterfactual.</div>` +
+      `<div class="hero-meta"><span>Watching this session · no input-change claim yet</span><button class="session-follow" type="button" onclick="ppWatchLatest()">Follow latest activity</button></div>` +
+      `</div>`
+    );
+  }
   const inputPct = baselineW > 0 ? (1 - actualW / baselineW) * 100 : 0;
   const positive = inputPct >= 0;
   const bigNum = `${Math.abs(inputPct).toFixed(0)}%`;
-  const word = positive ? 'fewer tokens' : 'more tokens';
+  const word = positive ? 'less estimated input' : 'more estimated input';
+  const rawOutput = s.rawOutputTokens ?? 0;
 
   return (
-    `<div class="hero${positive ? '' : ' hero-neg'}">` +
-    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged</div>` +
-    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} after caching</div>` +
+    `<div class="hero${positive ? '' : ' hero-neg'}" data-session-id="${escapeHtml(s.sessionId)}">` +
+    `<div class="block-label-row"><div class="hero-eyebrow">Current session · ${escapeHtml(s.sessionId.slice(0, 8))} · ${numFmt(measured)} comparable response${measured === 1 ? '' : 's'}</div>${help}</div>` +
+    `<div class="hero-headline"><span class="hero-number-group"><span class="hero-num">${bigNum}</span>${percentHelp}</span> ${word} after caching</div>` +
     `<div class="hero-sub">` +
     `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
-    `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
-    `Your latest messages and Claude's live output are never compressed.` +
+    `stayed plain text — both counted after normal cache discounts in this session. ${effectiveInputHelp} This is a counterfactual estimate, not an invoice.` +
     `</div>` +
     `<div class="hero-meta">` +
-    `Cache-aware — cached reads counted at their real ~0.1× weight, not full price · ` +
-    `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
+    `<span>Watching this session · output untouched (${kFmt(rawOutput)}) · no dollar assumptions</span>` +
+    `<button class="session-follow" type="button" onclick="ppWatchLatest()">Follow latest activity</button>` +
     `</div>` +
     `</div>`
   );
@@ -219,115 +343,280 @@ function mathRow(key: string, val: number | string | undefined, note = ''): stri
   return `<div><span class="k">${key}:</span> <span class="v">${escapeHtml(v)}</span> <span class="k">${note}</span></div>`;
 }
 
-function mathBlock(title: string, body: string): string {
-  return `<section class="math-block"><h4>${title}</h4><div class="formula">${body}</div></section>`;
-}
-
-/** Stat tile; `tip` adds a hover "?" explainer. */
-function statTile(
-  label: string,
-  value: string,
-  sub: string,
-  cls = '',
-  tip = '',
-): string {
-  const q = tip
-    ? `<span class="q" tabindex="0" aria-label="${escapeHtml(tip)}" data-tip="${escapeHtml(tip)}">?</span>`
-    : '';
-  return (
-    `<div class="tile">` +
-    `<div class="tile-label">${label}${q}</div>` +
-    `<div class="tile-value ${cls}">${value}</div>` +
-    `<div class="tile-sub">${sub}</div>` +
-    `</div>`
-  );
+function mathBlock(title: string, body: string, help: string): string {
+  return `<section class="math-block"><div class="block-label-row"><h4>${title}</h4>${help}</div><div class="formula">${body}</div></section>`;
 }
 
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
+  const pricedRows = s.priced_measured_savings_requests ?? 0;
+  const unpricedRows = s.unpriced_measured_savings_requests ?? 0;
+  const measuredClaudeRows = s.measured_anthropic_savings_requests ?? 0;
+  const estimatedResponsesRows = s.estimated_openai_savings_requests ?? 0;
+  const excludedProbeRows = s.baseline_probe_excluded_requests ?? 0;
+  const cacheCreate5m = s.cache_create_5m_tokens ?? 0;
+  const cacheCreate1h = s.cache_create_1h_tokens ?? 0;
+  const cacheCreateUnknown = s.cache_create_tier_unknown_tokens ?? 0;
+  const priceCoverageTotal = pricedRows + unpricedRows;
+  const priceCoverage = priceCoverageTotal > 0
+    ? `${pricedRows}/${priceCoverageTotal} rows`
+    : 'No priced rows yet';
+  const codex = s.codex_actual_usage ?? {
+    source: '', loading: false, error: null, sessionFiles: 0, usageSnapshots: 0,
+    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+    reasoningOutputTokens: 0, totalTokens: 0, modelContextWindow: null,
+    earliestEventAt: null, latestEventAt: null, rateLimits: null, quotaWindows: [],
+  };
+  const codexCachePct = codex.inputTokens > 0
+    ? ((codex.cachedInputTokens / codex.inputTokens) * 100).toFixed(1)
+    : '0.0';
+  const measuredClaudeSaved = s.measured_claude_saved_input_equivalents ?? 0;
+  const modeledResponsesSaved = s.modeled_openai_saved_input_equivalents ?? 0;
+  const usageBearingResponses = s.usage_bearing_responses ?? s.all_usage_requests ?? 0;
+  const paidCompressed = s.compressed_paid_requests ?? 0;
+  const paidPassthrough = s.passthrough_paid_requests ?? 0;
+  const evidenceLabel = measuredClaudeRows > 0 && estimatedResponsesRows > 0
+    ? 'Mixed evidence'
+    : measuredClaudeRows > 0
+      ? 'Provider-measured'
+      : estimatedResponsesRows > 0
+        ? 'Modeled only'
+        : 'Collecting data';
+  const evidenceClass = measuredClaudeRows > 0 && estimatedResponsesRows === 0 && excludedProbeRows === 0
+    ? 'good'
+    : measuredClaudeRows > 0 || estimatedResponsesRows > 0
+      ? 'mixed'
+      : 'waiting';
+  const outcomeClass = (s.saved_input_tokens ?? 0) < 0 ? ' negative' : '';
+  const overviewHelp = helpTip(
+    'overview', 'Overview',
+    'A since-restart summary of PXPIPE effect, paid response activity, and evidence quality.',
+    'These values have different meanings. Keeping effect, activity, and confidence separate prevents token savings from being confused with provider usage.',
+    'Start with input change, then check whether it is Claude measured or Responses modeled. Use Paid LLM responses for sample size and Reliability for limitations.',
+  );
+  const changeHelp = helpTip(
+    'input-change', 'Estimated input change',
+    'The cache-aware difference between the input PXPIPE sent and a counterfactual where the same imageable context stayed as text.',
+    'It estimates the part PXPIPE can influence. It is not total provider usage and not an invoice.',
+    'Positive is an estimated reduction; negative means imaging used more effective input. Claude rows use provider counts. Responses rows use a local tokenizer and vision model.',
+  );
+  const paidHelp = helpTip(
+    'paid-responses', 'Paid LLM responses',
+    'Responses with non-zero upstream usage that entered paid-traffic accounting since restart.',
+    'Health checks, errors without usage, and other proxy traffic should not inflate the sample size used to judge savings.',
+    'Imaged and passthrough are the two paths. “Uncredited” is a subset of imaged rows whose baseline could not be verified, so zero savings were assigned.',
+  );
+  const reliabilityHelp = helpTip(
+    'reliability', 'Estimate reliability',
+    'A summary of where the estimate came from and how much of the Claude value has an exact configured model price.',
+    'Provider-measured Claude rows are stronger evidence than locally modeled Responses rows. Missing probes and missing prices reduce what can be claimed.',
+    'Provider-measured is strongest. Mixed evidence combines measured and modeled rows. Modeled only should be treated as directional. Open Audit for formulas and exclusions.',
+  );
+  const claudeMeasuredHelp = helpTip(
+    'claude-measured', 'Claude provider-measured reduction',
+    'Claude input change calculated from an Anthropic text count for the baseline and upstream usage for the actual request.',
+    'Both sides are provider measurements, making this the strongest savings evidence PXPIPE exposes.',
+    'The token-equivalent value includes cache weights. Dollar value covers only rows whose exact model price is configured; the priced-row fraction is shown inline.',
+  );
+  const responsesModeledHelp = helpTip(
+    'responses-modeled', 'Responses locally modeled reduction',
+    'OpenAI Responses input change estimated locally with the matching text tokenizer and the vision-token model used for imaged content.',
+    'Responses does not provide the same count endpoint as Claude, so PXPIPE cannot claim this part as provider-measured.',
+    'Use it as a directional token-equivalent estimate. It is disclosed separately and deliberately excluded from dollar savings.',
+  );
+  const imagedHelp = helpTip(
+    'paid-imaged', 'Imaged paid responses',
+    'Paid responses whose eligible context PXPIPE rendered into images before sending upstream.',
+    'They are the rows where PXPIPE can potentially change input usage.',
+    'This is a path count, not a savings count: an imaged row can still be uncredited if no trustworthy baseline was available.',
+  );
+  const passthroughHelp = helpTip(
+    'paid-passthrough', 'Passthrough paid responses',
+    'Paid responses sent upstream without imaging.',
+    'They show the real amount of traffic for which PXPIPE did not transform the context.',
+    'They remain in paid-traffic totals but normally contribute zero attributed input change.',
+  );
+  const uncreditedHelp = helpTip(
+    'paid-uncredited', 'Uncredited imaged rows',
+    'Imaged paid responses that lacked a successful comparable text baseline.',
+    'PXPIPE assigns them zero savings instead of guessing, which keeps the estimate conservative.',
+    'This count is a subset of imaged responses, not a third traffic path to add to the total.',
+  );
+  const priceCoverageHelp = helpTip(
+    'price-coverage', 'Exact model-price coverage',
+    'The fraction of provider-measured Claude rows with a configured official input price.',
+    'Only those rows can contribute to the model-priced dollar value without using a generic tariff.',
+    'A lower fraction means the displayed dollar amount is deliberately partial; token-equivalent reduction can still include all measured rows.',
+  );
 
-  // stat strip
-  const splitReady = s.split_sufficient_sample;
-  const cAvg = s.compressed_avg_usd_per_request ?? 0;
-  const pAvg = s.passthrough_avg_usd_per_request ?? 0;
-  const costTile = splitReady
-    ? statTile(
-        'Cost per request',
-        `$${cAvg.toFixed(4)}`,
-        `vs $${pAvg.toFixed(4)} without pxpipe`,
-        cAvg <= pAvg ? 'pos' : 'neg',
-        'Average real cost of a request with imaging on vs off (passthrough), measured on your own traffic.',
-      )
-    : statTile(
-        'Cost per request',
-        'collecting…',
-        `${numFmt(s.compressed_paid_requests)} imaged · ${numFmt(s.passthrough_paid_requests)} passthrough so far`,
-        'muted-val',
-        `Needs at least ${s.split_min_sample_per_bucket} paid requests on each path before the comparison is trustworthy.`,
-      );
+  const overview =
+    `<details class="overview-panel collapsible-panel" id="overview" open aria-labelledby="overview-title">` +
+    `<summary><span><span class="scope-label">Overview · since restart</span><span class="collapsible-title" id="overview-title">What PXPIPE changed</span></span><span class="collapsible-actions"><span class="scope-chip"><span class="live-dot"></span>live · ${formatDuration(s.uptime_sec)}</span><span class="collapse-control"><span class="when-open">Hide</span><span class="when-closed">Show</span></span></span></summary>` +
+    `<div class="collapsible-content">` +
+    `<div class="overview-head">` +
+    `<div><p>Effect, activity, and evidence are separated so unlike numbers are not compared accidentally.</p></div>` +
+    overviewHelp +
+    `</div>` +
+    `<div class="overview-grid">` +
+    `<article class="outcome-card${outcomeClass}">` +
+    `<div class="block-label-row"><div class="card-eyebrow">Estimated input change</div>${changeHelp}</div>` +
+    `<div class="outcome-value">${numFmt(s.saved_input_tokens)}</div>` +
+    `<div class="outcome-note">cache-aware counterfactual · not a provider bill</div>` +
+    `<div class="effect-breakdown">` +
+    `<div class="effect-row measured"><span class="effect-name"><span><b>Claude</b><small>provider-measured · ${numFmt(measuredClaudeRows)} rows</small></span>${claudeMeasuredHelp}</span><span class="effect-result"><strong>${numFmt(measuredClaudeSaved)}</strong>${pricedRows > 0 ? `<span class="price-callout"><small>Model-priced input value</small><b class="price-value">$${(s.saved_usd ?? 0).toFixed(2)}</b><em>${pricedRows}/${priceCoverageTotal} priced Claude rows</em></span>` : '<em>unpriced</em>'}</span></div>` +
+    `<div class="effect-row modeled"><span class="effect-name"><span><b>Responses</b><small>locally modeled · ${numFmt(estimatedResponsesRows)} rows</small></span>${responsesModeledHelp}</span><strong>${numFmt(modeledResponsesSaved)} <em>not priced</em></strong></div>` +
+    `</div></article>` +
+    `<article class="overview-card">` +
+    `<div class="block-label-row"><div class="card-eyebrow">Paid LLM responses</div>${paidHelp}</div>` +
+    `<div class="overview-value">${numFmt(usageBearingResponses)}</div>` +
+    `<div class="overview-lines">` +
+    `<span><span class="field-label"><b>${numFmt(paidCompressed)}</b> imaged${imagedHelp}</span></span>` +
+    `<span><span class="field-label"><b>${numFmt(paidPassthrough)}</b> passthrough${passthroughHelp}</span></span>` +
+    `<span><span class="field-label"><b>${numFmt(excludedProbeRows)}</b> of imaged rows uncredited${uncreditedHelp}</span></span>` +
+    `</div><small>${numFmt(s.requests)} total proxy responses observed</small>` +
+    `</article>` +
+    `<article class="overview-card evidence-card">` +
+    `<div class="evidence-title"><div class="card-eyebrow">How reliable is the estimate?</div><div class="evidence-actions"><span class="quality-badge ${evidenceClass}">${evidenceLabel}</span>${reliabilityHelp}</div></div>` +
+    `<div class="overview-lines compact">` +
+    `<span><b>${numFmt(measuredClaudeRows)}</b> Claude rows measured by provider</span>` +
+    `<span><b>${numFmt(estimatedResponsesRows)}</b> Responses rows modeled locally</span>` +
+    `<span><span class="field-label"><b>${priceCoverage}</b> exact model-price coverage${priceCoverageHelp}</span></span>` +
+    `</div><a class="text-link" href="#audit-drawer">See methodology and assumptions ↓</a>` +
+    `</article>` +
+    `</div>` +
+    `<div class="reading-legend">` +
+    `<span><b>Reduction</b> = estimated counterfactual</span>` +
+    `<span><b>$ value</b> = measured Claude only</span>` +
+    `<span><b>Codex usage</b> = consumption, not savings</span>` +
+    `</div></div></details>`;
 
-  const strip =
-    `<div class="strip">` +
-    statTile('Requests', numFmt(s.requests), `${numFmt(s.compressed_requests)} turned into images`) +
-    statTile(
-      'Input tokens saved',
-      numFmt(s.saved_input_tokens),
-      'vs sending the same context as text',
-      'pos',
-      'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — recent turns and the live output stay text.',
-    ) +
-    statTile(
-      'Estimated saved',
-      `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      `at $${pa.input_per_mtok}/M input tokens`,
-      '',
-      'A rough dollar figure: saved tokens × the input price. Actual savings depend on your plan and caching — see the math drawer.',
-    ) +
-    costTile +
-    `</div>`;
+  const quotaLabel = (minutes: number): string => {
+    if (minutes === 300) return '5-hour';
+    if (minutes === 10_080) return 'Weekly';
+    if (minutes > 0 && minutes % 1_440 === 0) return `${minutes / 1_440}-day`;
+    if (minutes > 0 && minutes % 60 === 0) return `${minutes / 60}-hour`;
+    return `${numFmt(minutes)} min`;
+  };
+  const quotaRows = groupCodexQuotaWindows(codex.quotaWindows ?? []).map((group) => {
+    const limitId = group.limitId ?? 'codex';
+    const displayName = group.limitName || (limitId === 'codex' ? 'Codex' : limitId);
+    return `<div class="quota-row"><span class="quota-name"><b>${escapeHtml(displayName)}</b><small>${escapeHtml(limitId)}</small></span>` +
+      group.windows.map((window) =>
+        `<span><small>${quotaLabel(window.windowMinutes)}</small><b>${window.usedPercent.toFixed(1)}%</b><em>${formatReset(window.resetsAt)}</em></span>`,
+      ).join('') + `</div>`;
+  }).join('');
+  const codexStatus = codex.loading
+    ? 'Scanning official rollouts…'
+    : codex.error
+      ? 'Rollout scan unavailable'
+    : 'Retained rollout coverage';
+  const codexHelp = helpTip(
+    'codex-usage', 'Codex provider-reported usage',
+    'Exact token and rate-limit observations read from retained local Codex rollout files whose provider is PXPIPE.',
+    'This is the best available view of actual Codex consumption, but it covers retained files rather than every request ever made.',
+    'Input includes cached input. Output includes reasoning. Do not add those subcomponents twice, and do not compare this usage total directly with estimated savings.',
+  );
+  const codexInputHelp = helpTip(
+    'codex-input', 'Actual input',
+    'Provider-reported Codex input tokens found in retained PXPIPE rollouts.',
+    'It shows consumption, not what PXPIPE saved.',
+    'Treat it as a cumulative retained-rollout total. Cached input is already included in this number.',
+  );
+  const codexCacheHelp = helpTip(
+    'codex-cache', 'Cached input',
+    'The portion of actual Codex input served from provider cache.',
+    'Cached tokens are usually billed or limited differently, but they are still part of input usage.',
+    'Read the token count and percentage as a subset of Actual input. Never add it to Actual input again.',
+  );
+  const codexOutputHelp = helpTip(
+    'codex-output', 'Actual output',
+    'Provider-reported Codex output tokens, including reasoning output.',
+    'PXPIPE compresses input context only, so output is usage context rather than a savings claim.',
+    'The smaller reasoning value is already included in total output and should not be added twice.',
+  );
+  const codexCoverageHelp = helpTip(
+    'codex-coverage', 'PXPIPE coverage',
+    'The number of usable token snapshots and retained Codex session files scanned locally.',
+    'It defines the boundary of the Codex totals shown here.',
+    'More records improve retained-history coverage, but deleted, moved, direct-provider, or unreadable rollouts remain outside the total.',
+  );
+  const quotaHelp = helpTip(
+    'codex-quotas', 'Provider quota windows',
+    'The freshest provider-reported percentage and reset time for every quota window, grouped by limit identifier.',
+    'Different Codex products can report separate limits with the same duration; grouping prevents them from being merged accidentally.',
+    'Each percentage is used quota for that named limit and window. Reset times come from the provider and are shown in local time.',
+  );
+  const codexPanel =
+    `<details class="codex-panel collapsible-panel" id="usage-limits" open aria-labelledby="codex-title">` +
+    `<summary><span><span class="scope-label codex-eyebrow">Usage &amp; limits · retained rollouts</span><span class="collapsible-title" id="codex-title">Codex provider-reported usage</span></span><span class="collapsible-actions"><span class="codex-badge">${codexStatus}</span><span class="collapse-control"><span class="when-open">Hide</span><span class="when-closed">Show</span></span></span></summary>` +
+    `<div class="collapsible-content">` +
+    `<div class="quality-head">` +
+    `<div><div class="title-help-row"><p class="quality-lead">Consumption found in retained local PXPIPE rollouts. This is usage, not evidence of token savings.</p>${codexHelp}</div></div>` +
+    `</div>` +
+    `<div class="quality-grid">` +
+    `<div class="quality-metric"><div class="block-label-row"><span class="quality-label">Actual input</span>${codexInputHelp}</div><strong>${numFmt(codex.inputTokens)}</strong><small>provider-reported input tokens</small></div>` +
+    `<div class="quality-metric"><div class="block-label-row"><span class="quality-label">Cached input</span>${codexCacheHelp}</div><strong>${numFmt(codex.cachedInputTokens)} · ${codexCachePct}%</strong><small>included in actual input, not added twice</small></div>` +
+    `<div class="quality-metric"><div class="block-label-row"><span class="quality-label">Actual output</span>${codexOutputHelp}</div><strong>${numFmt(codex.outputTokens)}</strong><small>${numFmt(codex.reasoningOutputTokens)} reasoning tokens included</small></div>` +
+    `<div class="quality-metric"><div class="block-label-row"><span class="quality-label">PXPIPE coverage</span>${codexCoverageHelp}</div><strong>${numFmt(codex.usageSnapshots)} usage records</strong><small>${numFmt(codex.sessionFiles)} retained Codex session files</small></div>` +
+    `</div>` +
+    `<div class="usage-scope">Observed ${formatObservedAt(codex.earliestEventAt)} → ${formatObservedAt(codex.latestEventAt)} · ${numFmt(codex.sessionFiles)} retained files</div>` +
+    `<div class="quota-head"><strong>Provider quota windows</strong>${quotaHelp}</div>` +
+    `<div class="quota-list">${quotaRows || '<div class="quota-empty">No quota windows reported yet</div>'}</div>` +
+    `<p class="quality-caveat"><strong>Usage, not savings.</strong> Cached input is included in input; reasoning is included in output. Deleted or unavailable rollouts are outside this coverage.</p>` +
+    `</div></details>`;
 
   // math drawer
   const savedMath =
     `<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>` +
-    `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create×1.25, cache_read×0.10</span></div>` +
+    `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create_5m×1.25, cache_create_1h×2.0, cache_read×0.10</span></div>` +
     `<div class="sp"></div>` +
     mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable×weight + cold_tail)') +
-    mathRow('actual', s.actual_input_weighted, '(input + cc×1.25 + cr×0.10 from usage)') +
+    mathRow('actual', s.actual_input_weighted, '(input + server-reported cache tier + cache-read from usage)') +
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
-    `<span class="src">output excluded — identical with/without compression</span>`;
+    mathRow('Claude measured reduction', measuredClaudeSaved, 'provider count_tokens baseline + upstream usage') +
+    mathRow('Responses modeled reduction', modeledResponsesSaved, 'local tokenizer/vision counterfactual; not dollar-priced') +
+    mathRow('TTL sensitivity (unknown creates→1h)', s.saved_if_unknown_cache_create_1h, 'downside scenario for rows whose server response omitted the 5m/1h split; not a confidence interval') +
+    `<div class="sp"></div>` +
+    mathRow('measured Claude rows', s.measured_anthropic_savings_requests, 'count_tokens + upstream usage; high-confidence part of the headline') +
+    mathRow('estimated Responses rows', s.estimated_openai_savings_requests, 'local tokenizer/vision model; disclosed separately in this mixed legacy aggregate') +
+    mathRow('probe-excluded rows', s.baseline_probe_excluded_requests, 'compressed paid requests with no successful baseline; zero saving credited') +
+    mathRow('cache-create 5m / 1h / unknown', `${numFmt(s.cache_create_5m_tokens)} / ${numFmt(s.cache_create_1h_tokens)} / ${numFmt(s.cache_create_tier_unknown_tokens)}`, 'unknown tier retains the legacy 5m assumption; not proof of its TTL') +
+    `<span class="src">output excluded — identical with/without compression; baseline cache TTL remains a modeled counterfactual</span>`;
 
   const usdMath =
-    `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens × $${pa.input_per_mtok}/Mtok</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">$ saved = Σ(row_saved × that model’s input rate)</span></div>` +
     `<div class="sp"></div>` +
-    mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
-    mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> saved_tokens × input_rate / 1e6`) +
-    `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
+    mathRow('priced Claude rows', pricedRows, `${numFmt(unpricedRows)} measured Claude rows excluded until configured`) +
+    mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> sum of model-priced rows`) +
+    `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')} · override: PXPIPE_MODEL_INPUT_USD_PER_MTOK JSON</span>`;
 
+  const usdToTokenEquiv = (usd: number | undefined): number =>
+    pa.input_per_mtok > 0 ? ((usd ?? 0) * 1e6) / pa.input_per_mtok : 0;
   const splitMath =
-    `<div><span class="k">formula:</span> <span class="v">bucket_$ = (Σ actual_input + Σ output × ${pa.output_multiplier}) × $${pa.input_per_mtok}/Mtok</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">partition the paid-rows set by which path actually ran (compressed vs passthrough). Same $/Mtok on both sides so the rate assumption cancels in the delta. Selection bias (the gate routes each turn) does NOT cancel — read with the sample counts.</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">cost_index = weighted actual input + output × ${pa.output_multiplier}</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">partitions paid responses by the path that ran. It is a normalized token-equivalent index across mixed providers, not model-priced dollars. Selection bias still applies — read it with the sample counts.</span></div>` +
     `<div class="sp"></div>` +
-    mathRow(`compressed (n=${s.compressed_paid_requests})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.compressed_avg_usd_per_request || 0).toFixed(4)}/req`) +
-    mathRow(`passthrough (n=${s.passthrough_paid_requests})`, `$${(s.passthrough_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.passthrough_avg_usd_per_request || 0).toFixed(4)}/req`) +
+    mathRow(`imaged (n=${s.compressed_paid_requests})`, usdToTokenEquiv(s.compressed_actual_usd), `total equivalents · avg ${numFmt(usdToTokenEquiv(s.compressed_avg_usd_per_request))}/response`) +
+    mathRow(`passthrough (n=${s.passthrough_paid_requests})`, usdToTokenEquiv(s.passthrough_actual_usd), `total equivalents · avg ${numFmt(usdToTokenEquiv(s.passthrough_avg_usd_per_request))}/response`) +
     mathRow(
-      'compressed − passthrough',
-      `$${(s.compressed_minus_passthrough_avg_usd || 0).toFixed(4)}/req`,
+      'imaged − passthrough',
+      `${numFmt(usdToTokenEquiv(s.compressed_minus_passthrough_avg_usd))}/response`,
       s.split_sufficient_sample
         ? `(both buckets ≥ ${s.split_min_sample_per_bucket} — delta is meaningful)`
         : `(small sample: need ≥ ${s.split_min_sample_per_bucket} per bucket; treat as noisy)`,
     ) +
-    `<span class="src">no counterfactual, no probe gate — pure observed $/req on each path</span>`;
+    `<span class="src">observed normalized cost index; mixed-provider and not a currency value</span>`;
 
   const pctMath =
-    `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
-    `<div><span class="k">diagnostic, not the headline:</span> <span class="v">this is a counterfactual ("what you WOULD have paid"). It leans on the count_tokens probe, the cache-aware split, and an input-rate assumption. Useful as a sanity check; the real-traffic answer is the compressed-vs-passthrough split above.</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">reduction_share = combined_reduction / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
+    `<div><span class="k">diagnostic, not spend:</span> <span class="v">this mixed-provider counterfactual combines provider-measured Claude and locally modeled Responses reductions in normalized token equivalents. It is not a share of an invoice.</span></div>` +
     `<div class="sp"></div>` +
-    mathRow('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
+    mathRow('combined_reduction', s.saved_input_tokens, '(Claude measured + Responses modeled; cache-aware)') +
     mathRow('all_baseline_equivalent', s.all_baseline_equivalent_weighted, '(every paid request; baseline on measured + actual on the rest)') +
     mathRow(`all_output × ${pa.output_multiplier}`, s.all_output_weighted, '(every paid request)') +
-    mathRow('share_of_spend', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> saved / counterfactual_total × 100`) +
+    mathRow('reduction_share', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> combined reduction / counterfactual total × 100`) +
     mathRow('all_usage_requests', s.all_usage_requests, '(denominator request count — compressed + passthrough + probe-failed)') +
-    `<span class="src">measured numerator, all-rows counterfactual denominator — bounded at 100%</span>`;
+    `<span class="src">mixed evidence numerator, all-rows normalized denominator — bounded at 100%</span>`;
 
   const tokeqMath =
     `<div><span class="k">formula:</span> <span class="v">token_equivalent = input + output × ${pa.output_multiplier}</span></div>` +
@@ -344,21 +633,46 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<span class="src">measured — no estimation</span>`;
 
   const drawer =
-    `<details class="drawer" id="math-drawer">` +
-    `<summary>Show the math &amp; honesty receipts</summary>` +
-    `<div class="drawer-intro">Every number above, derived from the same per-event log. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
+    `<details class="drawer" id="audit-drawer">` +
+    `<summary>Show the math &amp; honesty receipts <span class="summary-q" aria-hidden="true">?</span></summary>` +
+    `<div class="drawer-intro"><strong>Audit note:</strong> the savings headline is a counterfactual (the same request as plain text), not an invoice. Claude credit requires upstream usage and a successful text probe; OpenAI/Responses rows use a local text-versus-image estimate. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
     `<div class="math-grid">` +
-    mathBlock('Input tokens saved', savedMath) +
-    mathBlock('Dollars saved', usdMath) +
-    mathBlock('Compressed vs passthrough, per request', splitMath) +
-    mathBlock('Share of total spend (diagnostic)', pctMath) +
-    mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath) +
+    mathBlock('Input tokens saved', savedMath, helpTip(
+      'audit-input', 'Input tokens saved math',
+      'The exact cache-aware counterfactual formula behind the input-change headline.',
+      'It exposes the weights, exclusions, and measured-versus-modeled split instead of hiding assumptions in one total.',
+      'Compare baseline with actual, then inspect Claude measured and Responses modeled subtotals. Probe-excluded rows receive zero credit.',
+    )) +
+    mathBlock('Dollars saved', usdMath, helpTip(
+      'audit-dollars', 'Dollar value math',
+      'The sum of Claude measured reductions multiplied by each row’s configured model input price.',
+      'A single generic price would be misleading when models have different tariffs.',
+      'Only priced Claude rows contribute. Responses modeled savings and unknown Claude prices are deliberately excluded.',
+    )) +
+    mathBlock('Observed path cost index (diagnostic)', splitMath, helpTip(
+      'audit-path-index', 'Observed path cost index',
+      'A normalized input-equivalent comparison of actual imaged and passthrough responses.',
+      'It is an observational sanity check that does not require a counterfactual baseline.',
+      'Use averages only when both samples are large enough. It is not currency, and path selection differences can bias the comparison.',
+    )) +
+    mathBlock('Estimated reduction share (mixed diagnostic)', pctMath, helpTip(
+      'audit-share', 'Estimated reduction share',
+      'Combined estimated reduction divided by a normalized all-response counterfactual total.',
+      'It answers how large the attributed change is relative to all paid traffic, including passthrough and uncredited rows.',
+      'Treat it as a mixed-evidence diagnostic, not a percentage of an invoice or provider quota.',
+    )) +
+    mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath, helpTip(
+      'audit-equivalent', 'Token-equivalent',
+      'Input plus output multiplied by the configured output-to-input price ratio.',
+      'It places input and output on one normalized scale for limit and cost diagnostics.',
+      'Output appears on both actual and baseline sides because PXPIPE does not compress it. Encrypted blocks can be billed even when their characters are not measurable.',
+    )) +
     `</div></details>`;
 
   // NOTE: tests assert the header fragment contains the port number.
   const updated = `<div class="updated"><span class="live-dot"></span>live · port ${port} · uptime ${formatDuration(s.uptime_sec)}</div>`;
 
-  return strip + drawer + updated;
+  return overview + codexPanel + drawer + updated;
 }
 
 // ---- request x-ray (image vs text breakdown) -----------------------------
@@ -434,6 +748,24 @@ export function renderContextMapFragment(
   const pct = showCompare ? Math.round((1 - real / base) * 100) : 0;
   const rawShrink = c.baselineTokens > 0 ? Math.round((1 - c.realInput / c.baselineTokens) * 100) : 0;
   const totalImagedChars = CTXMAP_BUCKETS.reduce((a, [key]) => a + (c.buckets[key] ?? 0), 0);
+  const billingBasisHelp = helpTip(
+    'context-billing-basis', 'Billing-equivalent comparison',
+    'The request-level comparison of imaged input with the same context estimated as text, using cache-aware weights.',
+    'Raw character counts and raw token counts can disagree with billed input when a cache is warm or newly written.',
+    'Use this headline and the Saved/lost table column for the comparable basis. Treat raw content shrinkage as a supporting diagnostic only.',
+  );
+  const imageColumnHelp = helpTip(
+    'context-images', 'Compressed into images',
+    'Context buckets that PXPIPE rendered into PNG pages for the upstream model.',
+    'These are the parts whose token representation can be reduced, at the trade-off of visual rather than byte-exact interpretation.',
+    'Character counts describe source size. Inspect pages when fidelity matters, especially for numbers, identifiers, and code-like content.',
+  );
+  const textColumnHelp = helpTip(
+    'context-text', 'Kept as plain text',
+    'Context PXPIPE deliberately leaves native, including the newest user messages and model output.',
+    'Keeping high-precision or recent content as text protects exactness and conversational continuity.',
+    'These rows do not become images. “Verbatim” means they are forwarded as text; model output is shown only as usage context.',
+  );
 
   const imgRows = CTXMAP_BUCKETS.map(([key, label]) => [label, c.buckets[key] ?? 0] as const)
     .filter(([, ch]) => ch > 0)
@@ -516,17 +848,17 @@ export function renderContextMapFragment(
 
   return (
     `<div class="ctxmap">` +
-    `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline}</div>` +
+    `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline} ${billingBasisHelp}</div>` +
     `<div class="split-note ctx-subnote">${subnote}</div>` +
     `<div class="legend"><span class="tag tag-img">Became an image</span><span class="tag tag-txt">Stayed as text</span></div>` +
     `<div class="split">` +
     `<div class="split-col split-img">` +
-    `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
+    `<div class="split-head"><span class="field-label">Compressed into images${imageColumnHelp}</span> <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
     (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
     `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
-    `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
+    `<div class="split-head"><span class="field-label">Kept as plain text${textColumnHelp}</span> <span class="split-sum">byte-exact</span></div>` +
     `<div class="ctx-row"><span class="ctx-lbl">Your latest messages</span><span class="ctx-val">verbatim</span></div>` +
     `<div class="ctx-row"><span class="ctx-lbl">Model reply (output)</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
     `<div class="split-note">never imaged — safe for IDs, hashes and exact numbers.</div>` +
@@ -548,6 +880,36 @@ function statusCls(status: number): string {
 
 export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
+  const sentAsHelp = helpTip(
+    'recent-sent-as', 'Sent as',
+    'Whether the eligible context was sent upstream as images or normal text for this response.',
+    'It identifies the actual path, not whether a saving was proven.',
+    'Image means PXPIPE transformed eligible context. Text means passthrough. Use Saved/lost to see the attributed input difference when a baseline exists.',
+  );
+  const cacheHitsHelp = helpTip(
+    'recent-cache-hits', 'Cache hits',
+    'Provider input tokens served from a warm cache on this request.',
+    'Warm cache reads have a lower billing weight, so they materially affect fair text-versus-image comparisons.',
+    'This is a subset of input usage. A high value can make raw text reduction look larger than billing-equivalent savings.',
+  );
+  const asTextHelp = helpTip(
+    'recent-as-text', 'As text',
+    'The cache-aware input counterfactual if the same request had stayed as plain text.',
+    'It is the baseline used to attribute PXPIPE input change.',
+    'Compare it with Sent only on rows where both values exist. It is not a separately billed request.',
+  );
+  const sentHelp = helpTip(
+    'recent-sent', 'Sent',
+    'Actual cache-aware input usage of the request that was sent upstream.',
+    'This is the observed side of the text-versus-image comparison.',
+    'Compare it with As text. It includes the appropriate cache create/read weighting, not raw input tokens alone.',
+  );
+  const savedHelp = helpTip(
+    'recent-saved-lost', 'Saved/lost',
+    'As text minus Sent, expressed as cache-aware input equivalents.',
+    'It shows the attributed effect for this one request using the same basis as the dashboard overview.',
+    'Positive means estimated reduction; negative means the imaged path cost more. A create badge marks a one-time cache-write premium that later reads may recoup.',
+  );
   const body =
     rows.length === 0
       ? `<tr><td colspan="10" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
@@ -556,7 +918,7 @@ export function renderRecentFragment(p: RecentPayload): string {
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
             const viewLink =
               viewId != null
-                ? `<a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a>`
+                ? `<button class="row-view" type="button" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</button>`
                 : `<span class="muted">—</span>`;
             const saved = e.session_saved_so_far_delta;
             // A loss that disappears when the newly written prefix is repriced at
@@ -604,11 +966,11 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>Result</th>` +
     `<th>Endpoint</th>` +
     `<th>Model</th>` +
-    `<th title="Was this request's context compressed into an image?">Sent as</th>` +
-    `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
-    `<th class="num" title="Billing-equivalent input if kept as plain text, after cache create/read rates">As text</th>` +
-    `<th class="num" title="Actual billing-equivalent input after imaging, after cache create/read rates">Sent</th>` +
-    `<th class="num" title="As-text minus Sent; negative means imaging cost more">Saved/lost</th>` +
+    `<th><span class="th-help">Sent as${sentAsHelp}</span></th>` +
+    `<th class="num"><span class="th-help">Cache hits${cacheHitsHelp}</span></th>` +
+    `<th class="num"><span class="th-help">As text${asTextHelp}</span></th>` +
+    `<th class="num"><span class="th-help">Sent${sentHelp}</span></th>` +
+    `<th class="num"><span class="th-help">Saved/lost${savedHelp}</span></th>` +
     `<th></th>` +
     `</tr></thead><tbody>${body}</tbody></table>`
   );
@@ -810,13 +1172,14 @@ const CSS = `
   .muted { color: var(--muted); }
 
   /* topbar */
-  .topbar { display: flex; align-items: flex-start; justify-content: space-between;
-    gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+  .topbar { position: sticky; top: 0; z-index: 200; display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin: -22px -26px 18px; padding: 14px 26px 12px; background: color-mix(in srgb, var(--bg) 94%, transparent);
+    border-bottom: 1px solid var(--border); box-shadow: 0 5px 18px rgba(45,28,16,.06); backdrop-filter: blur(12px); }
   .brand { display: flex; align-items: center; gap: 12px; }
   .flame-dot { width: 14px; height: 14px; border-radius: 50%;
     background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
     box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
-  .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
+  .wordmark { margin: 0; font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
   .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
   .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 
@@ -840,6 +1203,61 @@ const CSS = `
     box-shadow: var(--shadow); display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
   .theme-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
 
+  .page-nav { display: flex; align-items: center; gap: 5px; margin: -8px 0 14px; overflow-x: auto; }
+  .page-nav a { color: var(--muted); text-decoration: none; font-size: 11.5px; font-weight: 650;
+    white-space: nowrap; padding: 5px 9px; border-radius: 7px; }
+  .page-nav a:hover { color: var(--flame-ink); background: var(--flame-tint); }
+  .settings-shell { position: relative; }
+  .settings-shell > .help-tip { position: absolute; z-index: 5; top: 8px; right: 12px; }
+  .settings-panel { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: var(--shadow); }
+  .settings-panel > summary { cursor: pointer; list-style: none; padding: 9px 13px; color: var(--ink-2);
+    padding-right: 46px; font-size: 11.5px; font-weight: 650; }
+  .settings-panel > summary::-webkit-details-marker { display: none; }
+  .settings-panel > summary::before { content: '⚙'; margin-right: 7px; color: var(--muted); }
+  .settings-panel[open] > summary { border-bottom: 1px solid var(--border); }
+  .settings-panel > summary:focus-visible, .page-nav a:focus-visible, .text-link:focus-visible,
+  .drawer > summary:focus-visible { outline: 2px solid var(--flame); outline-offset: 2px; }
+  .settings-panel #frag-models { padding: 12px 13px 2px; }
+  .settings-panel .models { margin-bottom: 10px; }
+
+  /* Contextual help: native details works with mouse, keyboard, and touch. */
+  .help-tip { position: relative; display: inline-flex; flex: none; font-size: 12px; }
+  .help-tip[open] { z-index: 100; }
+  .help-tip > summary { display: inline-flex; align-items: center; justify-content: center; width: 19px; height: 19px;
+    list-style: none; cursor: help; user-select: none; color: var(--muted); background: var(--surface);
+    border: 1px solid var(--border-strong); border-radius: 50%; font: 750 11px/1 var(--mono); }
+  .help-tip > summary::-webkit-details-marker { display: none; }
+  .help-tip > summary:hover, .help-tip > summary:focus-visible, .help-tip[open] > summary {
+    color: var(--flame-ink); border-color: var(--flame); background: var(--flame-tint); outline: none; }
+  .help-tip > summary:focus-visible { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--flame); }
+  .help-popover { position: absolute; z-index: 110; top: calc(100% + 7px); left: 0; width: min(360px, calc(100vw - 44px));
+    padding: 12px 13px; color: var(--ink-2); background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 10px; box-shadow: 0 12px 36px rgba(45, 28, 16, .20); font-size: 11.5px; line-height: 1.45;
+    text-align: left; text-transform: none; letter-spacing: normal; font-weight: 400; }
+  :root[data-theme="dark"] .help-popover { box-shadow: 0 14px 40px rgba(0,0,0,.6); }
+  .help-popover > strong { display: block; margin-bottom: 7px; color: var(--ink); font-size: 12.5px; }
+  .help-popover p { margin: 6px 0 0; }
+  .help-popover p b { color: var(--ink); }
+  .field-label, .th-help, .hero-number-group { display: inline-flex; align-items: center; gap: 6px; }
+  .th-help { justify-content: flex-end; white-space: nowrap; }
+  .rtable .help-tip { vertical-align: middle; }
+  .rtable .help-popover { position: fixed; top: 92px; right: 22px; left: auto; }
+  .block-label-row, .title-help-row, .card-head-row, .section-title-row, .quota-head, .evidence-actions {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 9px; }
+  .block-label-row > .help-tip .help-popover, .title-help-row > .help-tip .help-popover,
+  .card-head-row > .help-tip .help-popover, .section-title-row > .help-tip .help-popover,
+  .quota-head > .help-tip .help-popover, .evidence-actions > .help-tip .help-popover,
+  .settings-shell > .help-tip .help-popover { left: auto; right: 0; }
+  .title-help-row { align-items: center; }
+  .block-label-row .hero-eyebrow, .block-label-row .quality-label { margin-bottom: 0; }
+  .hero > .block-label-row { margin-bottom: 8px; }
+  .quota-head { align-items: center; margin-top: 12px; color: var(--ink-2); font-size: 11px; }
+  @media (max-width: 520px) {
+    .help-popover { position: fixed; top: 76px; left: 22px !important; right: 22px !important; width: auto;
+      max-height: calc(100vh - 98px); overflow: auto; }
+  }
+
   /* model chips */
   .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
   .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
@@ -850,61 +1268,167 @@ const CSS = `
     font-weight: 600; }
 
   /* session hero */
+  #current-session { scroll-margin-top: 118px; }
   #frag-session { display: block; margin-bottom: 16px; }
   .hero { background: linear-gradient(135deg, var(--flame-tint), var(--surface) 60%); border: 1px solid var(--border);
-    border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 20px 24px; box-shadow: var(--shadow); }
+    border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 17px 20px; box-shadow: var(--shadow); }
   .hero-neg { border-left-color: var(--bad); }
   .hero-eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
     color: var(--muted); margin-bottom: 8px; }
-  .hero-headline { font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; line-height: 1.1; }
-  .hero-num { font-size: 56px; font-weight: 800; line-height: 1; margin-right: 8px;
+  .hero-headline { font-size: 22px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; line-height: 1.15; }
+  .hero-num { font-size: 40px; font-weight: 800; line-height: 1; margin-right: 7px;
     background: linear-gradient(135deg, #ff9a4d, var(--flame) 55%, var(--flame-strong));
     -webkit-background-clip: text; background-clip: text; color: transparent;
     font-variant-numeric: tabular-nums; }
   .hero-neg .hero-num { background: linear-gradient(135deg, #f0857a, var(--bad));
     -webkit-background-clip: text; background-clip: text; color: transparent; }
   .hero-sub { font-size: 14.5px; color: var(--ink-2); margin-top: 12px; max-width: 720px; }
-  .hero-meta { font-size: 12px; color: var(--muted); margin-top: 10px; padding-top: 10px;
-    border-top: 1px dashed var(--border-strong); }
+  .hero-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    font-size: 12px; color: var(--muted); margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border-strong); }
+  .session-follow { flex: none; padding: 4px 8px; color: var(--flame-ink); background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 6px; cursor: pointer; font: 650 10.5px/1.2 inherit; }
+  .session-follow:hover, .session-follow:focus-visible { color: var(--flame-ink); border-color: var(--flame); outline: none; }
   .hero-empty .hero-headline { color: var(--muted); font-size: 24px; }
 
-  /* stat strip */
-  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
-  @media (max-width: 1000px) { .strip { grid-template-columns: repeat(2, 1fr); } }
-  @media (max-width: 560px) { .strip { grid-template-columns: 1fr; } }
-  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 14px 16px; box-shadow: var(--shadow); }
-  .tile-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 8px;
-    display: flex; align-items: center; gap: 5px; }
-  .tile-value { font-size: 26px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums;
-    letter-spacing: -0.01em; line-height: 1.1; }
-  .tile-value.pos { color: var(--good); } .tile-value.neg { color: var(--bad); }
-  .tile-value.muted-val { color: var(--muted); font-size: 18px; font-weight: 600; }
-  .tile-sub { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
-  .q { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
-    border-radius: 50%; background: var(--surface-2); border: 1px solid var(--border-strong);
-    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; position: relative; outline: none; }
-  .q:hover, .q:focus-visible { color: var(--flame-ink); border-color: var(--flame); }
-  .q::after { content: attr(data-tip); position: absolute; z-index: 50; left: 50%; bottom: calc(100% + 8px);
-    width: min(280px, 75vw); transform: translate(-50%, 4px); padding: 8px 10px; border-radius: 7px;
-    background: var(--ink); color: var(--surface); box-shadow: var(--shadow); font-size: 11px; font-weight: 500;
-    line-height: 1.4; text-align: left; pointer-events: none; opacity: 0; visibility: hidden;
-    transition: opacity .12s, transform .12s, visibility .12s; }
-  .q::before { content: ''; position: absolute; z-index: 51; left: 50%; bottom: calc(100% + 3px);
-    transform: translateX(-50%); border: 5px solid transparent; border-top-color: var(--ink);
-    pointer-events: none; opacity: 0; visibility: hidden; transition: opacity .12s, visibility .12s; }
-  .q:hover::after, .q:focus-visible::after { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
-  .q:hover::before, .q:focus-visible::before { opacity: 1; visibility: visible; }
+  /* Overview — one reading order: effect, activity, evidence. */
+  .overview-panel { margin: 0 0 16px; padding: 20px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); scroll-margin-top: 118px; }
+  .overview-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 15px; }
+  .overview-head h2 { margin: 2px 0 3px; color: var(--ink); font-size: 20px; line-height: 1.2; letter-spacing: -.015em; }
+  .overview-head p { margin: 0; color: var(--muted); font-size: 12px; }
+  .collapsible-panel > summary { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    list-style: none; cursor: pointer; user-select: none; }
+  .collapsible-panel > summary::-webkit-details-marker { display: none; }
+  .collapsible-panel > summary:focus-visible { outline: 2px solid var(--flame); outline-offset: 4px; }
+  .collapsible-title { display: block; margin-top: 2px; color: var(--ink); font-size: 18px; font-weight: 750; line-height: 1.2; }
+  .collapsible-actions { display: inline-flex; flex: none; align-items: center; gap: 8px; }
+  .collapse-control { display: inline-flex; align-items: center; min-height: 25px; padding: 4px 9px; color: var(--muted);
+    border: 1px solid var(--border-strong); border-radius: 999px; font-size: 10.5px; font-weight: 700; }
+  .collapse-control::before { content: '▾'; margin-right: 5px; color: var(--flame); }
+  .collapsible-panel:not([open]) .collapse-control::before { content: '▸'; }
+  .when-closed { display: none; }
+  .collapsible-panel:not([open]) .when-open { display: none; }
+  .collapsible-panel:not([open]) .when-closed { display: inline; }
+  .collapsible-content { padding-top: 15px; }
+  .codex-panel > summary .scope-label { color: var(--txt); }
+  @media (max-width: 660px) {
+    .collapsible-panel > summary { align-items: flex-start; }
+    .collapsible-actions { flex-direction: column; align-items: flex-end; gap: 5px; }
+    .collapsible-actions .scope-chip, .collapsible-actions .codex-badge { font-size: 9.5px; }
+  }
+  .scope-label { color: var(--flame-ink); font-size: 10px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
+  .scope-chip { flex: none; display: inline-flex; align-items: center; gap: 7px; padding: 5px 9px;
+    border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 10.5px; white-space: nowrap; }
+  .overview-grid { display: grid; grid-template-columns: minmax(360px, 1.7fr) repeat(2, minmax(210px, 1fr)); gap: 11px; }
+  .outcome-card, .overview-card { min-width: 0; padding: 15px; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 11px; }
+  .outcome-card { background: linear-gradient(135deg, var(--good-tint), var(--surface) 76%); border-left: 3px solid var(--good); }
+  .outcome-card.negative { background: linear-gradient(135deg, var(--bad-tint), var(--surface) 76%); border-left-color: var(--bad); }
+  .card-eyebrow { color: var(--muted); font-size: 10.5px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+  .outcome-value, .overview-value { margin-top: 4px; color: var(--ink); font-size: 31px; font-weight: 820;
+    line-height: 1.05; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+  .outcome-value { color: var(--good); }
+  .outcome-card.negative .outcome-value { color: var(--bad); }
+  .outcome-note { margin-top: 4px; color: var(--muted); font-size: 10.5px; }
+  .effect-breakdown { display: grid; gap: 7px; margin-top: 13px; padding-top: 11px; border-top: 1px dashed var(--border-strong); }
+  .effect-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .effect-row > span, .effect-row > strong { min-width: 0; }
+  .effect-name { display: inline-flex; align-items: center; gap: 7px; }
+  .effect-result { display: grid; justify-items: end; gap: 4px; text-align: right; }
+  .effect-row b { display: block; font-size: 12px; }
+  .effect-row small { display: block; color: var(--muted); font-size: 10px; font-weight: 400; }
+  .effect-row strong { color: var(--ink); text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .effect-row em { display: block; color: var(--muted); font-size: 10.5px; font-style: normal; font-weight: 550; }
+  .effect-row.measured em { color: var(--good); }
+  .price-callout { display: inline-grid; justify-items: end; gap: 1px; padding: 5px 7px; background: var(--good-tint);
+    border: 1px solid color-mix(in srgb, var(--good) 55%, var(--border)); border-radius: 7px; white-space: nowrap; }
+  .price-callout small { color: var(--ink-2); font-size: 9.5px; font-weight: 650; }
+  .price-value { color: var(--good); font-size: 20px; line-height: 1; font-weight: 850; }
+  .price-callout em { color: var(--muted); font-size: 9.5px; font-weight: 600; }
+  .overview-lines { display: grid; gap: 5px; margin: 12px 0 9px; font-size: 11.5px; }
+  .overview-lines span { display: flex; justify-content: space-between; gap: 8px; color: var(--ink-2); }
+  .overview-lines.compact span { display: block; }
+  .overview-card > small { color: var(--muted); font-size: 10px; }
+  .evidence-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .text-link { color: var(--flame-ink); font-size: 10.5px; font-weight: 650; text-decoration: none; }
+  .text-link:hover { text-decoration: underline; }
+  .reading-legend { display: flex; flex-wrap: wrap; gap: 7px 18px; margin-top: 12px; padding: 9px 11px;
+    background: var(--surface-2); border-radius: 8px; color: var(--muted); font-size: 10.5px; }
+  .reading-legend b { color: var(--ink-2); }
+  @media (max-width: 1050px) { .overview-grid { grid-template-columns: 1fr 1fr; } .outcome-card { grid-column: 1 / -1; } }
+  @media (max-width: 660px) {
+    .overview-panel { padding: 15px; } .overview-head { flex-direction: column; }
+    .overview-grid { grid-template-columns: 1fr; } .outcome-card { grid-column: auto; }
+    .effect-row { align-items: flex-start; }
+  }
+
+  /* estimate quality — visible trust summary, not hidden in the math drawer */
+  .quality-panel { margin: 0 0 14px; padding: 18px; background: linear-gradient(135deg, var(--good-tint), var(--surface) 68%);
+    border: 1px solid var(--border); border-left: 4px solid var(--good); border-radius: var(--radius); box-shadow: var(--shadow); }
+  .quality-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+  .quality-eyebrow { margin-bottom: 5px; color: var(--good); font-size: 10.5px; font-weight: 800;
+    letter-spacing: .09em; text-transform: uppercase; }
+  .quality-title { margin: 0; color: var(--ink); font-size: 18px; line-height: 1.25; letter-spacing: -.01em; }
+  .quality-lead { max-width: 860px; margin: 7px 0 0; color: var(--ink-2); font-size: 12.5px; line-height: 1.5; }
+  .quality-badge { flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px;
+    border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .quality-badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .quality-badge.good { color: var(--good); background: var(--good-tint); border: 1px solid currentColor; }
+  .quality-badge.mixed { color: var(--warn); background: var(--warn-tint); border: 1px solid currentColor; }
+  .quality-badge.waiting { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border-strong); }
+  .quality-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 15px; }
+  .quality-metric { min-width: 0; padding: 11px 12px; background: color-mix(in srgb, var(--surface) 82%, transparent);
+    border: 1px solid var(--border); border-radius: 9px; }
+  .quality-label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 10.5px; font-weight: 700;
+    letter-spacing: .03em; text-transform: uppercase; }
+  .quality-metric strong { display: block; color: var(--ink); font-size: 16px; line-height: 1.25; font-variant-numeric: tabular-nums; }
+  .quality-metric small { display: block; margin-top: 5px; color: var(--muted); font-size: 10.5px; line-height: 1.35; }
+  .quality-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 7px 13px; margin-top: 13px; }
+  .quality-check { color: var(--good); font-size: 11px; font-weight: 600; }
+  .quality-excluded { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .quality-caveat { margin: 12px 0 0; padding-top: 10px; border-top: 1px dashed var(--border-strong);
+    color: var(--muted); font-size: 11px; line-height: 1.45; }
+  .quality-caveat strong { color: var(--ink-2); }
+  @media (max-width: 1000px) { .quality-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 680px) {
+    .quality-head { flex-direction: column; gap: 10px; }
+    .quality-grid { grid-template-columns: 1fr; }
+    .quality-excluded { width: 100%; margin-left: 0; }
+  }
+
+  /* exact Codex rollout usage — visually distinct from estimated savings */
+  .codex-panel { margin: 0 0 14px; padding: 18px; background: linear-gradient(135deg, var(--txt-tint), var(--surface) 68%);
+    border: 1px solid var(--border); border-left: 4px solid var(--txt); border-radius: var(--radius); box-shadow: var(--shadow);
+    scroll-margin-top: 118px; }
+  .codex-eyebrow { margin-bottom: 5px; color: var(--txt); font-size: 10.5px; font-weight: 800;
+    letter-spacing: .09em; text-transform: uppercase; }
+  .codex-badge { flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px;
+    color: var(--txt-ink); background: var(--txt-tint); border: 1px solid var(--txt); border-radius: 999px;
+    font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .codex-badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--txt); }
+  .usage-scope { margin-top: 11px; color: var(--muted); font-size: 10.5px; }
+  .quota-list { display: grid; gap: 7px; margin-top: 11px; }
+  .quota-row { display: grid; grid-template-columns: minmax(180px, 1.2fr) repeat(auto-fit, minmax(140px, 1fr)); gap: 10px;
+    padding: 9px 11px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; }
+  .quota-row > span { min-width: 0; }
+  .quota-row small, .quota-row em { display: block; color: var(--muted); font-size: 9.5px; font-style: normal; }
+  .quota-row b { display: block; color: var(--ink); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .quota-name small { font-family: var(--mono); }
+  .quota-empty { color: var(--muted); font-size: 11px; padding: 9px; }
+  @media (max-width: 680px) { .quota-row { grid-template-columns: 1fr 1fr; } .quota-name { grid-column: 1 / -1; } }
 
   /* drawer */
   .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: visible; scroll-margin-top: 118px; }
   .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 12px 16px;
     font-size: 13px; font-weight: 600; color: var(--flame-ink); display: flex; align-items: center; gap: 8px; }
   .drawer > summary::-webkit-details-marker { display: none; }
   .drawer > summary::before { content: '▸'; color: var(--flame); font-size: 11px; }
   .drawer[open] > summary::before { content: '▾'; }
   .drawer > summary:hover { background: var(--surface-2); }
+  .summary-q { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px;
+    margin-left: auto; border: 1px solid var(--border-strong); border-radius: 50%; color: var(--muted);
+    font: 750 10px/1 var(--mono); }
   .drawer-intro { padding: 0 16px 10px; font-size: 12px; color: var(--ink-2); }
   .drawer-intro em { color: var(--flame-ink); font-style: normal; font-weight: 600; }
   .math-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding: 0 16px 16px; }
@@ -930,7 +1454,11 @@ const CSS = `
     padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
   .card-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); margin: 0 0 12px; }
-  .card-head.spaced { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .card-head-row > .card-head { margin-bottom: 12px; }
+  .card-head-row.spaced { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .card-head-row.spaced > .card-head { margin-bottom: 12px; }
+  .section-title-row { align-items: baseline; }
+  .section-title-row > .section-head { flex: 1; }
 
   /* x-ray */
   .xray { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; align-items: start; }
@@ -976,7 +1504,7 @@ const CSS = `
     color: var(--muted); font-size: 10px; cursor: default; }
 
   /* recent requests */
-  .row-view { color: var(--flame-ink); font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .row-view { padding: 0; color: var(--flame-ink); background: transparent; border: 0; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
   .row-view:hover { text-decoration: underline; }
   table.rtable, table.dtable { width: 100%; border-collapse: collapse; font-size: 12px; }
   .rtable th, .dtable th { text-align: left; color: var(--muted); font-weight: 600; padding: 7px 8px;
@@ -1060,7 +1588,7 @@ const CSS = `
 
 // Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
 const GLUE_JS = `
-  window.pp = { pin: null, src: false };
+  window.pp = { pin: null, src: false, session: null, hashRevealPending: !!location.hash };
   function ppPin(id) {
     window.pp.pin = id;
     htmx.trigger('#frag-latest', 'pp-refresh');
@@ -1069,17 +1597,57 @@ const GLUE_JS = `
     window.pp.src = on;
     htmx.trigger('#frag-latest', 'pp-refresh');
   }
+  function ppWatchLatest() {
+    window.pp.session = null;
+    htmx.trigger('#frag-session', 'pp-refresh');
+  }
   document.body.addEventListener('htmx:beforeSwap', function (ev) {
-    const open = [];
-    ev.detail.target.querySelectorAll('details[open][id]').forEach(function (d) { open.push(d.id); });
-    ev.detail.target.__ppOpen = open;
+    const states = [];
+    ev.detail.target.querySelectorAll('details[id]').forEach(function (d) {
+      states.push({ id: d.id, open: d.open });
+    });
+    ev.detail.target.__ppDetails = states;
   });
   document.body.addEventListener('htmx:afterSwap', function (ev) {
-    (ev.detail.target.__ppOpen || []).forEach(function (id) {
-      const d = document.getElementById(id);
-      if (d) d.setAttribute('open', '');
+    (ev.detail.target.__ppDetails || []).forEach(function (state) {
+      const d = document.getElementById(state.id);
+      if (d) d.toggleAttribute('open', state.open);
     });
+    if (window.pp.hashRevealPending) ppRevealHash();
+    if (ev.detail.target && ev.detail.target.id === 'frag-session') {
+      var sessionNode = ev.detail.target.querySelector('[data-session-id]');
+      var sessionId = sessionNode && sessionNode.getAttribute('data-session-id');
+      if (sessionId && sessionId !== window.pp.session) window.pp.session = sessionId;
+    }
   });
+  function ppRevealHash() {
+    if (!location.hash || location.hash.length < 2) { window.pp.hashRevealPending = false; return; }
+    var target = document.getElementById(location.hash.slice(1));
+    if (!target) return false;
+    if (target.tagName === 'DETAILS') target.setAttribute('open', '');
+    requestAnimationFrame(function () { target.scrollIntoView({ block: 'start' }); });
+    window.pp.hashRevealPending = false;
+    return true;
+  }
+  document.body.addEventListener('click', function (ev) {
+    var link = ev.target.closest && ev.target.closest('a[href^="#"]');
+    if (link) { window.pp.hashRevealPending = true; setTimeout(ppRevealHash, 0); }
+    if (!(ev.target.closest && ev.target.closest('.help-tip'))) {
+      document.querySelectorAll('details.help-tip[open]').forEach(function (d) { d.removeAttribute('open'); });
+    }
+  });
+  document.addEventListener('toggle', function (ev) {
+    var opened = ev.target;
+    if (!opened.matches || !opened.matches('details.help-tip[open]')) return;
+    document.querySelectorAll('details.help-tip[open]').forEach(function (d) {
+      if (d !== opened) d.removeAttribute('open');
+    });
+  }, true);
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Escape') return;
+    document.querySelectorAll('details.help-tip[open]').forEach(function (d) { d.removeAttribute('open'); });
+  });
+  window.addEventListener('hashchange', function () { window.pp.hashRevealPending = true; ppRevealHash(); });
   document.body.addEventListener('htmx:responseError', function (ev) {
     window.dispatchEvent(new CustomEvent('pp-toast', {
       detail: { text: ev.detail.xhr.status + ' ' + ev.detail.requestConfig.path }
@@ -1139,8 +1707,8 @@ export function renderPage(port: number): string {
   <div class="brand">
     <span class="flame-dot"></span>
     <div>
-      <div class="wordmark">pxpipe</div>
-      <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
+      <h1 class="wordmark">pxpipe</h1>
+      <div class="tagline">Live proxy effect, provider usage, and an auditable explanation of every estimate.</div>
     </div>
   </div>
   <div class="controls">
@@ -1149,40 +1717,85 @@ export function renderPage(port: number): string {
   </div>
 </header>
 
-<div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+<nav class="page-nav" aria-label="Dashboard sections">
+  <a href="#overview">Overview</a>
+  <a href="#current-session">Current session</a>
+  <a href="#requests">Requests</a>
+  <a href="#usage-limits">Usage &amp; limits</a>
+  <a href="#audit-drawer">Audit</a>
+</nav>
 
-<div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
-  <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>
+<div class="settings-shell">
+  <details class="settings-panel">
+    <summary>Model scope &amp; routing settings</summary>
+    <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+  </details>
+  ${helpTip(
+    'model-settings', 'Model scope and routing settings',
+    'Runtime controls for choosing which model bases PXPIPE may transform.',
+    'They let you opt models in or out without changing upstream routing or restarting the proxy.',
+    'Checked chips are active now. Your choice is saved automatically and survives restart, overriding PXPIPE_MODELS until you press Reset to default.',
+  )}
 </div>
+
+<div id="current-session"><div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
+  hx-vals='js:{session: window.pp.session || ""}'>
+  <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>
+</div></div>
 
 <div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
 
-<section class="section">
+<section class="section" id="requests">
   <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>
   <div class="xray">
     <div class="card">
-      <h3 class="card-head">Recent requests</h3>
+      <div class="card-head-row"><h3 class="card-head">Recent requests</h3>${helpTip(
+        'recent-requests', 'Recent requests',
+        'The latest proxy responses with model, status, path, usage, and attributed input change.',
+        'It connects summary totals to individual requests so unusual rows can be inspected.',
+        'Use status and path first, then compare actual and baseline values. Open Details to inspect the exact image-versus-text composition.',
+      )}</div>
       <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
     </div>
     <div class="card">
-      <h3 class="card-head">Image vs text breakdown</h3>
+      <div class="card-head-row"><h3 class="card-head">Image vs text breakdown</h3>${helpTip(
+        'context-breakdown', 'Image versus text breakdown',
+        'A request-level map of which context buckets stayed native text and which were rendered into images.',
+        'It explains where the estimated input change came from instead of showing only a final number.',
+        'Compare the image and text columns. Cache-aware effective input drives savings; raw token counts are supporting diagnostics.',
+      )}</div>
       <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
-      <h3 class="card-head spaced">Image ↔ source inspector</h3>
+      <div class="card-head-row spaced"><h3 class="card-head">Image ↔ source inspector</h3>${helpTip(
+        'source-inspector', 'Image and source inspector',
+        'A visual preview of the PNG sent to the model, optionally paired with the source text used to create it.',
+        'It lets you verify fidelity, layout, and source-to-image pairing for a concrete request.',
+        'Select a recent request, inspect each page, and enable source view when you need to compare content. Previews can disappear after ring-buffer eviction or restart.',
+      )}</div>
       <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
            hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
     </div>
   </div>
 </section>
 
-<section class="section">
-  <h2 class="section-head">Top sessions <span class="section-sub">by tokens saved</span></h2>
+<section class="section" id="sessions">
+  <div class="section-title-row"><h2 class="section-head">Top sessions <span class="section-sub">by tokens saved</span></h2>${helpTip(
+    'top-sessions', 'Top sessions',
+    'A ranking of retained PXPIPE sessions by their accumulated estimated input change.',
+    'It reveals which conversations contribute most to the total and where investigation is most useful.',
+    'Longer bars mean larger positive estimated reduction. Negative values indicate sessions where imaging cost more effective input than the text counterfactual.',
+  )}</div>
   <div class="card">
     <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>
 </section>
 
-<section class="section">
-  <h2 class="section-head">Full history <span class="section-sub">every event on disk</span></h2>
+<section class="section" id="history">
+  <div class="section-title-row"><h2 class="section-head">Full history <span class="section-sub">every event on disk</span></h2>${helpTip(
+    'full-history', 'Full history',
+    'The event log PXPIPE retained on disk, including successful, passthrough, and error events.',
+    'It is the durable audit trail behind session and request diagnostics.',
+    'Use it for completeness and troubleshooting rather than headline savings. Rows without upstream usage may be operational events and are not paid LLM responses.',
+  )}</div>
   <div class="card">
     <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>

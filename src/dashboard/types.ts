@@ -1,5 +1,7 @@
 // JSON payload shapes for the dashboard. Single source of truth — update here when src/dashboard.ts changes.
 
+import type { CodexUsageSnapshot } from '../codex-usage.js';
+
 /** /proxy-stats payload. */
 export interface StatsPayload {
   port: number;
@@ -10,6 +12,8 @@ export interface StatsPayload {
   baseline_input_weighted: number;
   actual_input_weighted: number;
   saved_input_tokens: number;
+  /** Sensitivity only: reprices unreported cache-create tiers at 1h on the actual side. */
+  saved_if_unknown_cache_create_1h: number;
   /** Back-compat duplicate of `saved_pct_input_only`. */
   saved_pct: number;
   saved_pct_input_only: number;
@@ -20,7 +24,10 @@ export interface StatsPayload {
   all_baseline_equivalent_weighted: number;
   all_actual_input_weighted: number;
   all_output_weighted: number;
+  /** Back-compatible alias for `usage_bearing_responses`. */
   all_usage_requests: number;
+  /** Responses with non-zero provider usage that entered the paid-traffic totals. */
+  usage_bearing_responses: number;
   /** Observed cost split: compressed vs passthrough paths on real traffic. `split_sufficient_sample` gates the per-request delta (UI shows caveat below threshold). */
   compressed_paid_requests: number;
   passthrough_paid_requests: number;
@@ -32,6 +39,22 @@ export interface StatsPayload {
   split_sufficient_sample: boolean;
   split_min_sample_per_bucket: number;
   saved_usd: number;
+  /** Audit coverage: rows in the Claude count_tokens + upstream-usage numerator. */
+  measured_anthropic_savings_requests: number;
+  /** Count_tokens-measured Claude savings, in input-token equivalents. */
+  measured_claude_saved_input_equivalents: number;
+  /** GPT/OpenAI savings use local tokenizer/vision estimates and are not in the Claude headline. */
+  estimated_openai_savings_requests: number;
+  /** Locally modeled OpenAI/Responses savings, in input-token equivalents. */
+  modeled_openai_saved_input_equivalents: number;
+  /** Compressed paid Anthropic rows withheld from the numerator when a probe failed. */
+  baseline_probe_excluded_requests: number;
+  /** Server-reported cache-create tier coverage for Anthropic actual usage. */
+  cache_create_5m_tokens: number;
+  cache_create_1h_tokens: number;
+  cache_create_tier_unknown_tokens: number;
+  priced_measured_savings_requests: number;
+  unpriced_measured_savings_requests: number;
   output_weighted: number;
   baseline_token_equivalent: number;
   actual_token_equivalent: number;
@@ -41,6 +64,8 @@ export interface StatsPayload {
   measured_tool_use_chars: number;
   measured_redacted_block_count: number;
   events_with_measurement: number;
+  /** Exact provider-reported Codex usage imported from official rollout logs. */
+  codex_actual_usage: CodexUsageSnapshot;
   uptime_sec_unused?: never; // future-proof
   compression_enabled: boolean;
 }

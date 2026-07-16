@@ -180,6 +180,13 @@ export async function aggregateSessions(
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
+    const cacheCreate =
+      ev.cache_create_5m_tokens !== undefined || ev.cache_create_1h_tokens !== undefined
+        ? {
+            fiveMinuteTokens: ev.cache_create_5m_tokens,
+            oneHourTokens: ev.cache_create_1h_tokens,
+          }
+        : undefined;
     const haveUsage = inp > 0 || cc > 0 || cr > 0;
     const baseline = ev.baseline_tokens;
     if (
@@ -211,7 +218,7 @@ export async function aggregateSessions(
         warm,
         prevCacheable,
       );
-      const actualEff = computeActualInputEff(inp, cc, cr);
+      const actualEff = computeActualInputEff(inp, cc, cr, cacheCreate);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);

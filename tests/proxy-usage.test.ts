@@ -433,6 +433,186 @@ describe('proxy usage extraction', () => {
     expect(captured!.usage?.cache_creation_input_tokens).toBe(5000);
   });
 
+  it('extracts Codex Responses usage when SSE omits the event: line', async () => {
+    // ChatGPT's /backend-api/codex/responses identifies events with the JSON
+    // `type` discriminator. Codex itself reads this shape; requiring a separate
+    // SSE `event:` line made every real Codex row lose its provider usage.
+    const sseBody =
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'hello' })}\n\n` +
+      `data: ${JSON.stringify({ type: 'response.reasoning_summary_text.delta', delta: 'think' })}\n\n` +
+      `data: ${JSON.stringify({ type: 'response.function_call_arguments.delta', delta: '{"path":"x"}' })}\n\n` +
+      `data: ${JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: 'resp_codex_1',
+          usage: {
+            input_tokens: 1200,
+            input_tokens_details: { cached_tokens: 900, cache_write_tokens: 125 },
+            output_tokens: 80,
+            output_tokens_details: { reasoning_tokens: 50 },
+            total_tokens: 1280,
+          },
+        },
+      })}\n\n`;
+
+    const restore = mockUpstream(() => {
+      const response = new Response(sseBody, { status: 200 });
+      // Response(string) adds text/plain automatically; remove it to mirror
+      // ChatGPT Codex, whose SSE response currently has no Content-Type.
+      response.headers.delete('content-type');
+      return response;
+    });
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.test',
+      transform: { minCompressChars: 1_000_000 },
+      onRequest: (e) => { captured = e; },
+    });
+    const body = JSON.stringify({
+      model: 'gpt-5.6-sol',
+      input: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    const res = await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured?.usage).toEqual({
+      input_tokens: 1200,
+      output_tokens: 80,
+      cached_tokens: 900,
+      cache_write_tokens: 125,
+      reasoning_output_tokens: 50,
+    });
+    expect(captured?.measurement).toEqual({
+      textChars: 5,
+      thinkingChars: 5,
+      toolUseChars: 12,
+      redactedBlockCount: 0,
+    });
+    expect(captured?.stopReason).toBe('stop');
+  });
+
+  it('marks a Responses refusal instead of overwriting it with a successful stop', async () => {
+    const sseBody =
+      `data: ${JSON.stringify({ type: 'response.refusal.delta', delta: 'cannot comply' })}\n\n` +
+      `data: ${JSON.stringify({
+        type: 'response.completed',
+        response: { usage: { input_tokens: 50, output_tokens: 3 } },
+      })}\n\n`;
+    const restore = mockUpstream(() => {
+      const response = new Response(sseBody, { status: 200 });
+      response.headers.delete('content-type');
+      return response;
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.test',
+      transform: { minCompressChars: 1_000_000 },
+      onRequest: (e) => { captured = e; },
+    });
+    const res = await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: true }),
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+    expect(captured?.stopReason).toBe('refusal');
+    expect(captured?.measurement?.textChars).toBe(13);
+  });
+
+  it('keeps usage from a response.failed terminal event', async () => {
+    const sseBody = `data: ${JSON.stringify({
+      type: 'response.failed',
+      response: {
+        error: { code: 'server_error' },
+        usage: { input_tokens: 75, output_tokens: 4 },
+      },
+    })}\n\n`;
+    const restore = mockUpstream(() => new Response(sseBody, {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    }));
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.test',
+      transform: { minCompressChars: 1_000_000 },
+      onRequest: (e) => { captured = e; },
+    });
+    const res = await proxy(new Request('http://localhost/v1/responses', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: true }),
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+    expect(captured?.usage?.input_tokens).toBe(75);
+    expect(captured?.stopReason).toBe('server_error');
+  });
+
+  it('extracts cache and reasoning details from Chat Completions usage aliases', async () => {
+    const restore = mockUpstream(() => new Response(JSON.stringify({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 90,
+        completion_tokens: 10,
+        prompt_tokens_details: { cached_tokens: 60, cache_write_tokens: 15 },
+        completion_tokens_details: { reasoning_tokens: 7 },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://openai.test',
+      transform: { minCompressChars: 1_000_000 },
+      onRequest: (e) => { captured = e; },
+    });
+    const res = await proxy(new Request('http://localhost/v1/chat/completions', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', messages: [{ role: 'user', content: 'hi' }] }),
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+    expect(captured?.usage).toEqual({
+      input_tokens: 90,
+      output_tokens: 10,
+      cached_tokens: 60,
+      cache_write_tokens: 15,
+      reasoning_output_tokens: 7,
+    });
+  });
+
+  it('parses headerless non-streaming Responses JSON as JSON, not SSE', async () => {
+    const restore = mockUpstream(() => {
+      const response = new Response(JSON.stringify({
+        id: 'resp_json', status: 'completed', output: [],
+        usage: { input_tokens: 42, output_tokens: 8 },
+      }), { status: 200 });
+      response.headers.delete('content-type');
+      return response;
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://openai.test',
+      transform: { minCompressChars: 1_000_000 },
+      onRequest: (e) => { captured = e; },
+    });
+    const res = await proxy(new Request('http://localhost/v1/responses', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: 'hi', stream: false }),
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+    expect(captured?.usage).toMatchObject({ input_tokens: 42, output_tokens: 8 });
+  });
+
   it('fires the event with undefined usage when the response is an error', async () => {
     const restore = mockUpstream(
       () =>

@@ -32,9 +32,11 @@ import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
+import type { CodexUsageSnapshot } from './codex-usage.js';
 import {
   computeActualInputEff,
   computeBaselineInputEff,
+  cacheCreateUnknownTokens,
   deriveBaselineWarmth,
 } from './core/baseline.js';
 import {
@@ -67,6 +69,7 @@ import {
   renderSessionsFragment,
   renderStatsTableFragment,
   type ContextMapData,
+  type ManualCalibrationStatus,
 } from './dashboard/fragments.js';
 import {
   getAllowedModelBases,
@@ -263,9 +266,11 @@ interface Totals {
    *  numerator. Included in the denominator so the headline drops honestly
    *  toward zero on output-heavy workloads. */
   allOutputWeighted: number;
-  /** Count of requests that contributed to allActualInputWeighted (had a
-   *  usage block). Lets the UI annotate "N of M paid requests". */
-  allUsageRequests: number;
+  /** Count of completed responses with non-zero provider usage. These are the
+   *  responses that contributed to the actual/counterfactual paid-traffic
+   *  totals; the explicit name avoids implying that every proxy request was
+   *  billable or carried usage. */
+  usageBearingResponses: number;
   /** Direct compressed-vs-passthrough actual-cost split. No counterfactuals,
    *  no probe gating — just sum what each path actually billed.
    *
@@ -282,6 +287,26 @@ interface Totals {
   passthroughPaidRequests: number;
   passthroughActualInputWeighted: number;
   passthroughOutputWeighted: number;
+  /** Audit coverage for the cache-create price tier reported by Anthropic. */
+  cacheCreate5mTokens: number;
+  cacheCreate1hTokens: number;
+  cacheCreateTierUnknownTokens: number;
+  measuredCacheCreateTierUnknownTokens: number;
+  /** Rows actually eligible for the measured Claude counterfactual numerator. */
+  measuredSavingsRequests: number;
+  /** Claude savings backed by count_tokens + provider usage, in input-token
+   *  equivalents. Kept separate from the locally modeled OpenAI estimate. */
+  measuredClaudeSavedInputEquivalents: number;
+  /** GPT/OpenAI rows use local tokenizer/vision math, never the Claude headline. */
+  estimatedOpenAISavingsRequests: number;
+  /** OpenAI/Responses savings modeled from local tokenizer/vision accounting,
+   *  in input-token equivalents. Never presented as measured Claude savings. */
+  modeledOpenAISavedInputEquivalents: number;
+  /** Paid compressed rows deliberately excluded because their baseline probe was unavailable. */
+  baselineProbeExcludedRequests: number;
+  pricedMeasuredSavingsRequests: number;
+  unpricedMeasuredSavingsRequests: number;
+  pricedMeasuredSavingsUsd: number;
   /** Sum of ground-truth output character counts from the SSE/JSON scanner
    *  (see `OutputMeasurement` in proxy.ts). These three accumulators are
    *  independent of Anthropic's `usage.output_tokens` — they let the operator
@@ -344,6 +369,50 @@ const OUTPUT_TOKEN_RATE = 5.0;
 // excluded entirely (the proxy can't move them), so this still
 // understates the real bill - treat it as "input-side $ saved".
 export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
+
+/** Per-model list-price conversion for the dollar display. A private gateway
+ * can override an exact model with PXPIPE_MODEL_INPUT_USD_PER_MTOK JSON. */
+const MODEL_INPUT_USD_PER_MTOK: ReadonlyArray<[prefix: string, usd: number]> = [
+  ['claude-fable-5', 10],
+  ['claude-opus-', 5],
+  ['claude-sonnet-', 3],
+  ['claude-haiku-', 1],
+];
+/** Sonnet 5 introductory price is valid through 2026-08-31 inclusive. */
+const SONNET_5_INTRO_END_MS = Date.UTC(2026, 8, 1);
+
+/** Pure official-list-price lookup, exported so the scheduled transition is testable. */
+export function officialInputUsdPerMtokForModel(
+  model: string | undefined,
+  atMs = Date.now(),
+): number | undefined {
+  const m = (model ?? '').toLowerCase();
+  if (m.startsWith('claude-sonnet-5')) {
+    return atMs < SONNET_5_INTRO_END_MS ? 2 : 3;
+  }
+  return MODEL_INPUT_USD_PER_MTOK.find(([prefix]) => m.startsWith(prefix))?.[1];
+}
+
+let modelPriceOverrides: Record<string, number> | undefined;
+function inputUsdPerMtokForModel(
+  model: string | undefined,
+  atMs = Date.now(),
+): number | undefined {
+  if (modelPriceOverrides === undefined) {
+    try {
+      const raw = process.env.PXPIPE_MODEL_INPUT_USD_PER_MTOK;
+      const parsed = raw ? JSON.parse(raw) : {};
+      modelPriceOverrides = Object.fromEntries(
+        Object.entries(parsed as Record<string, unknown>)
+          .filter(([, v]) => typeof v === 'number' && Number.isFinite(v) && v >= 0),
+      ) as Record<string, number>;
+    } catch { modelPriceOverrides = {}; }
+  }
+  const m = (model ?? '').toLowerCase();
+  const override = modelPriceOverrides[m];
+  if (override !== undefined) return override;
+  return officialInputUsdPerMtokForModel(m, atMs);
+}
 
 /** Route per-event accounting by upstream. OpenAI paths use the GPT cost
  *  model (vision-token imaging, automatic 0.1× prefix cache, no count_tokens
@@ -444,13 +513,25 @@ export class DashboardState {
     allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
-    allUsageRequests: 0,
+    usageBearingResponses: 0,
     compressedPaidRequests: 0,
     compressedActualInputWeighted: 0,
     compressedOutputWeighted: 0,
     passthroughPaidRequests: 0,
     passthroughActualInputWeighted: 0,
     passthroughOutputWeighted: 0,
+    cacheCreate5mTokens: 0,
+    cacheCreate1hTokens: 0,
+    cacheCreateTierUnknownTokens: 0,
+    measuredCacheCreateTierUnknownTokens: 0,
+    measuredSavingsRequests: 0,
+    measuredClaudeSavedInputEquivalents: 0,
+    estimatedOpenAISavingsRequests: 0,
+    modeledOpenAISavedInputEquivalents: 0,
+    baselineProbeExcludedRequests: 0,
+    pricedMeasuredSavingsRequests: 0,
+    unpricedMeasuredSavingsRequests: 0,
+    pricedMeasuredSavingsUsd: 0,
     textCharsMeasured: 0,
     thinkingCharsMeasured: 0,
     toolUseCharsMeasured: 0,
@@ -480,14 +561,44 @@ export class DashboardState {
    *  matches Fable. Verbatim recall is still lossy; the dashboard toggle
    *  remains the kill switch. See FINDINGS.md. */
   private compressionEnabled = true;
+  /**
+   * Operator-started comparison note. There is deliberately no sampler: a
+   * baseline begins only when the user presses the existing kill switch.
+   * It is in-memory because historic passthrough traffic has no provenance.
+   */
+  private manualCalibration: ManualCalibrationStatus = {
+    active: false,
+    phase: null,
+    baselineRequests: 0,
+    imagedRequests: 0,
+    scopeModel: null,
+    scopeSession: null,
+    skippedMismatches: 0,
+  };
   /** Recent requests' transform breakdowns, for the Context Map panel + its
    *  history selector. In-memory ring, newest last. */
   private contextHistory: ContextMapData[] = [];
   setCompressionEnabled(on: boolean): void {
+    if (!on && this.compressionEnabled) {
+      this.manualCalibration = {
+        active: true,
+        phase: 'baseline',
+        baselineRequests: 0,
+        imagedRequests: 0,
+        scopeModel: null,
+        scopeSession: null,
+        skippedMismatches: 0,
+      };
+    } else if (on && !this.compressionEnabled && this.manualCalibration.active) {
+      this.manualCalibration.phase = 'imaged';
+    }
     this.compressionEnabled = on;
   }
   getCompressionEnabled(): boolean {
     return this.compressionEnabled;
+  }
+  getManualCalibration(): ManualCalibrationStatus {
+    return { ...this.manualCalibration };
   }
   /** Resolved disk paths for the events.jsonl + 4xx-bodies sidecar dir. The
    *  new sessions / cleanup endpoints need this; legacy callers that don't
@@ -499,13 +610,23 @@ export class DashboardState {
    *  path. Lets unit tests run in tens of ms instead of scanning hundreds of
    *  the developer's actual Claude Code session files. */
   private readonly ccMapFn: () => Promise<Map<string, ClaudeCodeSessionRef>>;
+  /** Cached official Codex rollout usage supplied by the Node host. Tests and
+   *  non-Codex callers use an empty snapshot and never touch ~/.codex. */
+  private readonly codexUsageFn: () => CodexUsageSnapshot;
 
   constructor(
     paths?: SessionsPaths,
     ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
+    codexUsageFn?: () => CodexUsageSnapshot,
   ) {
     this.paths = paths;
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
+    this.codexUsageFn = codexUsageFn ?? (() => ({
+      source: '', loading: false, error: null, sessionFiles: 0, usageSnapshots: 0,
+      inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+      reasoningOutputTokens: 0, totalTokens: 0, modelContextWindow: null,
+      earliestEventAt: null, latestEventAt: null, rateLimits: null, quotaWindows: [],
+    }));
   }
 
   /** Stash every rendered image into the ring (called from onRequest with the
@@ -568,7 +689,44 @@ export class DashboardState {
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
+    const cacheCreate = u?.cache_creation
+      ? {
+          fiveMinuteTokens: u.cache_creation.ephemeral_5m_input_tokens,
+          oneHourTokens: u.cache_creation.ephemeral_1h_input_tokens,
+        }
+      : undefined;
     const gpt = isOpenAIEvent(ev.path);
+
+    // Count only completed, usage-bearing requests after an operator explicitly
+    // started the manual baseline/image phases. This never changes routing and
+    // intentionally does not retrofit ordinary historical passthrough events.
+    const hasAnyUsage = u !== undefined &&
+      ((u.input_tokens ?? 0) > 0 || (u.output_tokens ?? 0) > 0 ||
+       (u.cache_creation_input_tokens ?? 0) > 0 || (u.cache_read_input_tokens ?? 0) > 0 ||
+       (u.cached_tokens ?? 0) > 0);
+    // The manual comparison is currently a Claude/count_tokens cohort. Do not
+    // mix OpenAI/Codex usage into counters that the UI presents as a text-vs-
+    // image Claude calibration; those providers use a different baseline.
+    if (!gpt && this.manualCalibration.active && hasAnyUsage) {
+      const calibrationModel = (ev.model ?? '').toLowerCase();
+      const calibrationSession = info?.firstUserSha8 ?? '';
+      const c = this.manualCalibration;
+      if (!calibrationModel || !calibrationSession) {
+        c.skippedMismatches += 1;
+      } else {
+        // The first eligible baseline request locks a comparable cohort. The
+        // image phase then accepts only the same Claude model and session.
+        if (c.scopeModel === null && c.phase === 'baseline' && !compressed) {
+          c.scopeModel = calibrationModel;
+          c.scopeSession = calibrationSession;
+        }
+        const inScope = c.scopeModel === calibrationModel
+          && c.scopeSession === calibrationSession;
+        if (!inScope) c.skippedMismatches += 1;
+        else if (c.phase === 'baseline' && !compressed) c.baselineRequests += 1;
+        else if (c.phase === 'imaged' && compressed) c.imagedRequests += 1;
+      }
+    }
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -630,7 +788,7 @@ export class DashboardState {
       haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
       // Weighted INPUT cost we actually paid this turn.
-      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr, cacheCreate) : 0;
 
       // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
       // row had its body forwarded untouched, so its unproxied counterfactual
@@ -753,9 +911,32 @@ export class DashboardState {
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
     if (creditSaving) {
+      const savedInputEquivalents = baselineInputEff - actualInputEff;
+      if (gpt) {
+        // Keep Responses estimates explicitly labelled in the audit payload.
+        // The legacy aggregate remains backward-compatible; consumers that
+        // need a strictly measured Claude-only view use the count below.
+        this.totals.estimatedOpenAISavingsRequests += 1;
+        this.totals.modeledOpenAISavedInputEquivalents += savedInputEquivalents;
+      } else {
+        this.totals.measuredSavingsRequests += 1;
+        this.totals.measuredClaudeSavedInputEquivalents += savedInputEquivalents;
+        this.totals.measuredCacheCreateTierUnknownTokens += cacheCreateUnknownTokens(cc, cacheCreate);
+        const inputRate = inputUsdPerMtokForModel(ev.model);
+        if (inputRate === undefined) this.totals.unpricedMeasuredSavingsRequests += 1;
+        else {
+          this.totals.pricedMeasuredSavingsRequests += 1;
+          this.totals.pricedMeasuredSavingsUsd +=
+            (baselineInputEff - actualInputEff) * inputRate / 1e6;
+        }
+      }
       this.totals.baselineInputWeighted += baselineInputEff;
       this.totals.actualInputWeighted += actualInputEff;
       this.totals.outputWeighted += outputEquiv;
+    } else if (!gpt && compressed && haveUsage) {
+      // A successful request without both count_tokens probes is intentionally
+      // excluded from the headline rather than guessed.
+      this.totals.baselineProbeExcludedRequests += 1;
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
     // denominator for "did pxpipe move my real bill". Measured rows
@@ -766,12 +947,17 @@ export class DashboardState {
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
     if (haveUsage) {
+      if (!gpt) {
+        this.totals.cacheCreate5mTokens += cacheCreate?.fiveMinuteTokens ?? 0;
+        this.totals.cacheCreate1hTokens += cacheCreate?.oneHourTokens ?? 0;
+        this.totals.cacheCreateTierUnknownTokens += cacheCreateUnknownTokens(cc, cacheCreate);
+      }
       // baselineInputEff already folds the uncompressed/probe-failed fallback
       // to actualInputEff, so passthrough rows contribute zero saved here.
       this.totals.allBaselineEquivalentWeighted += baselineInputEff;
       this.totals.allActualInputWeighted += actualInputEff;
       this.totals.allOutputWeighted += outputEquiv;
-      this.totals.allUsageRequests += 1;
+      this.totals.usageBearingResponses += 1;
       // Direct observed compressed-vs-passthrough split. No counterfactual,
       // no probe gating — just partition the paid-rows set by which path
       // actually ran this turn. Headline answers "is the compressed path
@@ -911,8 +1097,15 @@ export class DashboardState {
     for (const t of tail) {
       const inp = t.input_tokens ?? 0;
       const out = t.output_tokens ?? 0;
-      const cc = t.cache_create_tokens ?? 0;
-      const cr = t.cache_read_tokens ?? 0;
+        const cc = t.cache_create_tokens ?? 0;
+        const cr = t.cache_read_tokens ?? 0;
+        const cacheCreate =
+          t.cache_create_5m_tokens !== undefined || t.cache_create_1h_tokens !== undefined
+            ? {
+                fiveMinuteTokens: t.cache_create_5m_tokens,
+                oneHourTokens: t.cache_create_1h_tokens,
+              }
+            : undefined;
       const compressed = t.compressed === true;
       const gpt = isOpenAIEvent(t.path);
 
@@ -960,7 +1153,7 @@ export class DashboardState {
         const probeOk = probeStatus === 'ok'
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr, cacheCreate) : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
         // actual cost so they show zero saved (no fabricated savings).
@@ -1087,14 +1280,21 @@ export class DashboardState {
    * panel rather than zeroes when a session goes idle (NO `lastSeen >
    * threshold` check here; see comment in `update()` for the rationale).
    */
-  serveCurrentSessionJson(): Response {
-    if (!this.currentSessionId) {
+  serveCurrentSessionJson(requestedSessionId?: string | null): Response {
+    // A dashboard can receive traffic from several agents at once. Honor a
+    // client-selected session whenever it is still retained; otherwise fall
+    // back to the newest event. This prevents the visible panel from jumping
+    // between concurrent agents on every two-second poll.
+    const sessionId = requestedSessionId && this.sessions.has(requestedSessionId)
+      ? requestedSessionId
+      : this.currentSessionId;
+    if (!sessionId) {
       return jsonResponse({
         sessionId: null,
         message: 'no active session yet',
       });
     }
-    const s = this.sessions.get(this.currentSessionId);
+    const s = this.sessions.get(sessionId);
     if (!s) {
       return jsonResponse({ sessionId: null, message: 'no active session yet' });
     }
@@ -1142,6 +1342,11 @@ export class DashboardState {
     const actual = this.totals.actualInputWeighted;
     const output = this.totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
     const saved = baseline - actual;
+    // Sensitivity, not a confidence interval: legacy rows lack the server's
+    // create-tier split. Repricing just that unknown ACTUAL side at 1h adds
+    // 0.75× per token and shows the downside of the historical 5m assumption.
+    const savedIfUnknownCreatesWere1h =
+      saved - this.totals.measuredCacheCreateTierUnknownTokens * (2.0 - 1.25);
     const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
     const baselineTotal = baseline + output;
     const actualTotal = actual + output;
@@ -1207,6 +1412,7 @@ export class DashboardState {
       baseline_input_weighted: Math.round(baseline),
       actual_input_weighted: Math.round(actual),
       saved_input_tokens: Math.round(saved),
+      saved_if_unknown_cache_create_1h: Math.round(savedIfUnknownCreatesWere1h),
       // saved_pct kept for back-compat with existing dashboard HTML; it is
       // the input-only number. New code should read saved_pct_input_only.
       saved_pct: round1(pctInput),
@@ -1221,7 +1427,10 @@ export class DashboardState {
       all_baseline_equivalent_weighted: Math.round(allBaselineEquiv),
       all_actual_input_weighted: Math.round(allActual),
       all_output_weighted: Math.round(allOutput),
-      all_usage_requests: this.totals.allUsageRequests,
+      // Back-compatible alias plus an explicit name for the count of responses
+      // that actually carried non-zero provider usage and entered paid totals.
+      all_usage_requests: this.totals.usageBearingResponses,
+      usage_bearing_responses: this.totals.usageBearingResponses,
       // Direct observed split — replaces "share of spend saved" as the
       // headline. Total actual $ and average $/req per path, plus a delta
       // gated on `split_sufficient_sample`. No counterfactual: each
@@ -1235,7 +1444,19 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      saved_usd: round4(this.totals.pricedMeasuredSavingsUsd),
+      measured_anthropic_savings_requests: this.totals.measuredSavingsRequests,
+      measured_claude_saved_input_equivalents:
+        Math.round(this.totals.measuredClaudeSavedInputEquivalents),
+      estimated_openai_savings_requests: this.totals.estimatedOpenAISavingsRequests,
+      modeled_openai_saved_input_equivalents:
+        Math.round(this.totals.modeledOpenAISavedInputEquivalents),
+      baseline_probe_excluded_requests: this.totals.baselineProbeExcludedRequests,
+      cache_create_5m_tokens: Math.round(this.totals.cacheCreate5mTokens),
+      cache_create_1h_tokens: Math.round(this.totals.cacheCreate1hTokens),
+      cache_create_tier_unknown_tokens: Math.round(this.totals.cacheCreateTierUnknownTokens),
+      priced_measured_savings_requests: this.totals.pricedMeasuredSavingsRequests,
+      unpriced_measured_savings_requests: this.totals.unpricedMeasuredSavingsRequests,
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
@@ -1259,6 +1480,7 @@ export class DashboardState {
       measured_tool_use_chars: this.totals.toolUseCharsMeasured,
       measured_redacted_block_count: this.totals.redactedBlockCountMeasured,
       events_with_measurement: this.totals.eventsWithMeasurement,
+      codex_actual_usage: this.codexUsageFn(),
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
     };
@@ -1332,7 +1554,7 @@ export class DashboardState {
   async serveFragment(name: string, url: URL, port: number): Promise<Response> {
     switch (name) {
       case 'toggle':
-        return htmlResponse(renderToggleFragment(this.compressionEnabled));
+        return htmlResponse(renderToggleFragment(this.compressionEnabled, this.getManualCalibration()));
       case 'models':
         return htmlResponse(
           renderModelsFragment(
@@ -1356,9 +1578,11 @@ export class DashboardState {
         );
       }
       case 'session-summary': {
-        // Lifetime hero — same cumulative payload as the header strip so the
-        // headline and the "$ saved" tiles never disagree and it stops jumping.
-        const s = (await this.serveStats().json()) as StatsPayload;
+        // Explicitly scoped to the most recently active session. The Overview
+        // above it remains the since-restart aggregate. A browser may pin one
+        // retained session while other agents continue to send traffic.
+        const requestedSessionId = url.searchParams.get('session');
+        const s = (await this.serveCurrentSessionJson(requestedSessionId).json()) as CurrentSessionPayload;
         return htmlResponse(renderSessionSummaryFragment(s));
       }
       case 'header': {
@@ -1447,13 +1671,15 @@ export class DashboardState {
    *  restart resets to the default (on). */
   handleCompressionToggle(body: { enabled?: unknown }): Response {
     const on = body.enabled === true;
-    this.compressionEnabled = on;
+    this.setCompressionEnabled(on);
     return jsonResponse({ compression_enabled: on });
   }
 
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
-   *  runtime compress scope. In-memory only; restart resets to the PXPIPE_MODELS
-   *  env / built-in default. The model checks read this live. */
+   *  runtime compress scope. Mutates the in-memory override only; the Node host
+   *  (src/node.ts) persists the result to model-scope.json after this returns so
+   *  the choice survives restart (Variant A: overrides PXPIPE_MODELS until the
+   *  dashboard Reset). The model checks read the override live. */
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);

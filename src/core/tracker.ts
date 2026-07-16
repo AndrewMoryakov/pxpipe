@@ -109,6 +109,10 @@ export interface TrackEvent {
   cache_read_tokens?: number;
   /** OpenAI prompt-cache hits (subset of input_tokens), from input/prompt_tokens_details.cached_tokens. */
   cached_tokens?: number;
+  /** OpenAI prompt-cache writes (diagnostic subset of input_tokens; not additive). */
+  cache_write_tokens?: number;
+  /** OpenAI reasoning tokens, a subset of output_tokens (not additive). */
+  reasoning_output_tokens?: number;
   /** Cache_create split by tier — 1.25x (5-min) and 2x (1-hour) input rates.
    *  Their sum equals `cache_create_tokens` when both fields are present. */
   cache_create_5m_tokens?: number;
@@ -152,6 +156,8 @@ export interface TrackEvent {
   req_body_sample_b64?: string;
   /** Node host only: path to gzipped sidecar when inline cap exceeded. Workers drop oversized samples. */
   req_body_sample_path?: string;
+  response_content_type?: string;
+  response_content_encoding?: string;
 }
 
 /** Max inline base64 body per JSONL row (32 KiB). Larger goes to sidecar (Node) or is dropped (Workers). */
@@ -181,6 +187,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
+  if (ev.responseContentType) out.response_content_type = ev.responseContentType;
+  if (ev.responseContentEncoding) out.response_content_encoding = ev.responseContentEncoding;
   // Body sample: sidecar path (Node) > inline base64 if it fits > drop (Workers, oversized).
   if (ev.reqBodySamplePath) {
     out.req_body_sample_path = ev.reqBodySamplePath;
@@ -300,6 +308,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.cache_read_tokens = u.cache_read_input_tokens;
     if (u.cached_tokens !== undefined)
       out.cached_tokens = u.cached_tokens;
+    if (u.cache_write_tokens !== undefined)
+      out.cache_write_tokens = u.cache_write_tokens;
+    if (u.reasoning_output_tokens !== undefined)
+      out.reasoning_output_tokens = u.reasoning_output_tokens;
     // cache_creation splits cache_creation_input_tokens across 5-min (1.25x) and 1-hour (2x) tiers.
     if (u.cache_creation) {
       if (u.cache_creation.ephemeral_5m_input_tokens !== undefined)

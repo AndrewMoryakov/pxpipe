@@ -4,9 +4,45 @@
  * See docs/CACHING_AND_SAVINGS.md for the full derivation and audit history.
  */
 
-/** Documented Anthropic price ratios: cc_5m = 1.25×, cr = 0.1× base input. One-line change if rates change. */
-export const CACHE_CREATE_RATE = 1.25;
+/** Documented Anthropic cache price ratios to ordinary input. */
+export const CACHE_CREATE_5M_RATE = 1.25;
+export const CACHE_CREATE_1H_RATE = 2.0;
+/** @deprecated Prefer the explicit 5m/1h constants. Kept for source compatibility. */
+export const CACHE_CREATE_RATE = CACHE_CREATE_5M_RATE;
 export const CACHE_READ_RATE = 0.1;
+
+/**
+ * Server-reported cache-create tier split. Anthropic omits it on some older
+ * responses; that remainder is deliberately treated as 5m *estimate*, not as
+ * proof that the request used the 5m tier. Callers can surface the coverage.
+ */
+export interface CacheCreateBreakdown {
+  fiveMinuteTokens?: number;
+  oneHourTokens?: number;
+}
+
+export function cacheCreateEffectiveTokens(
+  totalTokens: number,
+  breakdown?: CacheCreateBreakdown,
+): number {
+  const total = Math.max(0, totalTokens || 0);
+  const five = Math.min(total, Math.max(0, breakdown?.fiveMinuteTokens ?? 0));
+  const one = Math.min(total - five, Math.max(0, breakdown?.oneHourTokens ?? 0));
+  // Legacy/unreported tier: preserve historical 5m arithmetic while callers
+  // disclose that this portion is an assumption.
+  const unknown = total - five - one;
+  return five * CACHE_CREATE_5M_RATE + one * CACHE_CREATE_1H_RATE + unknown * CACHE_CREATE_5M_RATE;
+}
+
+export function cacheCreateUnknownTokens(
+  totalTokens: number,
+  breakdown?: CacheCreateBreakdown,
+): number {
+  const total = Math.max(0, totalTokens || 0);
+  const five = Math.min(total, Math.max(0, breakdown?.fiveMinuteTokens ?? 0));
+  const one = Math.min(total - five, Math.max(0, breakdown?.oneHourTokens ?? 0));
+  return total - five - one;
+}
 
 /** Anthropic prompt-cache TTL (seconds). Kept for callers that display provider
  *  docs, but savings math does not use TTL to infer a hypothetical text-cache
@@ -127,6 +163,7 @@ export function computeActualInputEff(
   inputTokens: number,
   cc: number,
   cr: number,
+  cacheCreate?: CacheCreateBreakdown,
 ): number {
-  return inputTokens + cc * CACHE_CREATE_RATE + cr * CACHE_READ_RATE;
+  return inputTokens + cacheCreateEffectiveTokens(cc, cacheCreate) + cr * CACHE_READ_RATE;
 }

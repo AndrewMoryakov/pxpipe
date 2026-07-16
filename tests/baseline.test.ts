@@ -4,6 +4,9 @@ import {
   computeActualInputEff,
   deriveBaselineWarmth,
   CACHE_CREATE_RATE,
+  CACHE_CREATE_1H_RATE,
+  CACHE_CREATE_5M_RATE,
+  cacheCreateUnknownTokens,
   CACHE_READ_RATE,
   CACHE_TTL_SEC,
 } from '../src/core/baseline.js';
@@ -66,6 +69,21 @@ describe('computeBaselineInputEff (warmth-aware)', () => {
     const cold = computeBaselineInputEff(5000, 4000, inp, cc, cr, false, 0);
     const warm = computeBaselineInputEff(5000, 4000, inp, cc, cr, true, 4000);
     expect(cold).toBeGreaterThan(warm);
+  });
+});
+
+describe('computeActualInputEff (server cache tiers)', () => {
+  it('uses the server-reported 5m/1h split instead of flattening all creates to 1.25x', () => {
+    expect(computeActualInputEff(100, 1_000, 200, {
+      fiveMinuteTokens: 900,
+      oneHourTokens: 100,
+    })).toBe(100 + 900 * CACHE_CREATE_5M_RATE + 100 * CACHE_CREATE_1H_RATE + 200 * CACHE_READ_RATE);
+  });
+
+  it('keeps legacy rows readable but reports their unverified cache tier', () => {
+    expect(computeActualInputEff(0, 100, 0)).toBe(100 * CACHE_CREATE_5M_RATE);
+    expect(cacheCreateUnknownTokens(100)).toBe(100);
+    expect(cacheCreateUnknownTokens(100, { fiveMinuteTokens: 100 })).toBe(0);
   });
 });
 

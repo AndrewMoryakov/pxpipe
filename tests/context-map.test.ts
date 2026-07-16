@@ -204,7 +204,25 @@ describe('renderRecentFragment — billed delta presentation', () => {
     } satisfies RecentPayload);
 
     expect(html).toContain('Saved/lost');
+    expect(html).toContain('id="help-recent-sent-as"');
+    expect(html).toContain('id="help-recent-cache-hits"');
+    expect(html).toContain('id="help-recent-as-text"');
+    expect(html).toContain('id="help-recent-sent"');
+    expect(html).toContain('id="help-recent-saved-lost"');
     expect(html).toContain('class="num neg">-61,908</td>');
     expect(html).not.toContain('class="num pos">—</td>');
+  });
+
+  it('uses a button for Details so inspecting a request cannot follow the current hash anchor', () => {
+    const html = renderRecentFragment({
+      recent: [{
+        ts: 0, method: 'POST', path: '/v1/messages', status: 200, compressed: true, img_id: 42,
+      }],
+      has_preview: false,
+      preview_meta: '',
+    } satisfies RecentPayload);
+
+    expect(html).toContain('<button class="row-view" type="button" hx-get="/fragments/context-map?req=42"');
+    expect(html).not.toContain('class="row-view" href="#"');
   });
 });
