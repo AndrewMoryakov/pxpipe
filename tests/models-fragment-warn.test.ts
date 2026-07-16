@@ -1,38 +1,54 @@
 import { describe, it, expect } from 'vitest';
 import { renderModelsFragment } from '../src/dashboard/fragments.js';
 
-// Weak-reader chips (per FINDINGS): enabling one from the dashboard must prompt
-// a confirm; a lit one must show a ⚠ marker. Non-flagged models (Fable, Sonnet,
-// Terra, Lun, broad gpt-5.6) never prompt.
-const WEAK = ['claude-opus-4-8', 'claude-opus-4-7', 'gpt-5.5', 'gpt-5.6-sol', 'grok-4.5'];
+// Readiness tiers (derived from committed eval receipts, see fragments.ts):
+//  - below-bar → blocking confirm on enable + ⚠ when lit
+//  - unmeasured → NON-blocking ⚠ + tooltip (default for unlisted ids)
+//  - validated (Fable) → nothing
+const BELOW_BAR = ['claude-opus-4-8', 'claude-opus-4-7', 'gpt-5.5', 'gpt-5.6-sol', 'grok-4.5', 'gpt-5.6'];
 
-describe('renderModelsFragment — weak-reader warnings', () => {
-  it('adds hx-confirm only to weak-reader chips that are OFF (enable attempt)', () => {
-    // Nothing active, nothing extra configured → chip set is the built-in catalog.
+/** Extract the <button> for one model id from rendered html. */
+function chip(html: string, id: string): string {
+  const esc = id.replace(/\./g, '\\.');
+  return html.match(new RegExp(`<button[^>]*"model":"${esc}"[^>]*>[^<]*</button>`))?.[0] ?? '';
+}
+
+describe('renderModelsFragment — readiness-tiered warnings', () => {
+  it('blocking confirm on exactly the below-bar chips when OFF', () => {
     const html = renderModelsFragment([], [], true);
-    // Exactly the weak readers carry a confirm; Fable/Sonnet/Terra/Lun/gpt-5.6 do not.
-    const confirmCount = (html.match(/hx-confirm=/g) ?? []).length;
-    expect(confirmCount).toBe(WEAK.length);
-    // The Opus warning text is present and carries the FINDINGS number.
-    expect(html).toContain('6/15 dense-hex');
+    expect((html.match(/hx-confirm=/g) ?? []).length).toBe(BELOW_BAR.length);
+    // below-bar confirm carries the concrete measured number.
+    expect(html).toContain('0/15 verbatim dense-hex');
   });
 
-  it('does NOT prompt when a weak reader is already ON (disable never confirms)', () => {
-    // All weak readers lit → clicking them would DISABLE → no confirm anywhere.
-    const html = renderModelsFragment(WEAK, [], true);
+  it('disabling never prompts: all below-bar ON → no confirm, ⚠ present', () => {
+    const html = renderModelsFragment(BELOW_BAR, [], true);
     expect(html).not.toContain('hx-confirm=');
-    // Lit weak readers show the ⚠ marker.
     expect(html).toContain('⚠');
   });
 
-  it('never marks or prompts a non-flagged model (Terra)', () => {
-    const offHtml = renderModelsFragment([], [], true);
-    const onHtml = renderModelsFragment(['gpt-5.6-terra'], [], true);
-    // Terra chip: extract its button and assert no confirm / no ⚠ on it.
-    const terraOff = offHtml.match(/<button[^>]*"model":"gpt-5\.6-terra"[^>]*>[^<]*<\/button>/)?.[0] ?? '';
-    const terraOn = onHtml.match(/<button[^>]*"model":"gpt-5\.6-terra"[^>]*>[^<]*<\/button>/)?.[0] ?? '';
-    expect(terraOff).not.toContain('hx-confirm=');
-    expect(terraOn).not.toContain('⚠');
-    expect(terraOn).toContain('✓'); // it is enabled, just not flagged
+  it('unmeasured (Terra) never blocks: no confirm off or on; ⚠ + tooltip when on', () => {
+    const off = chip(renderModelsFragment([], [], true), 'gpt-5.6-terra');
+    const on = chip(renderModelsFragment(['gpt-5.6-terra'], [], true), 'gpt-5.6-terra');
+    expect(off).not.toContain('hx-confirm=');
+    expect(on).not.toContain('hx-confirm=');
+    expect(on).toContain('⚠');
+    expect(on).toContain('title=');
+    expect(on).toContain('unmeasured');
+  });
+
+  it('validated (Fable) is never flagged: no confirm, ⚠, or title', () => {
+    const on = chip(renderModelsFragment(['claude-fable-5'], [], true), 'claude-fable-5');
+    expect(on).not.toContain('hx-confirm=');
+    expect(on).not.toContain('⚠');
+    expect(on).not.toContain('title=');
+    expect(on).toContain('✓');
+  });
+
+  it('unknown/unlisted model defaults to unmeasured (⚠ + tooltip, no confirm)', () => {
+    const c = chip(renderModelsFragment(['gpt-9.9-foo'], [], true), 'gpt-9.9-foo');
+    expect(c).not.toContain('hx-confirm=');
+    expect(c).toContain('⚠');
+    expect(c).toContain('title=');
   });
 });

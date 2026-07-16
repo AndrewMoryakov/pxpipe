@@ -178,23 +178,63 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
 
-/** Models that read pxpipe-imaged content measurably worse (FINDINGS.md, see
- *  applicability.ts). Enabling one from the dashboard prompts a confirm with the
- *  concrete numbers; a lit one shows a ⚠ marker. Fable/Sonnet/Terra/Lun and the
- *  broad gpt-5.6 are not flagged (no evidence they're weak; Terra is the Codex
- *  production model). Keyed by exact chip id. */
-const WEAK_READERS: Readonly<Record<string, string>> = {
-  'claude-opus-4-8':
-    'Opus 4.8 reads pxpipe-imaged context worse: 6/15 dense-hex vs Fable 100/100 (~2pp arithmetic). pxpipe images context, so dense/precise data can be misread. Enable anyway?',
-  'claude-opus-4-7':
-    'Opus 4.7 reads pxpipe-imaged context worse (like 4.8: ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100). Enable anyway?',
-  'gpt-5.5':
-    'GPT-5.5 degrades on imaged history/context — recall of older turns can suffer. Enable anyway?',
-  'gpt-5.6-sol':
-    'GPT-5.6 Sol on imaged content: 98/100 arithmetic but 79/93 gist, 4/15 guard confabulations, 0/15 dense-hex. Enable anyway?',
-  'grok-4.5':
-    'Grok 4.5 on imaged content: 82/100 arithmetic, 83/98 gist, 13/18 state tracking. Enable anyway?',
+/** Per-model readiness for pxpipe imaging, keyed to committed eval receipts —
+ *  NOT opinion (see FINDINGS.md / applicability.ts). The dashboard derives its
+ *  warning from `status`:
+ *   - validated  → reads dense imaged content at/above the Fable bar
+ *                  (≈13/15 verbatim + graceful failure). No warning.
+ *   - below-bar  → benchmarked and measured under the bar. Blocking confirm on
+ *                  enable + ⚠ marker (proven risk).
+ *   - unmeasured → no committed benchmark. Non-blocking ⚠ marker + tooltip
+ *                  (unknown, not proven-bad). This is also the default for any
+ *                  model absent from the table.
+ *  Promote to `validated` only by committing receipts that clear the bar. */
+type Readiness = 'validated' | 'below-bar' | 'unmeasured';
+
+const MODEL_READINESS: Readonly<Record<string, { status: Readiness; evidence?: string }>> = {
+  // Validated — the only reader proven at the production density.
+  'claude-fable-5': { status: 'validated' },
+  // Below-bar — benchmarked, measured under the Fable bar.
+  'claude-opus-4-8': {
+    status: 'below-bar',
+    evidence: 'Opus 4.8: 0/15 verbatim dense-hex, ~7% arithmetic read-tax, silent confabulation (fixable with abstention prompting).',
+  },
+  'claude-opus-4-7': {
+    status: 'below-bar',
+    evidence: 'Opus 4.7: below the Fable bar on imaged verbatim recall (0/15 dense-hex), silent confabulation.',
+  },
+  'gpt-5.5': {
+    status: 'below-bar',
+    evidence: 'GPT-5.5: degrades on imaged history/context; recall of older turns can suffer.',
+  },
+  'gpt-5.6-sol': {
+    status: 'below-bar',
+    evidence: 'GPT-5.6 Sol: 0/15 verbatim dense-hex, gist 79/93, 98/100 arithmetic — below the Fable bar.',
+  },
+  'grok-4.5': {
+    status: 'below-bar',
+    evidence: 'Grok 4.5: 82/100 arithmetic, 83/98 gist, 13/18 state tracking on imaged content.',
+  },
+  // Broad gpt-5.6 chip enables every 5.6 sibling incl. Sol → carry Sol's risk.
+  'gpt-5.6': {
+    status: 'below-bar',
+    evidence: 'Enabling GPT-5.6 turns on all 5.6 siblings including Sol (0/15 verbatim dense-hex, below the Fable bar).',
+  },
+  // Unmeasured — no committed benchmark (explicit; unlisted ids default here too).
+  'claude-sonnet-5': { status: 'unmeasured' },
+  'claude-sonnet-4-6': { status: 'unmeasured' },
+  'gpt-5.6-terra': { status: 'unmeasured' },
+  'gpt-5.6-lun': { status: 'unmeasured' },
 };
+
+/** Shared risk statement for any non-validated model. */
+const IMAGED_RISK =
+  'pxpipe images older history at a density where exact recall of IDs/hashes/exact numbers is unsafe and can fail via silent confabulation.';
+const UNMEASURED_NOTE = `No committed pxpipe reading benchmark for this model — its accuracy on imaged context is unmeasured. ${IMAGED_RISK}`;
+
+function readinessOf(id: string): { status: Readiness; evidence?: string } {
+  return MODEL_READINESS[id] ?? { status: 'unmeasured' };
+}
 
 export function renderModelsFragment(
   active: string[],
@@ -224,14 +264,21 @@ export function renderModelsFragment(
   const chipFor = (id: string): string => {
     const lit = on.has(id);
     const label = labelOf.get(id) ?? id;
-    const warn = WEAK_READERS[id];
-    // Confirm only when ENABLING a weak reader (off → on); disabling never prompts.
-    const confirmAttr = warn && !lit ? ` hx-confirm="${escapeHtml(warn)}"` : '';
-    // Persistent marker on a lit weak reader so a risky choice stays visible.
-    const warnMark = warn && lit ? ' ⚠' : '';
+    const r = readinessOf(id);
+    const tip =
+      r.status === 'below-bar' ? (r.evidence ?? `${label} reads pxpipe-imaged context below the Fable bar. ${IMAGED_RISK}`)
+      : r.status === 'unmeasured' ? UNMEASURED_NOTE
+      : '';
+    // Persistent, hover-readable explanation for any flagged chip.
+    const titleAttr = tip ? ` title="${escapeHtml(tip)}"` : '';
+    // below-bar = proven risk → block on ENABLE (off → on). unmeasured never
+    // blocks (unknown, not proven-bad); validated never flags. Disable never prompts.
+    const confirmAttr = r.status === 'below-bar' && !lit ? ` hx-confirm="${escapeHtml(`${tip} Enable anyway?`)}"` : '';
+    // ⚠ marker on any lit non-validated chip so the risk stays visible after enabling.
+    const warnMark = r.status !== 'validated' && lit ? ' ⚠' : '';
     return (
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
-      `aria-pressed="${lit}"${confirmAttr} ` +
+      `aria-pressed="${lit}"${titleAttr}${confirmAttr} ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
       `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}${warnMark}</button>`
     );
