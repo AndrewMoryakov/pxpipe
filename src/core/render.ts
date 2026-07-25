@@ -221,18 +221,6 @@ export interface RenderStyle {
    *  white ink on black (pre-invert canvas). Fixed cell pitch. */
   invert?: boolean;
   /**
-   * Tint ink by character class (digit / UPPER / lower / other) for OCR disambiguation
-   * of confusable pairs like 0/O/o. Forces RGB. Composes with aa. Mutually exclusive
-   * intent with colorCycle (if both set, colorByClass wins).
-   */
-  colorByClass?: boolean;
-  /**
-   * Paint a 1px class micro-mark in the cell margin after each glyph blit:
-   * digit → bottom-left, UPPER → top-right, lower/other → none.
-   * Separates 0/O/o without changing cell pitch. Works with gray or RGB output.
-   */
-  classTick?: boolean;
-  /**
    * Post-invert paper gray (0–255). Default 255 = pure white. Mid-light values
    * (e.g. 230–240) reduce glare and lift faint grid rules without changing cell pitch.
    * Applied after invert; ink stays near-black via linear remap onto the paper.
@@ -316,67 +304,11 @@ const GLYPH_PALETTE: [number, number, number][] = [
 /** colorByRole palette, indexed by slot-1. Only the boundary TAGS are tinted;
  *  body content stays black. [<user> tags, <assistant> tags]. */
 export const ROLE_PALETTE: [number, number, number][] = [
-  [20, 120, 50],   // 1: <user> / </user> — green
-  [30, 70, 180],   // 2: <assistant> / </assistant> — blue
+  [150, 20, 20],   // 1: <user> / </user> — dark red (81.3% contrast on white)
+  [20, 40, 160],   // 2: <assistant> / </assistant> — dark blue (82.6% contrast on white)
 ];
 const ROLE_SLOT_USER = 1;
 const ROLE_SLOT_ASSISTANT = 2;
-
-/** colorByClass palette, indexed by slot-1: digit / UPPER / lower / other. */
-export const CLASS_PALETTE: [number, number, number][] = [
-  [20, 40, 160],   // 1: digit 0-9 — blue (0 ≠ O/o)
-  [150, 20, 20],   // 2: UPPER A-Z — red (O ≠ 0/o)
-  [20, 110, 40],   // 3: lower a-z — green (o ≠ 0/O)
-  [20, 20, 20],    // 4: other / punctuation — near-black
-];
-const CLASS_SLOT_DIGIT = 1;
-const CLASS_SLOT_UPPER = 2;
-const CLASS_SLOT_LOWER = 3;
-const CLASS_SLOT_OTHER = 4;
-
-function classSlotForCodepoint(cp: number): number {
-  if (cp >= 0x30 && cp <= 0x39) return CLASS_SLOT_DIGIT; // 0-9
-  if (cp >= 0x41 && cp <= 0x5a) return CLASS_SLOT_UPPER; // A-Z
-  if (cp >= 0x61 && cp <= 0x7a) return CLASS_SLOT_LOWER; // a-z
-  return CLASS_SLOT_OTHER;
-}
-
-/** 1px class micro-marks in cell margins (pre-invert ink = 255). */
-function paintClassTick(
-  fb: Uint8Array,
-  fbW: number,
-  fbH: number,
-  baseX: number,
-  baseY: number,
-  cellW: number,
-  cellH: number,
-  codepoint: number,
-  colorMask: Uint8Array | null,
-  colorSlot: number,
-): void {
-  const slot = classSlotForCodepoint(codepoint);
-  // digit → BL, UPPER → TR; lower/other unmarked
-  let ox: number;
-  let oy: number;
-  if (slot === CLASS_SLOT_DIGIT) {
-    ox = 0;
-    oy = Math.max(0, cellH - 1);
-  } else if (slot === CLASS_SLOT_UPPER) {
-    ox = Math.max(0, cellW - 1);
-    oy = 0;
-  } else {
-    return;
-  }
-  const px = baseX + ox;
-  const py = baseY + oy;
-  if (px < 0 || py < 0 || px >= fbW || py >= fbH) return;
-  const idx = py * fbW + px;
-  // only mark background so we don't erase glyph strokes
-  if (fb[idx]! === 0) {
-    fb[idx] = 255;
-    if (colorMask && colorSlot > 0) colorMask[idx] = colorSlot;
-  }
-}
 
 /**
  * Slot markers for the parallel "slot string" — the structure-through mechanism
@@ -682,7 +614,13 @@ function blitGlyph(
 }
 
 /**
- * Blit a grayscale atlas glyph at pixel (x, y) using max-blending. EVAL-ONLY (style.aa).
+ * Blit a grayscale atlas glyph at pixel (x, y) using max-blending. Selected by
+ * `style.aa`, which production sets via DENSE_RENDER_STYLE — this is NOT eval-only.
+ * Measured: the gray atlas is bit-identical to the bitmap atlas across all 95 ASCII
+ * glyphs (0/3800 intermediate coverage bytes) because Spleen-5x8.otb is a bitmap font
+ * at its native 8px, so AA has nothing to smooth. Only the Unifont vector fallback
+ * (CJK, box-drawing, accents) carries real grayscale (~48% intermediate bytes).
+ * Consequence: toggling `aa` cannot change a single pixel of ASCII content.
  * Returns cells advanced (1 or 2), or 0 if absent from the gray atlas.
  */
 function blitGlyphGray(
@@ -880,11 +818,30 @@ export async function renderChunkToPng(
   const markerMask: Uint8Array | null =
     style.markerRed ? new Uint8Array(width * height) : null;
   // colorMask: stores colorSlot per inked pixel (0 = background) for colorCycle / colorByRole RGB output.
-  const useColorByClass = style.colorByClass === true;
-  const useColorCycle = style.colorCycle === true && !useColorByClass;
-  const useColorByRole = style.colorByRole === true && !useColorByClass;
+  const useColorCycle = style.colorCycle === true;
+  const useColorByRole = style.colorByRole === true;
   const colorMask: Uint8Array | null =
-    (useColorCycle || useColorByRole || useColorByClass) ? new Uint8Array(width * height) : null;
+    (useColorCycle || useColorByRole) ? new Uint8Array(width * height) : null;
+  // Ink palette is fixed for the whole page; the composition pass indexes it per pixel.
+  const inkPalette = useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
+
+  /** Stamp colorSlot over the inked pixels of one glyph's cell span. Identical
+   *  for every blit path — only the horizontal span differs (scaled markers
+   *  advance in cellW, normal glyphs in atlasW). */
+  const stampColorMask = (baseX: number, baseY: number, spanW: number, colorSlot: number): void => {
+    if (!colorMask) return;
+    for (let gy = 0; gy < atlasH; gy++) {
+      const py = baseY + gy;
+      if (py >= height) break;
+      const rowBase = py * width;
+      for (let gx = 0; gx < spanW; gx++) {
+        const px = baseX + gx;
+        if (px >= width) break;
+        const idx = rowBase + px;
+        if (fb[idx]! > 0) colorMask[idx] = colorSlot;
+      }
+    }
+  };
 
   let droppedChars = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -902,59 +859,19 @@ export async function renderChunkToPng(
       const codepoint = ch.codePointAt(0)!;
       const baseX = PAD_X + col * cellW;
       const isMarker = codepoint === NL_SENTINEL_CP;
-      const colorSlot = useColorByClass
-        ? classSlotForCodepoint(codepoint)
-        : useColorByRole
-          ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
-          : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
+      const colorSlot = useColorByRole
+        ? (slotRow ? slotForMarkCp(slotRow[charIdx]?.codePointAt(0)) : 0) // 0 = body (black); only tags carry a role hue
+        : (glyphIndex % GLYPH_PALETTE.length) + 1; // 0 reserved for background in colorMask
       let advance: number;
       if (isMarker && markerScale > 1) {
         advance = blitGlyphScaled(fb, markerMask, width, height, baseX, baseY, codepoint, markerScale, style.font);
-        if (colorMask) {
-          for (let gy = 0; gy < atlasH; gy++) {
-            const py = baseY + gy;
-            if (py >= height) break;
-            for (let gx = 0; gx < advance * cellW; gx++) {
-              const px = baseX + gx;
-              if (px >= width) break;
-              const idx = py * width + px;
-              if (fb[idx]! > 0) colorMask[idx] = colorSlot;
-            }
-          }
-        }
-      } else if (useAA) {
-        advance = blitGlyphGray(fb, width, baseX, baseY, codepoint, style.font);
-        if (colorMask && advance > 0) {
-          const srcW = advance * atlasW;
-          for (let gy = 0; gy < atlasH; gy++) {
-            const py = baseY + gy;
-            if (py >= height) break;
-            for (let gx = 0; gx < srcW; gx++) {
-              const px = baseX + gx;
-              if (px >= width) break;
-              const idx = py * width + px;
-              if (fb[idx]! > 0) colorMask[idx] = colorSlot;
-            }
-          }
-        }
+        // Scaled marker occupies whole cells, so its span is in cellW units.
+        if (colorMask) stampColorMask(baseX, baseY, advance * cellW, colorSlot);
       } else {
-        advance = blitGlyph(fb, width, baseX, baseY, codepoint, style.font, isMarker ? markerMask : null);
-        if (colorMask && advance > 0) {
-          const srcW = advance * atlasW;
-          for (let gy = 0; gy < atlasH; gy++) {
-            const py = baseY + gy;
-            if (py >= height) break;
-            for (let gx = 0; gx < srcW; gx++) {
-              const px = baseX + gx;
-              if (px >= width) break;
-              const idx = py * width + px;
-              if (fb[idx]! > 0) colorMask[idx] = colorSlot;
-            }
-          }
-        }
-      }
-      if (style.classTick === true && advance > 0) {
-        paintClassTick(fb, width, height, baseX, baseY, cellW, cellH, codepoint, colorMask, colorSlot);
+        advance = useAA
+          ? blitGlyphGray(fb, width, baseX, baseY, codepoint, style.font)
+          : blitGlyph(fb, width, baseX, baseY, codepoint, style.font, isMarker ? markerMask : null);
+        if (colorMask && advance > 0) stampColorMask(baseX, baseY, advance * atlasW, colorSlot);
       }
       glyphIndex++;
       charIdx++;
@@ -996,8 +913,7 @@ export async function renderChunkToPng(
 
   let png: Uint8Array;
   if (colorMask) {
-    // colorCycle / colorByRole / colorByClass: AA-blend ink onto paper in palette color.
-    const palette = useColorByClass ? CLASS_PALETTE : useColorByRole ? ROLE_PALETTE : GLYPH_PALETTE;
+    // colorCycle / colorByRole: AA-blend ink onto paper in palette color.
     const rgb = new Uint8Array(width * height * 3);
     for (let i = 0; i < fb.length; i++) {
       const g = fb[i]!; // post-invert (+ optional paper): 0 = ink, paper = background
@@ -1006,7 +922,7 @@ export async function renderChunkToPng(
         // coverage relative to paper so AA fringes stay correct on mid-light bg
         const coverage = paper <= 0 ? 0 : Math.round(((paper - g) * 255) / paper);
         const cov = Math.max(0, Math.min(255, coverage));
-        const [pr, pg, pb] = palette[(slot - 1) % palette.length]!;
+        const [pr, pg, pb] = inkPalette[(slot - 1) % inkPalette.length]!;
         // Alpha-blend ink color onto paper: channel = paper - cov*(paper-palette)/255
         rgb[i * 3]     = Math.round(paper - (cov * (paper - pr!)) / 255);
         rgb[i * 3 + 1] = Math.round(paper - (cov * (paper - pg!)) / 255);
