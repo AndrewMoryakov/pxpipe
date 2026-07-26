@@ -225,6 +225,61 @@ describe('proxy usage extraction', () => {
     expect(captured?.info?.bucketChars).toBeUndefined();
   });
 
+  it('bounds the countTokens probe and reverts when it times out', async () => {
+    const probeSignals: (AbortSignal | undefined)[] = [];
+    const forwardedBodies: string[] = [];
+    // Local patch: the shared mockUpstream rebuilds a Request, whose `signal` is always
+    // populated — only the raw init reveals whether we actually attached a budget.
+    const realFetch = globalThis.fetch;
+    const restoreFetch = () => { globalThis.fetch = realFetch; };
+    globalThis.fetch = ((input: Request | string | URL, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes(':countTokens')) probeSignals.push(init?.signal ?? undefined);
+      const r = input instanceof Request ? input : new Request(url, init);
+      return Promise.resolve(handler(r));
+    }) as typeof fetch;
+    const handler = async (req: Request): Promise<Response> => {
+      if (req.url.includes(':countTokens')) {
+        // What AbortSignal.timeout produces once the budget expires.
+        throw Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' });
+      }
+      forwardedBodies.push(await req.clone().text());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 400, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    };
+    const restore = restoreFetch;
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://ocproxy.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    // The probe must carry a live budget, or a wedged endpoint hangs the caller's request.
+    expect(probeSignals.length).toBeGreaterThan(0);
+    for (const signal of probeSignals) expect(signal).toBeInstanceOf(AbortSignal);
+    expect(probeSignals.every((s) => s !== undefined)).toBe(true);
+    // Expiring is not an error path for the client: original body, request still served.
+    expect(res.status).toBe(200);
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).not.toContain('inlineData');
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toBe('count_tokens_failed');
+  });
+
   it('does not apply the 3.6 Flash profile to an unvalidated Gemini alias', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
@@ -471,7 +526,7 @@ describe('proxy usage extraction', () => {
     });
     expect(captured?.stopReason).toBe('tool_use');
     expect(captured?.info?.compressed).toBe(true);
-    expect(captured?.info?.firstImageWidth).toBe(768);
+    expect(captured?.info?.firstImageWidth).toBe(764);
     expect(captured?.info?.baselineProbeStatus).toBeUndefined();
   });
 
@@ -1204,14 +1259,12 @@ describe('proxy usage extraction', () => {
     expect(captured?.model).toBe('gpt-5.6-sol');
     expect(captured?.accountingProvider).toBe('openai');
     expect(captured?.info?.compressed).toBe(true);
-    // OpenCode reaches the Responses transformer directly. Sol's production
-    // profile supplies the validated 768px-wide monochrome renderer.
-    expect(captured?.info?.firstImageWidth).toBe(768);
-    expect(captured?.info?.firstImageHeight).toBeLessThanOrEqual(1932);
+    // OpenCode reaches the Responses transformer directly. Sol uses its
+    // JetBrains Mono profile and original-detail patch geometry.
+    expect(captured?.info?.firstImageWidth).toBe(764);
+    expect(captured?.info?.firstImageHeight).toBeLessThanOrEqual(1954);
     expect(captured?.info?.imageTokens ?? 0).toBeGreaterThan(0);
-    expect(captured?.info?.baselineImagedTokens ?? 0).toBeGreaterThan(
-      captured?.info?.imageTokens ?? 0,
-    );
+    expect(captured?.info?.baselineImagedTokens ?? 0).toBeGreaterThan(0);
     expect(captured?.info?.baselineProbeStatus).toBeUndefined();
     expect(captured?.info?.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
   });
@@ -2344,5 +2397,147 @@ describe('proxy usage extraction', () => {
 
     expect(captured).toBeDefined();
     expect(captured!.stopReason).toBeUndefined();
+  });
+
+  it('rejects a compressed final provider body above its profile byte cap', async () => {
+    const prev = process.env.PXPIPE_GPT_PROFILES;
+    let upstreamCalls = 0;
+    const restore = mockUpstream(() => {
+      upstreamCalls++;
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
+        'gpt-5.6-sol': { maxSerializedRequestBytes: 1 },
+      });
+      let captured: ProxyEvent | undefined;
+      const proxy = createProxy({
+        upstream: 'http://mock',
+        transform: { charsPerToken: 1, minCompressChars: 1 },
+        onRequest: (event) => { captured = event; },
+      });
+      const body = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions: 'System instruction. '.repeat(900),
+        input: [{ role: 'user', content: 'hi' }],
+      });
+      const res = await proxy(new Request('http://localhost/openai/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(res.status).toBe(413);
+      expect(upstreamCalls).toBe(0);
+      expect(captured?.status).toBe(413);
+      expect(captured?.info?.compressed).toBe(true);
+      expect(captured?.info?.serializedRequestBytes).toBeGreaterThan(1);
+      expect(captured?.info?.sizeLimitOutcome).toBe('rejected');
+    } finally {
+      restore();
+      if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
+      else process.env.PXPIPE_GPT_PROFILES = prev;
+    }
+  });
+
+  it('does not apply the profile byte cap to an uncompressed pass-through body', async () => {
+    const prev = process.env.PXPIPE_GPT_PROFILES;
+    let forwarded = '';
+    const restore = mockUpstream(async (req) => {
+      forwarded = await req.text();
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
+        'gpt-5.6-sol': { maxSerializedRequestBytes: 1 },
+      });
+      const proxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+      });
+      const body = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions: 'unchanged',
+        input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+      });
+      const res = await proxy(new Request('http://localhost/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      }));
+      await res.text();
+
+      expect(res.status).toBe(200);
+      expect(forwarded).toBe(body);
+    } finally {
+      restore();
+      if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
+      else process.env.PXPIPE_GPT_PROFILES = prev;
+    }
+  });
+
+  it('rejects an identical in-flight request without duplicating the upstream stream', async () => {
+    const encoder = new TextEncoder();
+    let upstreamCalls = 0;
+    let finish!: () => void;
+    const restore = mockUpstream(() => {
+      upstreamCalls++;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"ok"}\n\n'));
+          finish = () => {
+            controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":1}}}\n\n'));
+            controller.close();
+          };
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    });
+    try {
+      const events: ProxyEvent[] = [];
+      const proxy = createProxy({
+        openAIUpstream: 'http://mock',
+        transform: { compress: false },
+        onRequest: (event) => { events.push(event); },
+      });
+      const body = JSON.stringify({
+        model: 'gpt-5.6-sol',
+        input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+      });
+      const request = () => new Request('http://localhost/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
+        body,
+      });
+
+      const first = await proxy(request());
+      const duplicate = await proxy(request());
+      expect(duplicate.status).toBe(409);
+      expect(await duplicate.json()).toEqual({
+        error: {
+          type: 'duplicate_request_in_flight',
+          message: 'An identical request is already in progress',
+        },
+      });
+      expect(upstreamCalls).toBe(1);
+
+      finish();
+      const firstText = await first.text();
+      expect(firstText).toContain('response.output_text.delta');
+      expect(firstText).toContain('response.completed');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const later = await proxy(request());
+      expect(upstreamCalls).toBe(2);
+      finish();
+      await later.text();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const duplicateEvent = events.find((event) => event.status === 409);
+      expect(duplicateEvent?.error).toBe('duplicate_request_in_flight');
+      expect(duplicateEvent?.usage).toBeUndefined();
+    } finally {
+      restore();
+    }
   });
 });

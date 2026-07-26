@@ -22,6 +22,7 @@ import {
 } from './messages-chat-bridge.js';
 import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -54,6 +55,17 @@ export interface ProxyConfig {
   /** Persist 4xx diagnostics: the gzipped request body plus the upstream error
    *  body. Off by default because either side may contain prompts or secrets. */
   captureErrorReqBody?: boolean;
+  /** Abort the upstream request if response headers have not arrived within this
+   *  many ms. Cleared once headers land, so long generations are unaffected.
+   *  0 disables. */
+  upstreamHeadersTimeoutMs?: number;
+  /** Abort the upstream response if no bytes arrive for this many ms. This is the
+   *  stall guard: a wedged connection can otherwise be held open forever. 0 disables. */
+  upstreamIdleTimeoutMs?: number;
+  /** How long an in-flight request may reject an identical retry before the dedupe
+   *  fails open. Prevents one stalled request from permanently 409-ing its retries.
+   *  0 disables dedupe entirely. */
+  duplicateHoldMs?: number;
 }
 
 export interface ProxyEvent {
@@ -94,6 +106,120 @@ export interface ProxyEvent {
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
+
+/** Headers should arrive well inside this; generous enough for slow reasoning starts. */
+const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
+/** No bytes for this long means the connection is wedged, not slow. */
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Past this, an in-flight entry is treated as stale and a retry is let through. */
+const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
+/**
+ * Budget for a count-tokens probe. Both probes fail closed (null keeps the original
+ * body), so expiring one costs that request's savings, never correctness. The Google
+ * pair is awaited before the forward, so this is worst-case added latency; the
+ * Anthropic pair only feeds telemetry.
+ *
+ * Neither provider publishes a latency SLO for count-tokens, and we have no probe
+ * timing of our own, so this is not a measured figure. It is bounded by the one number
+ * we do have: p99 time-to-headers for a full generation on the same route (30s over
+ * 2166 Gemini requests in our telemetry). A probe does strictly less work than
+ * first-token generation, so one that misses that mark is wedged rather than slow.
+ */
+const COUNT_TOKENS_TIMEOUT_MS = 30_000;
+/** Sweep the in-flight map early once it grows past plausible real concurrency. */
+const INFLIGHT_SWEEP_SIZE = 256;
+/** Floor between size-triggered sweeps so genuine high concurrency stays O(1)/request. */
+const INFLIGHT_SWEEP_MIN_INTERVAL_MS = 1_000;
+
+/**
+ * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
+ * the watchdog sees real network activity rather than post-transform output.
+ */
+function withIdleTimeout(
+  res: Response,
+  firstChunkMs: number,
+  ms: number,
+  onIdle: () => void,
+): Response {
+  if (!res.body || ms <= 0) return res;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clear = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  // The watchdog errors its own controller rather than relying on the fetch
+  // implementation to tear the body down when the signal aborts.
+  let ctl: TransformStreamDefaultController<Uint8Array> | undefined;
+  const arm = (budget: number): void => {
+    clear();
+    timer = setTimeout(() => {
+      timer = undefined;
+      onIdle();
+      try {
+        ctl?.error(new Error(`pxpipe: upstream stalled for ${budget}ms`));
+      } catch {
+        /* already errored or closed */
+      }
+    }, budget);
+  };
+  const watched = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      start(controller) {
+        ctl = controller;
+        // Nothing has streamed yet: the model may still be starting up, which is the
+        // same wait the headers budget covers. Real traffic has taken >120s just to
+        // return headers (max 146s over 41k requests), so charging the mid-stream idle
+        // budget here would abort healthy slow starts.
+        arm(firstChunkMs);
+      },
+      transform(chunk, controller) {
+        // Bytes have flowed: from here a long silence means wedged, not slow.
+        arm(ms);
+        controller.enqueue(chunk);
+      },
+      flush() {
+        clear();
+      },
+    }),
+  );
+  return new Response(watched, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
+}
+
+/**
+ * Passthrough that notifies on client disconnect. `cancel` deliberately does not await
+ * the inner cancel: with a wedged upstream that call can hang, which would in turn hang
+ * the caller's `body.cancel()`.
+ */
+function withClientDisconnect(
+  body: ReadableStream<Uint8Array>,
+  onCancel: (reason: unknown) => void,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      onCancel(reason);
+      void reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
 
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
@@ -138,14 +264,18 @@ async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(buf);
 }
 
-/** sha256[0..8] hex of a byte buffer. */
-async function sha8Bytes(body: Uint8Array): Promise<string> {
+/** SHA-256 hex of a byte buffer. */
+async function sha256Bytes(body: Uint8Array): Promise<string> {
   // Cast: Web Crypto accepts Uint8Array at runtime despite the BufferSource type.
   const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
   const bytes = new Uint8Array(digest);
   let hex = '';
-  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
   return hex;
+}
+
+async function sha256Text(value: string): Promise<string> {
+  return sha256Bytes(new TextEncoder().encode(value));
 }
 
 /**
@@ -716,6 +846,7 @@ async function countTokensUpstream(
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
+      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const json = (await res.json()) as { input_tokens?: unknown };
@@ -740,6 +871,7 @@ async function countGoogleTokensUpstream(
       method: 'POST',
       headers,
       body: countBody,
+      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const json = await res.json() as { totalTokens?: unknown };
@@ -793,6 +925,16 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
+  const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
+  // Entries are released by their holder on every exit path, but the key space is
+  // unbounded (one per distinct body) and the map outlives every request, so a single
+  // missed release would leak for the daemon's lifetime. An entry past the hold window
+  // is already ignored by the duplicate check below, so expiring it costs nothing and
+  // bounds the map by real in-window concurrency instead of by release correctness.
+  let lastSweptAt = 0;
+  const headersTimeoutMs = config.upstreamHeadersTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
+  const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
+  const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -845,6 +987,7 @@ export function createProxy(config: ProxyConfig = {}) {
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
+    let reqBodySha256: string | undefined;
 
     const fire = (
       status: number,
@@ -1045,7 +1188,7 @@ export function createProxy(config: ProxyConfig = {}) {
               ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
               : bridgedChatMessages
                 ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformRequest(bodyIn, effectiveOpts)
+                : await transformRequest(bodyIn, { ...effectiveOpts, model: effectiveModel ?? undefined })
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
               : await transformOpenAIResponses(bodyIn, effectiveOpts);
@@ -1090,8 +1233,29 @@ export function createProxy(config: ProxyConfig = {}) {
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
+        r.info.serializedRequestBytes = r.body.byteLength;
         if (r.body.byteLength > 0) {
-          reqBodySha8 = await sha8Bytes(r.body);
+          reqBodySha256 = await sha256Bytes(r.body);
+          reqBodySha8 = reqBodySha256.slice(0, 8);
+        }
+        const requestByteLimit = requestModel
+          ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+          : undefined;
+        if (r.info.compressed && requestByteLimit !== undefined) {
+          if (r.body.byteLength > requestByteLimit) {
+            r.info.sizeLimitOutcome = 'rejected';
+            const message = `pxpipe serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+            fire(413, r.info, message);
+            const error = isMessages
+              ? { type: 'error', error: { type: 'request_too_large', message } }
+              : { error: { type: 'request_too_large', message } };
+            return new Response(JSON.stringify(error), {
+              status: 413,
+              headers: { 'content-type': 'application/json' },
+            });
+          } else {
+            r.info.sizeLimitOutcome = 'within_limit';
+          }
         }
 
         if (isMessages && messagesAnthropic) {
@@ -1177,21 +1341,116 @@ export function createProxy(config: ProxyConfig = {}) {
       const requestUpstreamBase = bridgedGptMessages ? openAIUpstream : upstreamBase;
       upstreamUrl = requestUpstreamBase + outPath;
     }
+    let releaseInFlight = (): void => {};
+    if (reqBodySha256 && duplicateHoldMs > 0) {
+      const headers: [string, string][] = [];
+      outHeaders.forEach((value, name) => { headers.push([name, value]); });
+      headers.sort(([a], [b]) => a.localeCompare(b));
+      const key = await sha256Text(JSON.stringify([
+        req.method,
+        upstreamUrl,
+        headers,
+        reqBodySha256,
+      ]));
+      const now = Date.now();
+      // Time trigger keeps steady state clean; size trigger reclaims promptly if entries
+      // ever strand faster than the window. Both are throttled, so cost stays amortized.
+      const sinceSweep = now - lastSweptAt;
+      if (
+        sinceSweep >= duplicateHoldMs
+        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
+      ) {
+        for (const [k, v] of inFlight) {
+          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
+        }
+        lastSweptAt = now;
+      }
+      const existing = inFlight.get(key);
+      // Fail open once the holder is older than the window: a retry that arrives this
+      // late is the client recovering from a stall, not an accidental double-send.
+      if (existing && now - existing.startedAt < duplicateHoldMs) {
+        const message = 'An identical request is already in progress';
+        fire(409, undefined, 'duplicate_request_in_flight');
+        const error = isMessages
+          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
+          : { error: { type: 'duplicate_request_in_flight', message } };
+        return new Response(JSON.stringify(error), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const lease = Symbol();
+      inFlight.set(key, { lease, startedAt: now });
+      releaseInFlight = () => {
+        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
+      };
+    }
+    // One controller for the whole exchange: headers timeout, stall watchdog and client
+    // disconnect all abort through it, so nothing can hold the socket open indefinitely.
+    const upstreamAbort = new AbortController();
+    let timeoutKind: 'headers' | 'idle' | undefined;
+    let headersTimer: ReturnType<typeof setTimeout> | undefined;
+    // Raced explicitly rather than trusting the fetch implementation to reject on
+    // abort — the headers phase must be bounded even if the signal is ignored.
+    const HEADERS_TIMEOUT = Symbol('headers-timeout');
+    const headersDeadline = new Promise<typeof HEADERS_TIMEOUT>((resolve) => {
+      if (headersTimeoutMs <= 0) return;
+      headersTimer = setTimeout(() => {
+        headersTimer = undefined;
+        timeoutKind = 'headers';
+        upstreamAbort.abort(new Error('pxpipe: upstream headers timeout'));
+        resolve(HEADERS_TIMEOUT);
+      }, headersTimeoutMs);
+    });
+    const clearHeadersTimer = (): void => {
+      if (headersTimer !== undefined) {
+        clearTimeout(headersTimer);
+        headersTimer = undefined;
+      }
+    };
+
     let upstreamRes: Response;
     try {
-      upstreamRes = await fetch(upstreamUrl, {
+      const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
         body: bodyOut,
+        signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body
         ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
       } as RequestInit);
+      const raced =
+        headersTimeoutMs > 0 ? await Promise.race([upstreamFetch, headersDeadline]) : await upstreamFetch;
+      clearHeadersTimer();
+      if (raced === HEADERS_TIMEOUT) {
+        // Abandoned: keep its eventual rejection from surfacing as unhandled.
+        void upstreamFetch.catch(() => undefined);
+        throw new Error('pxpipe: upstream headers timeout');
+      }
+      upstreamRes = raced;
+      // Watch the raw upstream stream, before any bridge re-encodes it.
+      upstreamRes = withIdleTimeout(upstreamRes, headersTimeoutMs, idleTimeoutMs, () => {
+        timeoutKind = 'idle';
+        upstreamAbort.abort(new Error('pxpipe: upstream stalled'));
+      });
       if (bridgedGptMessages) {
         upstreamRes = await openAIResponsesToAnthropicResponse(upstreamRes, requestModel ?? '');
       } else if (bridgedChatMessages) {
         upstreamRes = await openAIChatToAnthropicResponse(upstreamRes, requestModel ?? '');
       }
     } catch (e) {
+      clearHeadersTimer();
+      releaseInFlight();
+      if (timeoutKind) {
+        const detail = timeoutKind === 'headers'
+          ? `no response headers within ${headersTimeoutMs}ms`
+          : `no upstream bytes for ${idleTimeoutMs}ms`;
+        fire(504, info, `upstream_timeout: ${detail}`);
+        return new Response(JSON.stringify({ error: `pxpipe upstream timeout (${detail})` }), {
+          status: 504,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       fire(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
@@ -1202,8 +1461,18 @@ export function createProxy(config: ProxyConfig = {}) {
     const firstByteMs = Date.now() - t0;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
-      teeForUsage(upstreamRes);
+    let teed: Response;
+    let usagePromise: Promise<Usage | undefined>;
+    let errorBodyPromise: Promise<string | undefined>;
+    let measurementPromise: Promise<OutputMeasurement | undefined>;
+    let stopReasonPromise: Promise<string | undefined>;
+    try {
+      ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
+        teeForUsage(upstreamRes));
+    } catch (e) {
+      releaseInFlight();
+      throw e;
+    }
 
     // Fire event in background once all four resolve (all share the same stream read).
     void Promise.all([
@@ -1211,7 +1480,7 @@ export function createProxy(config: ProxyConfig = {}) {
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason]) =>
+    ]).then(([usage, errorBody, measurement, stopReason]) => {
       fire(
         upstreamRes.status,
         info,
@@ -1221,10 +1490,25 @@ export function createProxy(config: ProxyConfig = {}) {
         config.captureErrorReqBody ? errorBody : undefined,
         measurement,
         stopReason,
-      ),
-    );
+      );
+    }).finally(() => {
+      clearHeadersTimer();
+      releaseInFlight();
+    });
 
-    return new Response(teed.body, {
+    // Client disconnect: drop the lease immediately and abort upstream, rather than
+    // waiting on scanner promises that a wedged connection would never settle.
+    const clientBody = teed.body
+      ? withClientDisconnect(teed.body, () => {
+          clearHeadersTimer();
+          releaseInFlight();
+          if (!upstreamAbort.signal.aborted) {
+            upstreamAbort.abort(new Error('pxpipe: client disconnected'));
+          }
+        })
+      : null;
+
+    return new Response(clientBody, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
       headers: filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS),

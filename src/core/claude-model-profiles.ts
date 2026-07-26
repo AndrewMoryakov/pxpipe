@@ -16,30 +16,27 @@ import type { GptModelProfile } from './gpt-model-profiles.js';
  * rule table, so no Claude model can land on a GPT or Gemini profile.
  */
 
-/** Claude 4.7+. Vision struct unused: visionTokensForModel prices Claude by pixels. */
-export const CLAUDE_FABLE_PROFILE: GptModelProfile = {
-  vision: { regime: 'tile', base: 85, perTile: 170 },
+/** Claude 4.7+. Billed by Anthropic's 28-px patch grid after the high-res
+ *  tier downscale; `visionTier` below is the only knob that varies by release. */
+export const CLAUDE_PROFILE: GptModelProfile = {
+  vision: { regime: 'patch28' },
+  // Anthropic list prices: cache read $0.10 / input $1.00; output $5.00 / input.
+  cacheReadRate: 0.1,
+  outputRate: 5,
   stripCols: ANTHROPIC_STRIP_COLS,
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   visionTier: 'high-res',
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: { ...BASE_STYLE },
-};
-
-export const CLAUDE_OPUS_PROFILE: GptModelProfile = {
-  vision: { regime: 'tile', base: 85, perTile: 170 },
-  stripCols: ANTHROPIC_STRIP_COLS,
-  maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
-  visionTier: 'high-res',
-  factSheetFormat: 'full',
-  history: BASE_HISTORY,
-  style: { ...BASE_STYLE },
+  // No maxSerializedRequestBytes: no Anthropic request-size limit has ever been
+  // sourced. The 768 KiB entry that used to sit here was a guess, and live
+  // traffic contradicted it outright (thousands of clean 200s well above it).
 };
 
 /** Pre-4.7 Claude: same render geometry, standard image-resolution tier. */
 export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
-  ...CLAUDE_FABLE_PROFILE,
+  ...CLAUDE_PROFILE,
   visionTier: 'standard',
   style: { ...BASE_STYLE },
 };
@@ -73,10 +70,8 @@ export function isPre47Claude(m: string): boolean {
   return major < 4 || (major === 4 && minor < 7);
 }
 
-/** Pick the Claude profile for an id. Version beats family: the standard
- *  resolution tier cuts across opus/sonnet/haiku. */
+/** Pick the Claude profile for an id. Only the resolution tier varies: render
+ *  geometry is identical across opus/sonnet/haiku/fable. */
 export function resolveClaudeProfile(m: string): GptModelProfile {
-  if (isPre47Claude(m)) return CLAUDE_LEGACY_PROFILE;
-  if (m.includes('opus')) return CLAUDE_OPUS_PROFILE;
-  return CLAUDE_FABLE_PROFILE;
+  return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
 }

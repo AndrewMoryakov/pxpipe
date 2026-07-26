@@ -6,17 +6,30 @@ from the model id.
 
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
-| `claude-fable-5*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
-| `gpt-5.6-sol*` | opt-in | Spleen 5×8 | 152 | 1932 px | 98/100 production arithmetic; 83/98 gist |
-| `grok-*` | opt-in | Spleen 5×8 | 152 | 512 px | 82/100 arithmetic; 83/98 gist |
+| `claude-*` / `anthropic-*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
+| `gpt-5.6-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | 7/8 exact, 0 inventions, gist and guard pass |
+| `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | 100/100 arith, 97/98 gist, 17/18 state; hex 0/15 |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
 
 Every production path adds IDS rows to the image and an adjacent text factsheet
 for precision-critical strings. Recent and open protocol state remains native.
 Those guards reduce exact-string risk; they do not make image reading byte-safe.
 
+## Savings vs. cost
+
+Native 14px is a legibility/quality profile, **not a cost win** on warm-cache
+traffic. Images do cache — a turn whose image prefix is already cached saves a
+little (dashboard: ~1,700 tokens on a measured Claude turn) — but images are
+large, so each time the prefix changes and the provider re-writes it, one
+`cache_create` costs several times the text it replaced. One measured turn sent
+43,444 tokens versus 8,964 as text (−34,480), erasing ~20 warm turns of savings,
+i.e. net-negative. That is why the 14px profiles ship opt-in for
+legibility/quality; read cost off the dashboard's cache-aware number, and let the
+profitability gate skip transforms whose amortized create cost it predicts will
+lose.
+
 Sol and Grok remain opt-in because their broader image-reading results do not
-match Fable. Enable them explicitly with `PXPIPE_MODELS`, for example:
+match Claude. Enable them explicitly with `PXPIPE_MODELS`, for example:
 
 ```bash
 PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
@@ -24,7 +37,7 @@ PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
 
 `gpt-5.6-terra` and other siblings do not inherit the Sol profile or allowlist.
 
-Evidence: [Sol results](../eval/sol-profile/QUALITY_RESULTS.md),
+Evidence: [Sol results](../eval/sol-profile/RESULTS.md),
 [Grok results](../eval/grok-density/QUALITY_RESULTS.md).
 
 ## Overrides
