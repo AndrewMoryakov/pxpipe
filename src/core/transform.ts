@@ -148,12 +148,40 @@ const DEFAULTS: Required<TransformOptions> = {
 };
 
 /**
- * Subscription OAuth requests are classified as Claude Code traffic only when
- * this exact identity remains the first, separate top-level system block.
- * Never render it into an image or concatenate other text into its block.
+ * Subscription OAuth requests are classified as first-party traffic only when
+ * one of these exact identities remains the first, separate top-level system
+ * block. Never render one into an image or concatenate other text into its
+ * block: the endpoint answers an unclassified request with an opaque
+ * `429 rate_limit_error: "Error"` even when the account has quota left (#149).
+ *
+ * Which identity ships depends on the entrypoint, not the product. Claude Code
+ * 2.1.220 picks one of three:
+ *
+ *   if (vertex) return CLI;
+ *   if (nonInteractive) return appendSystemPrompt ? CLI_WITHIN_SDK : AGENT_SDK;
+ *   return CLI;
+ *
+ * so the terminal sends the CLI line, `claude -p` / the VS Code extension /
+ * Claude Desktop's `stream-json` mode send the Agent SDK line, and adding
+ * `--append-system-prompt` to any of those switches to the CLI-within-SDK line.
  */
 export const CLAUDE_CODE_OAUTH_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude.";
+
+export const CLAUDE_CODE_WITHIN_SDK_OAUTH_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+
+export const CLAUDE_AGENT_SDK_OAUTH_IDENTITY =
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+/** Longest first: CLAUDE_CODE_OAUTH_IDENTITY is a prefix of the within-SDK line,
+ *  so a shorter-first `startsWith` scan would match it and emit a truncated
+ *  identity, leaving `, running within the Claude Agent SDK.` to be imaged. */
+const OAUTH_IDENTITIES = [
+  CLAUDE_CODE_OAUTH_IDENTITY,
+  CLAUDE_CODE_WITHIN_SDK_OAUTH_IDENTITY,
+  CLAUDE_AGENT_SDK_OAUTH_IDENTITY,
+].sort((a, b) => b.length - a.length);
 
 // --- per-block break-even check ---
 //
@@ -687,6 +715,24 @@ function extractSystemText(sys: SystemField | undefined): { text: string; kept: 
     }
   }
   return { text: textParts.join('\n\n'), kept };
+}
+
+/**
+ * Remove a standalone OAuth identity block from passed-through system blocks.
+ * The caller re-emits it first; see the identity note above OAUTH_IDENTITIES.
+ */
+function liftIdentityBlock(kept: SystemField): { identity?: string; kept: SystemField } {
+  if (!Array.isArray(kept)) return { kept };
+  let identity: string | undefined;
+  const rest = kept.filter((block) => {
+    if (identity !== undefined) return true;
+    if (!block || typeof block !== 'object' || block.type !== 'text') return true;
+    const match = OAUTH_IDENTITIES.find((id) => block.text.trim() === id);
+    if (match === undefined) return true;
+    identity = match;
+    return false;
+  });
+  return { identity, kept: rest };
 }
 
 function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['cache_control'] | undefined {
@@ -1592,7 +1638,14 @@ export async function transformRequest(
   //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
   //    - staticText: everything else (cacheable, goes into the image).
   const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
-  const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
+  const { text: rawSysText, kept: rawSysRemainder } = extractSystemText(req.system);
+  // The identity block does not always carry cache_control — the CLI entrypoint
+  // marks only the big instruction block — so extractSystemText holds it in
+  // `kept`, which is re-emitted AFTER the env text. That is too late: the
+  // endpoint classifies on the leading block and answers an opaque
+  // `429 rate_limit_error: "Error"` when it does not lead (#149). Lift it out
+  // here so the assembly below can put it back in front.
+  const { identity: keptIdentity, kept: sysRemainder } = liftIdentityBlock(rawSysRemainder);
   const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
   // `# Environment` (working dir, git status, model ID) churns per turn but has
   // no XML wrapper, so the static/dynamic split would bake it into the slab PNG
@@ -1604,10 +1657,11 @@ export async function transformRequest(
   const splitSystem = splitStaticDynamic(sysBodyNoEnv);
   let staticText = splitSystem.staticText;
   const { dynamicText, blockCount: dynBlocks, unknownTags, staticTagContents } = splitSystem;
-  const preserveClaudeCodeIdentity = staticText.startsWith(CLAUDE_CODE_OAUTH_IDENTITY);
-  if (preserveClaudeCodeIdentity) {
-    staticText = staticText.slice(CLAUDE_CODE_OAUTH_IDENTITY.length).replace(/^\s+/, '');
+  const inlineIdentity = OAUTH_IDENTITIES.find((id) => staticText.startsWith(id));
+  if (inlineIdentity) {
+    staticText = staticText.slice(inlineIdentity.length).replace(/^\s+/, '');
   }
+  const preservedIdentity = keptIdentity ?? inlineIdentity;
   info.staticChars = staticText.length;
   info.dynamicBlockCount = dynBlocks;
   if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
@@ -1865,8 +1919,8 @@ export async function transformRequest(
   // Images go into first user message — system field rejects images (400 system.N.type).
   {
     const sysTail: SystemField = [];
-    if (preserveClaudeCodeIdentity) {
-      sysTail.push({ type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY });
+    if (preservedIdentity) {
+      sysTail.push({ type: 'text', text: preservedIdentity });
     }
     // Session-stable, so it sits ahead of the churny blocks below.
 
