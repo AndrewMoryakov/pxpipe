@@ -17,8 +17,15 @@
  * differs is only WHERE it was found, which is enough to classify it:
  *
  *   - inside the leading `<system-reminder>` run of message 0  → 'file'
+ *   - anywhere in the system prompt                            → 'file'
  *   - in a user's typed text                                   → 'session'
  *   - in any later `<system-reminder>` (inlined `@`-mention)   → 'session'
+ *
+ * Two file locations because harnesses disagree on where a rules file goes.
+ * Claude Code inlines CLAUDE.md into message 0 behind a `<system-reminder>`
+ * envelope; OpenCode puts AGENTS.md in the system prompt with no wrapper and no
+ * label. Scanning only the first shape is what made #155 a no-op under OpenCode.
+ * Both are a file the user can edit, so both earn the durable tier.
  *
  * State is re-derived from the transcript on every request — no store, no session
  * id (the Messages API has none), and rewinding the conversation rewinds the pins.
@@ -27,7 +34,7 @@
  * re-sending them verbatim every turn.
  */
 
-import type { ContentBlock, Message, TextBlock } from './types.js';
+import type { ContentBlock, ImageBlock, Message, SystemField, TextBlock } from './types.js';
 
 /** One pin line. Longer than this is a document, not an instruction. */
 const PIN_MAX_CHARS = 300;
@@ -99,9 +106,12 @@ export const PIN_REPLY_MARK = '@pxpipe ';
 /**
  * Which tier a pin lives in. `'file'`, not `'claude.md'`: the same tier holds
  * whatever the harness inlined, which is CLAUDE.md under Claude Code and
- * AGENTS.md under Codex. The tier is named for the origin because the origin is
- * what answers the two questions a user has: why `unpin` refuses, and what to
- * edit instead.
+ * AGENTS.md under OpenCode. (Codex inlines AGENTS.md too, but it speaks the
+ * Responses API, and foldPins has exactly one call site: the Messages path in
+ * transform.ts. Pins are still a no-op there.)
+ *
+ * The tier is named for the origin because the origin is what answers the two
+ * questions a user has: why `unpin` refuses, and what to edit instead.
  */
 export type PinSource = 'file' | 'session';
 
@@ -137,47 +147,57 @@ export interface Pin {
  * rest of the session with nothing on screen to explain why; to drop a durable
  * pin you delete its line from the file, where the change is visible.
  */
-export function foldPins(messages: Message[]): Pin[] {
+export function foldPins(messages: Message[], system?: SystemField): Pin[] {
   const pins: Pin[] = [];
+  // System first: it is serialized ahead of the messages, so folding in wire
+  // order is what makes the emitted block read in the order the user wrote it.
+  for (const entry of systemPinLines(system)) applyPinLine(pins, entry);
   messages.forEach((m, idx) => {
     if (m.role !== 'user') return;
-    for (const { line, source, path } of pinLines(m, idx)) {
-      const cmd = matchPinCmd(line);
-      if (!cmd) continue;
-      if (cmd.verb === 'unpin') {
-        applyUnpin(pins, cmd.rest);
-        continue;
-      }
-      const raw = cmd.rest;
-      // Mark the cut. The source line is stripped from the outbound copy, so a
-      // severed rule reads to the model as a whole one — "do X unless Y" becomes
-      // "do X" — while the user's own transcript still shows the full text.
-      const text = raw.length > PIN_MAX_CHARS
-        ? `${raw.slice(0, PIN_MAX_CHARS)}… [pxpipe: pin truncated]`
-        : raw;
-      if (source === 'file') {
-        // A file is a document, not a list of instructions. Its blank lines and
-        // its repeated lines ARE the format: a fence closes with the same ```
-        // that opened it, a table rule repeats, and an example that shows
-        // `Before: <code sample>` shows the same `<code sample>` again under
-        // `After:`. Deduping or dropping those leaves the user's own rules
-        // rendered as something they did not write — an empty `After:`, a fence
-        // that never closes. Only message 0's leading reminder reaches here
-        // (see pinLines), so the document is ingested exactly once and cannot
-        // accumulate across turns without the dedup guard.
-        const prev = pins[pins.length - 1];
-        // Blank runs collapse to one, and a leading blank is dropped: they cost
-        // budget that later lines need, and neither changes how the text reads.
-        if (!text && (!prev || !prev.text)) continue;
-        pins.push({ text, source, path });
-        continue;
-      }
-      if (!text) continue;
-      if (pins.some((p) => p.text === text)) continue;
-      pins.push({ text, source });
-    }
+    for (const entry of pinLines(m, idx)) applyPinLine(pins, entry);
   });
   return pins;
+}
+
+/** Fold one candidate line into the accumulated pin list. */
+function applyPinLine(
+  pins: Pin[],
+  { line, source, path }: { line: string; source: PinSource; path?: string },
+): void {
+  const cmd = matchPinCmd(line);
+  if (!cmd) return;
+  if (cmd.verb === 'unpin') {
+    applyUnpin(pins, cmd.rest);
+    return;
+  }
+  const raw = cmd.rest;
+  // Mark the cut. The source line is stripped from the outbound copy, so a
+  // severed rule reads to the model as a whole one — "do X unless Y" becomes
+  // "do X" — while the user's own transcript still shows the full text.
+  const text = raw.length > PIN_MAX_CHARS
+    ? `${raw.slice(0, PIN_MAX_CHARS)}… [pxpipe: pin truncated]`
+    : raw;
+  if (source === 'file') {
+    // A file is a document, not a list of instructions. Its blank lines and
+    // its repeated lines ARE the format: a fence closes with the same ```
+    // that opened it, a table rule repeats, and an example that shows
+    // `Before: <code sample>` shows the same `<code sample>` again under
+    // `After:`. Deduping or dropping those leaves the user's own rules
+    // rendered as something they did not write — an empty `After:`, a fence
+    // that never closes. Only message 0's leading reminder and the system
+    // prompt reach here (see pinLines / systemPinLines), and both are sent
+    // once per request, so the document cannot accumulate across turns
+    // without the dedup guard.
+    const prev = pins[pins.length - 1];
+    // Blank runs collapse to one, and a leading blank is dropped: they cost
+    // budget that later lines need, and neither changes how the text reads.
+    if (!text && (!prev || !prev.text)) return;
+    pins.push({ text, source, path });
+    return;
+  }
+  if (!text) return;
+  if (pins.some((p) => p.text === text)) return;
+  pins.push({ text, source });
 }
 
 /**
@@ -265,6 +285,37 @@ function* pinLines(
     }
     leadingRun = false;
     for (const line of text.split('\n')) yield { line, source: 'session' };
+  }
+}
+
+/**
+ * Pin lines in the system prompt, where OpenCode puts AGENTS.md.
+ *
+ * No `<system-reminder>` gate here, unlike pinLines. That gate exists because a
+ * user message is mostly the user talking and the envelope is what marks the part
+ * that came from a file. The system prompt has no such ambiguity: the user does
+ * not type into it, so every line in it was placed by the harness, and a pin
+ * command found there came from a file the user edited. Requiring a wrapper that
+ * only Claude Code emits is precisely what made this path dead under OpenCode.
+ *
+ * Everything is the `file` tier for the same reason: it comes back next request
+ * whatever `unpin` does, so offering to remove it would be a lie.
+ */
+function* systemPinLines(
+  sys: SystemField | undefined,
+): Generator<{ line: string; source: PinSource; path?: string }> {
+  if (sys == null) return;
+  const blocks: Array<TextBlock | ImageBlock> = typeof sys === 'string'
+    ? [{ type: 'text', text: sys }]
+    : Array.isArray(sys) ? sys : [];
+  for (const blk of blocks) {
+    if (!blk || typeof blk !== 'object' || (blk as { type?: string }).type !== 'text') continue;
+    const text = (blk as TextBlock).text;
+    if (typeof text !== 'string') continue;
+    // Codex labels its AGENTS.md block, OpenCode does not. Ask anyway: a label
+    // costs one regex and buys the user the path to edit.
+    const path = filePathOf(text);
+    for (const line of text.split('\n')) yield { line, source: 'file', path };
   }
 }
 
@@ -412,6 +463,57 @@ function stripFromMessage(m: Message): Message | null | undefined {
   if (!changed) return undefined;
   if (blocks.length === 0) return null;
   return { ...m, content: blocks };
+}
+
+/**
+ * Remove pin commands from the system prompt. Returns `undefined` when nothing
+ * changed, so the caller can leave the original object identity alone.
+ *
+ * Same move as stripFromMessage, including the `cache_control` handoff: system
+ * blocks carry the breakpoint that ends the cacheable prefix (extractSystemText
+ * keys on it), so a block emptied by stripping must pass its marker forward
+ * rather than take the boundary with it.
+ *
+ * Stripping here does rewrite bytes inside the cached prefix. That is the cost
+ * the message path already pays for CLAUDE.md: one cache create on the turn the
+ * strip first applies, then a stable prefix, because the rewrite is a pure
+ * function of the input and the client keeps re-sending the same source lines.
+ */
+export function stripPinCommandsFromSystem(
+  sys: SystemField | undefined,
+): SystemField | undefined {
+  if (sys == null) return undefined;
+  if (typeof sys === 'string') {
+    const text = stripLines(sys);
+    return text === sys ? undefined : text;
+  }
+  if (!Array.isArray(sys)) return undefined;
+  let changed = false;
+  const out: Array<TextBlock | ImageBlock> = [];
+  for (const blk of sys) {
+    if (blk && typeof blk === 'object' && (blk as { type?: string }).type === 'text') {
+      const tb = blk as TextBlock;
+      if (typeof tb.text === 'string') {
+        const text = stripLines(tb.text);
+        if (text !== tb.text) {
+          changed = true;
+          if (!text.trim()) {
+            const prev = out[out.length - 1] as TextBlock | undefined;
+            if (tb.cache_control !== undefined && prev && prev.type === 'text') {
+              out[out.length - 1] = { ...prev, cache_control: tb.cache_control };
+            } else if (tb.cache_control !== undefined) {
+              out.push(blk); // nothing in front to hold it: leave as sent
+            }
+            continue;
+          }
+          out.push({ ...tb, text });
+          continue;
+        }
+      }
+    }
+    out.push(blk);
+  }
+  return changed ? out : undefined;
 }
 
 function stripLines(text: string): string {

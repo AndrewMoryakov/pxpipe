@@ -36,7 +36,10 @@ import {
   renderCellWidth,
   type RenderStyle,
 } from './render.js';
-import { appendPinBlock, canAppendPinBlock, foldPins, stripPinCommands, type Pin } from './pin.js';
+import {
+  appendPinBlock, canAppendPinBlock, foldPins, stripPinCommands,
+  stripPinCommandsFromSystem, type Pin,
+} from './pin.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
@@ -1669,12 +1672,18 @@ export async function transformRequest(
   let pinsRewrote = false;
   if (Array.isArray(req.messages) && canAppendPinBlock(req.messages)) {
     try {
-      pins = foldPins(req.messages);
+      pins = foldPins(req.messages, req.system);
       const stripped = stripPinCommands(req.messages);
+      // System too: OpenCode inlines AGENTS.md there, so that is where the
+      // commands are. Must run BEFORE step 1 reads the system text, or the
+      // stripped lines get baked into the rendered slab.
+      const strippedSystem = stripPinCommandsFromSystem(req.system);
       pinsRewrote = pins.length > 0
+        || strippedSystem !== undefined
         || stripped.length !== req.messages.length
         || stripped.some((m, i) => m !== req.messages![i]);
       req.messages = stripped;
+      if (strippedSystem !== undefined) req.system = strippedSystem;
     } catch (e) {
       // A malformed message must not fail the request: pins are an optimization,
       // the untouched body is still valid.
