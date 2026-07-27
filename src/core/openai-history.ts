@@ -784,8 +784,12 @@ async function planResponsesMixedCollapse(
     messageIndices.push(i);
     if (msg.role === 'user') latestUserIndex = i;
   }
+  // slice(-0) returns the WHOLE array, so guard keepTail===0 explicitly —
+  // otherwise "protect 0 tail messages" protects every message and blocks
+  // all collapse. latestUserIndex is added separately below.
+  const tail = Math.max(0, Math.floor(o.keepTail));
   const protectedMessages = new Set(
-    messageIndices.slice(-Math.max(0, Math.floor(o.keepTail))),
+    tail > 0 ? messageIndices.slice(-tail) : [],
   );
   if (latestUserIndex >= 0) protectedMessages.add(latestUserIndex);
 

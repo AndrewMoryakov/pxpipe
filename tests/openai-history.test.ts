@@ -558,6 +558,25 @@ describe('planResponsesPairCollapse — native state classification', () => {
     expect(plan.baselineTokens).toBeLessThan(o200k(plan.text));
   });
 
+  it('mixed mode with keepTail 0 collapses old messages (no slice(-0) whole-array protect)', async () => {
+    // Regression: keepTail:0 must protect NO tail messages. slice(-0) returns
+    // the whole array, which would protect every message and block all collapse.
+    const items: Array<Record<string, unknown>> = [
+      { role: 'user', content: `old request ${'alpha '.repeat(500)}` },   // 0
+      { role: 'assistant', content: `old answer ${'beta '.repeat(500)}` }, // 1
+      { role: 'user', content: 'current live request' },                   // 2 (latest user)
+    ];
+    const plan = await planResponsesPairCollapse(items, yes, {
+      responsesMode: 'mixed', keepTail: 0, keepRecentPairs: 0,
+      minCollapseTokens: 1, maxImages: 100,
+    });
+    const selected = new Set(plan.selectedIndices);
+    // Only the latest user turn stays native; the old turns collapse.
+    expect(selected.has(0)).toBe(true);
+    expect(selected.has(1)).toBe(true);
+    expect(selected.has(2)).toBe(false);
+  });
+
   it('with a one-item Sol tail, protects the latest user and newest closed pair only', async () => {
     const items: Array<Record<string, unknown>> = [
       { role: 'user', content: `old request ${'alpha '.repeat(500)}` },
