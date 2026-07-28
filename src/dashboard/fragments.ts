@@ -188,7 +188,7 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
       `<div class="hero hero-empty">` +
       `<div class="hero-eyebrow">Since start</div>` +
       `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your running savings show up right here.</div>` +
+      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch it with <code>pxpipe warp -- claude</code> to keep <code>/remote-control</code> and claude.ai connectors working. Send a message and your running savings show up right here.</div>` +
       `</div>`
     );
   }
@@ -1224,6 +1224,21 @@ export function renderPage(port: number): string {
     <div id="frag-toggle" hx-get="/fragments/toggle" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
   </div>
 </header>
+
+<details class="models-collapse">
+  <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
+  <p>Warp starts the agent with the proxy already wired, no env or config edits:</p>
+  <pre>pxpipe warp -- claude
+pxpipe warp -- codex
+pxpipe warp -- cursor-agent</pre>
+  <p>Aliases work too (<code>pxpipe warp -- pp</code>), and <code>--route pattern=http://host:port</code> adds routes beyond <code>api.anthropic.com</code>. Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
+  <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
+  <pre>@pxpipe pin be concise, no walls of text
+@pxpipe unpin 2
+@pxpipe unpin all</pre>
+  <p><code>@pxpipe pin</code> with no text lists what is pinned.</p>
+  <p>A <code>@pxpipe pin …</code> line in your global or project <code>CLAUDE.md</code> (<code>AGENTS.md</code> under Codex / OpenCode) is relocated the same way, on every session, with no typing. Those are file-backed, so <code>unpin</code> and <code>unpin all</code> never touch them — edit the file to remove one.</p>
+</details>
 
 <details class="models-collapse">
   <summary class="models-summary">Image model scope <span class="hint">Fable 5 and Gemini 3.6 Flash by default · expand to experiment with other families</span></summary>
