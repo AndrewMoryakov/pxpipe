@@ -717,7 +717,7 @@ function liveVerb(m: Message | undefined): PinVerb {
 export function pinCommandResponse(
   bodyIn: Uint8Array,
 ): { body: string; contentType: string } | undefined {
-  let req: { messages?: Message[]; model?: string; stream?: boolean };
+  let req: { messages?: Message[]; system?: SystemField; model?: string; stream?: boolean };
   try {
     req = JSON.parse(new TextDecoder().decode(bodyIn));
   } catch {
@@ -725,7 +725,10 @@ export function pinCommandResponse(
   }
   if (!Array.isArray(req.messages) || !isPinOnlyRequest(req.messages)) return undefined;
   return synthesizeReply(
-    pinReplyText(foldPins(req.messages), liveVerb(liveTurn(req.messages))),
+    // `system` is where OpenCode puts AGENTS.md, so a listing that skips it
+    // answers "nothing pinned" to a user staring at four pinned lines. The
+    // OpenAI twin below has always passed its own system field.
+    pinReplyText(foldPins(req.messages, req.system), liveVerb(liveTurn(req.messages))),
     typeof req.model === 'string' ? req.model : 'pxpipe',
     req.stream === true,
   );
