@@ -169,11 +169,31 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     env.REQUESTS_CA_BUNDLE = ca.certPath; // Python requests / httpx
 
     const child = spawnResolved(command, env);
+    // The child's proxy and CA point at this process. If warp dies for any
+    // reason the child is reparented to init and keeps running against a closed
+    // port, so every request fails and the agent looks hung instead of exiting.
+    // Take it with us on every exit path, including a crash.
+    let childLive = true;
+    child.on('exit', () => {
+      childLive = false;
+    });
+    process.on('exit', () => {
+      if (childLive) child.kill('SIGTERM');
+    });
+    const die = (err: unknown): never => {
+      console.error(`[pxpipe] warp: ${err instanceof Error ? err.stack : String(err)}`);
+      process.exit(1);
+    };
+    process.on('uncaughtException', die);
+    process.on('unhandledRejection', die);
     child.on('error', (err) => {
       console.error(`[pxpipe] warp: cannot run ${command[0]}: ${err.message}`);
       process.exit(127);
     });
-    const forwarded = ['SIGINT', 'SIGTERM'] as const;
+    // SIGHUP and SIGQUIT matter as much as the interactive two: closing the
+    // terminal sends SIGHUP, and without forwarding it the agent survives with
+    // its proxy pointed at a port that is about to close.
+    const forwarded = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
     child.on('exit', (code, signal) => {
       // Reproduce the child's own exit status so warp is transparent to callers.
       // Re-raising means routing the signal back through our own handlers, so
