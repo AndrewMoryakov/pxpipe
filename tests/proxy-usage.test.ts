@@ -1420,6 +1420,31 @@ describe('proxy usage extraction', () => {
     expect(upstreamAuth).toBe('Bearer chatgpt-oauth-token');
   });
 
+  it('uses the configured OpenAI key on Codex paths when inbound auth is absent', async () => {
+    let upstreamAuth: string | null = null;
+    const restore = mockUpstream((req) => {
+      upstreamAuth = req.headers.get('authorization');
+      return new Response(JSON.stringify({ id: 'resp_codex_key', output: [] }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.test',
+      openAIApiKey: 'sk-openai-server-key',
+      transform: { compress: false },
+    });
+
+    const res = await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+    }));
+    await res.text();
+    restore();
+
+    expect(upstreamAuth).toBe('Bearer sk-openai-server-key');
+  });
+
   it('does not forward Anthropic OAuth to the Codex OpenAI upstream', async () => {
     let upstreamAuth: string | null = null;
     const restore = mockUpstream((req) => {
@@ -1436,6 +1461,48 @@ describe('proxy usage extraction', () => {
     }))).text();
     restore();
     expect(upstreamAuth).toBe('Bearer sk-server');
+  });
+
+  it('rejects an oversized chunked transform request before calling upstream', async () => {
+    let upstreamCalls = 0;
+    const restore = mockUpstream(() => {
+      upstreamCalls++;
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://openai.test',
+      onRequest: (event) => { captured = event; },
+    });
+    const eightMiB = new Uint8Array(8 * 1024 * 1024);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // Reuse the allocation: the stream contains 16 MiB + 1 byte but does not
+        // need a second 8 MiB test fixture in memory.
+        controller.enqueue(eightMiB);
+        controller.enqueue(eightMiB);
+        controller.enqueue(new Uint8Array(1));
+        controller.close();
+      },
+    });
+    const request = new Request('http://localhost/v1/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    expect(request.headers.has('content-length')).toBe(false);
+
+    const res = await proxy(request);
+    const payload = await res.json() as { error?: { type?: string; message?: string } };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(res.status).toBe(413);
+    expect(payload.error?.type).toBe('request_too_large');
+    expect(payload.error?.message).toContain('16777216 bytes');
+    expect(upstreamCalls).toBe(0);
+    expect(captured?.status).toBe(413);
   });
 
   it('keeps bypassed Codex Responses on OpenAI accounting and scans headerless SSE', async () => {

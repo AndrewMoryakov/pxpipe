@@ -2,14 +2,14 @@
  * Shared data layer for the dashboard's session views. Node-only (filesystem
  * I/O) — never imported from `src/core/`.
  *
- * ## Why we group by first_user_sha8 (Path B)
+ * ## How synthetic session cohorts are formed
  *
  * Every TrackEvent carries `first_user_sha8` (see src/core/tracker.ts), an
- * sha256 prefix of the conversation's first user message. Within a single
- * Claude Code session that hash is stable across every turn; across two
- * different sessions it is virtually never the same. That makes it a
- * better-than-good-enough session key without coupling pxpipe to Claude
- * Code's internal file layout for *correctness*.
+ * sha256 prefix of the conversation's first user message. It is stable across
+ * turns, but it is not a real conversation ID: separate projects can begin
+ * with the same template. Collisions across known working directories are
+ * qualified with a project hash; identical prompts in the same project remain
+ * inherently ambiguous until a client supplies a genuine session identifier.
  *
  * We *do* read `~/.claude/projects/` opportunistically (see `claudeCodeMap`)
  * to enrich the dashboard with real Claude Code session IDs + project
@@ -34,11 +34,16 @@ import {
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
 } from './core/baseline.js';
+import {
+  computeOpenAIActualInputEff,
+  computeOpenAIBaselineInputEff,
+} from './core/openai-savings.js';
 
 // ---- Types -----------------------------------------------------------------
 
 export interface SessionSummary {
-  /** The synthetic session ID = first_user_sha8 (or '<unknown>' if missing). */
+  /** Synthetic first-user fingerprint, project-qualified on a known collision
+   * (or '<unknown>' if missing). It is not a provider conversation ID. */
   id: string;
   /** Working directory of the first event in the session, if any. */
   project: string | undefined;
@@ -52,11 +57,11 @@ export interface SessionSummary {
    *  useful only as a rough "we shaved X kB off the wire" callout. Not
    *  load-bearing math; the real number is `tokensSavedEst`. */
   charsSaved: number;
-  /** Real input-side tokens saved: sum of `baseline_tokens − (input +
-   *  cache_create×1.25 + cache_read×0.10)` across events that carry both
-   *  a /v1/messages/count_tokens probe and an upstream usage block.
-   *  Events missing either side contribute to requestCount but not here.
-   *  No estimation — can go negative when a compression net-lost. */
+  /** Provider-specific input-side tokens saved. Anthropic uses the measured
+   *  cache-aware count_tokens counterfactual; OpenAI uses its persisted
+   *  tokenizer/vision delta and automatic-cache rate; Google uses its provider
+   *  countTokens result (or the same persisted local fallback as live stats).
+   *  Events without a usable provider baseline contribute only to requestCount. */
   tokensSavedEst: number;
   /** Sum of cache_read_input_tokens — actual prompt-cache hits. */
   cacheReadTokens: number;
@@ -119,14 +124,35 @@ export async function* readEvents(
 
 export const UNKNOWN_SESSION = '<unknown>';
 
-function sessionIdOf(ev: TrackEvent): string {
+function baseSessionIdOf(ev: TrackEvent): string {
   return ev.first_user_sha8 ?? UNKNOWN_SESSION;
+}
+
+/** A first-message fingerprint is not a conversation id: two projects can
+ * legitimately start with the same prompt. Keep the historical bare id for
+ * the first project (back-compatible API), and qualify colliding projects. */
+function projectQualifiedSessionId(base: string, project: string): string {
+  const suffix = crypto.createHash('sha256').update(project, 'utf8').digest('hex').slice(0, 8);
+  return `${base}@${suffix}`;
+}
+
+function sessionIdOf(
+  ev: TrackEvent,
+  primaryProjectByBase: ReadonlyMap<string, string | undefined>,
+): string {
+  const base = baseSessionIdOf(ev);
+  const primaryProject = primaryProjectByBase.get(base);
+  if (!ev.cwd || !primaryProject || ev.cwd === primaryProject) return base;
+  return projectQualifiedSessionId(base, ev.cwd);
 }
 
 export interface AggregateResult {
   sessions: Map<string, SessionSummary>;
   /** sessionId -> set of absolute sidecar paths referenced by its events. */
   sidecarsBySession: Map<string, Set<string>>;
+  /** Bare first-message id -> project assigned to its back-compatible primary
+   * session. Used by prune to resolve rows exactly as aggregation did. */
+  primaryProjectByBase: Map<string, string | undefined>;
 }
 
 /** Build a map of sessionId -> SessionSummary by scanning every event. Also
@@ -136,6 +162,7 @@ export async function aggregateSessions(
 ): Promise<AggregateResult> {
   const sessions = new Map<string, SessionSummary>();
   const sidecarsBySession = new Map<string, Set<string>>();
+  const primaryProjectByBase = new Map<string, string | undefined>();
   // Per-session prior prefix sizes for the cache-aware text counterfactual.
   // Warm/cold comes only from server-observed cache_read; this map only refines
   // reused/grown splitting after cr>0 has proved warmth. Kept out of
@@ -148,7 +175,10 @@ export async function aggregateSessions(
   const sidecarSizes = sidecarFileSizes(paths.sidecarDir);
 
   for await (const { ev, rawBytes } of readEvents(paths.eventsFile)) {
-    const id = sessionIdOf(ev);
+    const baseId = baseSessionIdOf(ev);
+    if (!primaryProjectByBase.has(baseId)) primaryProjectByBase.set(baseId, ev.cwd);
+    else if (!primaryProjectByBase.get(baseId) && ev.cwd) primaryProjectByBase.set(baseId, ev.cwd);
+    const id = sessionIdOf(ev, primaryProjectByBase);
     let s = sessions.get(id);
     if (!s) {
       s = {
@@ -178,13 +208,53 @@ export async function aggregateSessions(
     // the actual request: cr>0 means warm for both, cr===0 means cold for both.
     // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
+    const out = ev.output_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
     const cc5m = ev.cache_create_5m_tokens;
     const cc1h = ev.cache_create_1h_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
-    const haveUsage = inp > 0 || cc > 0 || cr > 0;
+    const provider = ev.accounting_provider
+      ?? (ev.path.includes('google-ai-studio') || ev.path.includes('generateContent')
+        ? 'google'
+        : ev.path.includes('responses') || ev.path.includes('chat/completions')
+          ? 'openai'
+          : 'anthropic');
+    const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
     const baseline = ev.baseline_tokens;
-    if (
+    if (provider === 'openai' && haveUsage && ev.compressed === true) {
+      const baselineImaged = ev.baseline_imaged_tokens ?? 0;
+      if (baselineImaged > 0) {
+        const actualEff = computeOpenAIActualInputEff(inp, ev.cached_tokens ?? 0, ev.model);
+        const baselineEff = computeOpenAIBaselineInputEff(
+          inp,
+          ev.cached_tokens ?? 0,
+          ev.image_tokens ?? 0,
+          baselineImaged,
+          ev.model,
+          ev.native_injected_tokens ?? 0,
+        );
+        const tokensSaved = baselineEff - actualEff;
+        s.tokensSavedEst += Math.round(tokensSaved);
+        s.charsSaved += Math.round(tokensSaved * 4);
+      }
+    } else if (provider === 'google' && haveUsage && ev.compressed === true) {
+      const measuredBaseline = ev.baseline_probe_status === 'ok' && (baseline ?? 0) > 0
+        ? baseline!
+        : 0;
+      const estimatedBaseline = (ev.image_tokens ?? 0) > 0 && (ev.baseline_imaged_tokens ?? 0) > 0
+        ? Math.max(
+            0,
+            inp - (ev.image_tokens ?? 0) - (ev.native_injected_tokens ?? 0)
+              + (ev.baseline_imaged_tokens ?? 0),
+          )
+        : 0;
+      const googleBaseline = measuredBaseline || estimatedBaseline;
+      if (googleBaseline > 0) {
+        const tokensSaved = googleBaseline - inp;
+        s.tokensSavedEst += Math.round(tokensSaved);
+        s.charsSaved += Math.round(tokensSaved * 4);
+      }
+    } else if (provider === 'anthropic' &&
       typeof baseline === 'number' &&
       baseline > 0 &&
       haveUsage &&
@@ -224,7 +294,7 @@ export async function aggregateSessions(
     }
     // Record this completed row's prefix size for future cr>0 split estimates.
     // Carry prior cacheable when this row had no probe.
-    if (haveUsage) {
+    if (provider === 'anthropic' && haveUsage) {
       const completionSec = Date.parse(ev.ts) / 1000;
       const cacheable = ev.baseline_cacheable_tokens ?? 0;
       const prefixSha = ev.system_sha8;
@@ -235,8 +305,9 @@ export async function aggregateSessions(
         prefixSha: prefixSha ?? prev?.prefixSha,
       });
     }
-    if (typeof ev.cache_read_tokens === 'number') {
-      s.cacheReadTokens += ev.cache_read_tokens;
+    const cacheRead = provider === 'anthropic' ? ev.cache_read_tokens : ev.cached_tokens;
+    if (typeof cacheRead === 'number') {
+      s.cacheReadTokens += cacheRead;
     }
     if (ev.req_body_sample_path) {
       let set = sidecarsBySession.get(id);
@@ -250,7 +321,7 @@ export async function aggregateSessions(
     }
   }
 
-  return { sessions, sidecarsBySession };
+  return { sessions, sidecarsBySession, primaryProjectByBase };
 }
 
 // ---- list / filter --------------------------------------------------------
@@ -336,6 +407,30 @@ export interface PruneReport {
   applied: boolean;
 }
 
+function hasActiveWriter(eventsFile: string): boolean {
+  const lock = eventsFile + '.writer.lock';
+  let raw: string;
+  try {
+    raw = fs.readFileSync(lock, 'utf8').trim();
+  } catch {
+    return false;
+  }
+  const pid = Number(raw);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') return true;
+    try {
+      fs.unlinkSync(lock);
+    } catch {
+      /* raced another stale-lock cleaner */
+    }
+    return false;
+  }
+}
+
 /** Decide which sessions to remove based on the prune options. Pure — no
  *  I/O — so it's easy to unit-test against a synthetic aggregation. */
 export function selectSessionsToRemove(
@@ -381,17 +476,19 @@ export function selectSessionsToRemove(
  * delete the matching 4xx-body sidecars. Atomic: writes to a sibling `.tmp`
  * file with fsync, then renames over the original.
  *
- * Concurrency note: if the live proxy appends during prune, those new lines
- * will be lost (the proxy holds an fd to the pre-rename inode and keeps
- * writing to it). For a single-user dev tool that's an acceptable tradeoff;
- * the dashboard's confirm dialog warns the user before the destructive op.
+ * Concurrency note: prune refuses while FileTracker's writer lock is live.
+ * Rewriting an inode that an append fd still owns would otherwise lose every
+ * line appended after the rename.
  */
 export async function prune(
   paths: SessionsPaths,
   opts: PruneOptions,
   now: Date = new Date(),
 ): Promise<PruneReport> {
-  const { sessions, sidecarsBySession } = await aggregateSessions(paths);
+  if (hasActiveWriter(paths.eventsFile)) {
+    throw new Error('cannot prune while the events log has an active writer');
+  }
+  const { sessions, sidecarsBySession, primaryProjectByBase } = await aggregateSessions(paths);
   const toRemove = selectSessionsToRemove(sessions, opts, now);
 
   let jsonlBytesFreed = 0;
@@ -440,7 +537,12 @@ export async function prune(
 
   // Atomic rewrite: stream the original through a filter into events.jsonl.tmp,
   // fsync, then rename. Any partial state on crash leaves the original intact.
-  await rewriteEventsFile(paths.eventsFile, toRemove);
+  // Re-check after the potentially long scan so a writer that started while
+  // the dry-run report was being built cannot race the rename.
+  if (hasActiveWriter(paths.eventsFile)) {
+    throw new Error('cannot prune while the events log has an active writer');
+  }
+  await rewriteEventsFile(paths.eventsFile, toRemove, primaryProjectByBase);
 
   for (const { path: p } of sidecarsToDelete) {
     try {
@@ -457,6 +559,7 @@ export async function prune(
 async function rewriteEventsFile(
   eventsFile: string,
   toRemove: Set<string>,
+  primaryProjectByBase: ReadonlyMap<string, string | undefined>,
 ): Promise<void> {
   if (!fs.existsSync(eventsFile)) return;
   const tmp = eventsFile + '.tmp';
@@ -475,7 +578,7 @@ async function rewriteEventsFile(
         fs.writeSync(outFd, line + '\n');
         continue;
       }
-      if (toRemove.has(sessionIdOf(ev))) continue;
+      if (toRemove.has(sessionIdOf(ev, primaryProjectByBase))) continue;
       fs.writeSync(outFd, line + '\n');
     }
     fs.fsyncSync(outFd);

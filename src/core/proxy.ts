@@ -230,6 +230,45 @@ function withClientDisconnect(
  *  past it stream through unbuffered. */
 const MODEL_SNIFF_MAX_BYTES = 1 << 20;
 
+/** Hard safety ceiling for request shapes pxpipe must buffer before transforming.
+ * This is deliberately separate from provider/model request limits: it bounds the
+ * proxy's own heap exposure, including when a chunked request has no Content-Length.
+ * The largest successful provider request seen in local telemetry is 11.2 MiB, so
+ * 16 MiB preserves measured traffic while preventing an unbounded allocation. */
+const TRANSFORM_BODY_MAX_BYTES = 16 * 1024 * 1024;
+
+async function readTransformBody(req: Request): Promise<Uint8Array | null> {
+  const reader = req.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let tooLarge = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (tooLarge) continue; // drain without retaining bytes
+      total += value.byteLength;
+      if (total > TRANSFORM_BODY_MAX_BYTES) {
+        tooLarge = true;
+        chunks.length = 0;
+        continue;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (tooLarge) return null;
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 /** Read the actual top-level `model` field. The body is already buffered for
  * transformation, so parsing it is both safer and simpler than a prefix regex
  * (which could mistake `metadata.model` for the routing model). */
@@ -1300,7 +1339,18 @@ let responseContentType: string | undefined;
     }
 
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
-      const bodyIn = new Uint8Array(await req.arrayBuffer());
+      const bodyIn = await readTransformBody(req);
+      if (bodyIn === null) {
+        const message = `pxpipe request body exceeds safety limit (${TRANSFORM_BODY_MAX_BYTES} bytes)`;
+        fire(413, undefined, message);
+        const error = isMessages
+          ? { type: 'error', error: { type: 'request_too_large', message } }
+          : { error: { type: 'request_too_large', message } };
+        return new Response(JSON.stringify(error), {
+          status: 413,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
@@ -1543,7 +1593,9 @@ const model = googleModel ?? readModelField(bodyIn);
       const isCodexPath = isChatGPTCodexPath(url.pathname);
       const inboundBearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(outHeaders.get('authorization') ?? '');
       if (isCodexPath && inboundBearerIsAnthropic) outHeaders.delete('authorization');
-      if (bridgeKey && (!isCodexPath || inboundBearerIsAnthropic)) {
+      if (bridgeKey && (
+        !isCodexPath || inboundBearerIsAnthropic || !outHeaders.has('authorization')
+      )) {
         outHeaders.set('authorization', `Bearer ${bridgeKey}`);
       }
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {

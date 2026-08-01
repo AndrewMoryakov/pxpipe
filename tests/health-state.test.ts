@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { buildHealthState } from '../src/health-state.js';
+import { buildHealthReport, buildHealthState } from '../src/health-state.js';
 import { HealthCounters } from '../src/health-counters.js';
 import { evaluateHealth } from '../src/core/health.js';
 import { setAllowedModelBases } from '../src/core/applicability.js';
@@ -28,5 +28,27 @@ describe('buildHealthState', () => {
     const s = buildHealthState({}, { getCompressionEnabled: () => false }, new HealthCounters(), 1000);
     expect(s.modelScope).toEqual(['gpt-5.6-terra']);
     expect(s.compressionEnabled).toBe(false);
+  });
+});
+
+describe('buildHealthReport', () => {
+  it('fails closed when health-state assembly throws', () => {
+    const counters = new HealthCounters();
+    const report = buildHealthReport(
+      { provider: 'cloudflare-ai-gateway' },
+      { getCompressionEnabled: () => true },
+      counters,
+      1_000,
+    );
+
+    expect(report.ok).toBe(false);
+    expect(report.httpStatus).toBe(503);
+    expect(report.state).toBeNull();
+    expect(report.findings).toEqual([
+      expect.objectContaining({
+        id: 'health-diagnostics-failed',
+        severity: 'error',
+      }),
+    ]);
   });
 });

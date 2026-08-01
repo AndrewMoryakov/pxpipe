@@ -86,7 +86,14 @@ see [the measurement and calibration audit](docs/MEASUREMENT_AUDIT.md).
 dashboard plus `/healthz` available at the usual local port. The compose file
 explicitly trusts only its fixed Docker bridge gateway for those routes; do
 not copy that setting to a deployment whose published port is reachable from
-an untrusted network.
+an untrusted network. Compose also sets
+`PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS=1` because `HOST=0.0.0.0` is confined to
+the container while the host port is loopback-only. Outside this bundled
+topology, pxpipe refuses a non-loopback bind when it would inject a server-owned
+OpenAI/Cloudflare credential or gateway header: otherwise
+any reachable client could spend that credential through the unauthenticated
+proxy. Set the override only when a firewall, private network, or equivalent
+trusted access boundary enforces the same restriction.
 ## Offline export (no proxy)
 
 You can render text, files, or diffs to PNG pages without running the proxy or

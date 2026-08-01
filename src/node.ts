@@ -36,9 +36,9 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
-import { evaluateHealth, summarizeHealth } from './core/health.js';
+import { evaluateHealth } from './core/health.js';
 import { HealthCounters } from './health-counters.js';
-import { buildHealthState } from './health-state.js';
+import { buildHealthReport, buildHealthState } from './health-state.js';
 import { CodexUsageIndex } from './codex-usage.js';
 import {
   modelScopeFile,
@@ -73,6 +73,10 @@ interface RuntimeConfig {
   captureErrorReqBody: boolean;
   /** Exact trusted proxy address for loopback-published dashboard traffic. */
   trustedDashboardProxy?: string;
+  /** Explicit acknowledgement that an external boundary (for example the
+   * bundled Compose loopback port publication) protects a non-loopback bind
+   * that injects server-owned upstream credentials. */
+  allowNonLoopbackCredentials: boolean;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -169,6 +173,8 @@ function parseCli(argv: string[]): RuntimeConfig {
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
     trustedDashboardProxy: process.env.PXPIPE_TRUSTED_DASHBOARD_PROXY?.trim() || undefined,
+    allowNonLoopbackCredentials:
+      process.env.PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS === '1',
   };
 }
 
@@ -231,6 +237,10 @@ Environment:
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
+  PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS
+                          set to 1 only when an external access boundary protects
+                          a non-loopback HOST (the bundled loopback-only Compose
+                          publication sets this explicitly)
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -424,6 +434,32 @@ function isAllowedDashboardClient(
     && (isLoopbackAddress(address) || address === trustedDashboardProxy);
 }
 
+function injectedCredentialSources(opts: RuntimeConfig): string[] {
+  const sources: string[] = [];
+  if (opts.openAIApiKey?.trim()) sources.push('OPENAI_API_KEY');
+  if (opts.cloudflareApiKey?.trim()) sources.push('CLOUDFLARE_API_TOKEN');
+  // Gateway headers are operator-controlled and their names are arbitrary;
+  // treating only familiar auth names as sensitive would let a custom header
+  // such as `x-upstream-credential` (or a neutral-looking quota key) bypass
+  // the non-loopback guard.
+  if (Object.keys(opts.gatewayHeaders ?? {}).length > 0) {
+    sources.push('PXPIPE_GATEWAY_HEADERS');
+  }
+  return sources;
+}
+
+function assertCredentialInjectionIsLocal(opts: RuntimeConfig): void {
+  const loopbackBind = opts.host.toLowerCase() === 'localhost'
+    || isLoopbackAddress(opts.host);
+  const sources = injectedCredentialSources(opts);
+  if (loopbackBind || sources.length === 0 || opts.allowNonLoopbackCredentials) return;
+  throw new Error(
+    `refusing non-loopback HOST=${opts.host} with server-owned credentials from ` +
+      `${sources.join(', ')}; bind HOST to loopback, or set ` +
+      'PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS=1 only when a trusted external access boundary is in place',
+  );
+}
+
 function isDashboardMutation(route: DashboardRoute, method: string): boolean {
   return method === 'POST' && (
     route.kind === 'api-compression'
@@ -602,7 +638,46 @@ class FileTracker implements Tracker {
   private brokenLogged = false;
   private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
 
-  constructor(private readonly filePath: string) {}
+  constructor(private readonly filePath: string) {
+    // Publish writer activity before the dashboard can offer any operation
+    // that rewrites the log. This closes the pre-first-event race.
+    this.markWriterActive();
+  }
+
+  private get writerLockPath(): string {
+    return this.filePath + '.writer.lock';
+  }
+
+  private markWriterActive(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.writerLockPath), { recursive: true, mode: 0o700 });
+      try {
+        const owner = Number(fs.readFileSync(this.writerLockPath, 'utf8').trim());
+        if (Number.isSafeInteger(owner) && owner > 0 && owner !== process.pid) {
+          try {
+            process.kill(owner, 0);
+            return; // another live process already protects this shared log
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ESRCH') return;
+          }
+        }
+      } catch {
+        /* absent/unreadable lock: replace below */
+      }
+      fs.writeFileSync(this.writerLockPath, `${process.pid}\n`, { mode: 0o600 });
+    } catch {
+      // Tracking remains best-effort; prune also performs a second lock check.
+    }
+  }
+
+  private clearWriterActive(): void {
+    try {
+      const owner = fs.readFileSync(this.writerLockPath, 'utf8').trim();
+      if (owner === String(process.pid)) fs.unlinkSync(this.writerLockPath);
+    } catch {
+      /* already absent */
+    }
+  }
 
   private ensureOpen(): boolean {
     if (this.fd != null) return true;
@@ -695,6 +770,7 @@ class FileTracker implements Tracker {
       }
       this.fd = null;
     }
+    this.clearWriterActive();
   }
 }
 
@@ -1049,6 +1125,11 @@ async function main(): Promise<void> {
     createWarpRuntime({ port: opts.port }).launch(warpCommand);
     return;
   }
+  // A non-loopback unauthenticated proxy plus a server-owned upstream key lets
+  // any reachable client spend that credential. Docker binds 0.0.0.0 only
+  // inside its network namespace and explicitly acknowledges the host-side
+  // loopback publication in compose.yml; other deployments must fail closed.
+  assertCredentialInjectionIsLocal(opts);
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
@@ -1247,24 +1328,20 @@ async function main(): Promise<void> {
         // api.anthropic.com (which would 404 them).
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         // Health endpoints — host-level (compose config + counters + dashboard),
-        // handled before the dashboard router. Fail-open: any throw → 200 with
-        // an empty report rather than a 500.
+        // handled before the dashboard router. A failure in the diagnostics
+        // themselves is unhealthy: probes must not silently fail open.
         if (url.pathname === '/healthz' || url.pathname === '/api/health.json') {
           if (!isAllowedDashboardClient(req.socket.remoteAddress, url.hostname, opts.trustedDashboardProxy)) {
             await writeWebResponse(new Response('health endpoint is loopback-only', { status: 403 }), res);
             return;
           }
-          let ok = true;
-          let payload = '{"ok":true,"findings":[],"state":null}';
-          try {
-            const state = buildHealthState(config, dashboard, healthCounters, Date.now());
-            const findings = evaluateHealth(state);
-            ok = summarizeHealth(findings).ok;
-            payload = JSON.stringify({ ok, findings, state }, null, 2);
-          } catch {
-            /* fail-open: keep ok=true, empty report */
-          }
-          const status = url.pathname === '/healthz' ? (ok ? 200 : 503) : 200;
+          const report = buildHealthReport(config, dashboard, healthCounters, Date.now());
+          const payload = JSON.stringify({
+            ok: report.ok,
+            findings: report.findings,
+            state: report.state,
+          }, null, 2);
+          const status = url.pathname === '/healthz' ? report.httpStatus : 200;
           res.statusCode = status;
           res.setHeader('content-type', 'application/json');
           res.end(payload);

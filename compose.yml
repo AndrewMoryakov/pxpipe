@@ -15,6 +15,10 @@ services:
       # Docker bridge requests are not loopback inside the container. The port
       # remains published to host loopback only, so dashboard/health stay local.
       - PXPIPE_TRUSTED_DASHBOARD_PROXY=172.30.250.1
+      # HOST is 0.0.0.0 inside the container, but the only host publication is
+      # the loopback binding above. Acknowledge that external access boundary
+      # so server-owned upstream credentials may be injected safely.
+      - PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS=1
       - PXPIPE_MODELS
       - PXPIPE_DISABLE
       - PXPIPE_UPSTREAM

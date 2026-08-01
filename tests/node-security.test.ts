@@ -109,6 +109,42 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
 }
 
 describe('Node dashboard security', () => {
+  it('refuses server-owned credential injection on a non-loopback bind', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-node-security-'));
+    const port = await freePort();
+    const output: string[] = [];
+    child = spawn(process.execPath, [tsxCli, 'src/node.ts'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '0.0.0.0',
+        PXPIPE_LOG: path.join(dir, 'events.jsonl'),
+        PXPIPE_CONFIG: path.join(dir, 'config.json'),
+        OPENAI_API_KEY: 'server-owned-test-key',
+        PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout?.on('data', (b) => output.push(String(b)));
+    child.stderr?.on('data', (b) => output.push(String(b)));
+    const exitCode = await new Promise<number | null>((resolve) => child!.once('exit', resolve));
+
+    expect(exitCode).toBe(1);
+    expect(output.join('')).toContain('refusing non-loopback HOST=0.0.0.0');
+    expect(output.join('')).toContain('OPENAI_API_KEY');
+  });
+
+  it('allows the explicit loopback-published Docker credential boundary', async () => {
+    const { base } = await startNode({
+      HOST: '0.0.0.0',
+      OPENAI_API_KEY: 'server-owned-test-key',
+      PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS: '1',
+    });
+    const response = await fetch(`${base}/healthz`);
+    expect(response.status).toBe(200);
+  });
+
   it('rejects cross-origin mutations and accepts same-origin mutations', async () => {
     const { base, configFile } = await startNode();
     const denied = await fetch(`${base}/fragments/models`, {

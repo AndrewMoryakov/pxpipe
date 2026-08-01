@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import {
   aggregateSessions,
   filterSessions,
+  prune,
   type SessionsPaths,
 } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
@@ -74,6 +75,49 @@ describe('aggregateSessions', () => {
     expect(sessions.size).toBe(2);
     expect(sessions.get('aaaaaaaa')?.requestCount).toBe(2);
     expect(sessions.get('bbbbbbbb')?.requestCount).toBe(1);
+  });
+
+  it('does not merge the same first-user fingerprint across different projects', async () => {
+    writeEvents(tmp, [
+      ev({ first_user_sha8: 'samehash', cwd: '/project/a' }),
+      ev({ first_user_sha8: 'samehash', cwd: '/project/b' }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    expect(sessions.size).toBe(2);
+    expect(sessions.get('samehash')?.project).toBe('/project/a');
+    const second = [...sessions.values()].find((s) => s.project === '/project/b');
+    expect(second?.id).toMatch(/^samehash@[0-9a-f]{8}$/);
+    expect(second?.requestCount).toBe(1);
+  });
+
+  it('uses provider-specific GPT and Google savings math in disk session rollups', async () => {
+    writeEvents(tmp, [
+      ev({
+        path: '/v1/responses', accounting_provider: 'openai', model: 'gpt-5.6-sol',
+        first_user_sha8: 'gpt', compressed: true, input_tokens: 100,
+        output_tokens: 1, cached_tokens: 0, image_tokens: 20,
+        baseline_imaged_tokens: 200,
+      }),
+      ev({
+        path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+        accounting_provider: 'google', first_user_sha8: 'google', compressed: true,
+        input_tokens: 120, output_tokens: 10, baseline_tokens: 400,
+        baseline_probe_status: 'ok', cached_tokens: 30,
+      }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    expect(sessions.get('gpt')?.tokensSavedEst).toBe(180);
+    expect(sessions.get('google')?.tokensSavedEst).toBe(280);
+    expect(sessions.get('google')?.cacheReadTokens).toBe(30);
+  });
+
+  it('refuses prune while a live writer owns the events log', async () => {
+    writeEvents(tmp, [ev({ first_user_sha8: 'keepme' })]);
+    fs.writeFileSync(tmp.eventsFile + '.writer.lock', `${process.pid}\n`);
+    await expect(prune(tmp, { sessionId: 'keepme', force: true })).rejects.toThrow(
+      'active writer',
+    );
+    expect(fs.readFileSync(tmp.eventsFile, 'utf8')).toContain('keepme');
   });
 
   it('uses earliest ts for firstSeen and latest for lastSeen even when input is unordered', async () => {
