@@ -112,11 +112,11 @@ describe('aggregateSessions', () => {
     expect(sessions.get('google')?.cacheReadTokens).toBe(30);
   });
 
-  it('refuses prune while a live writer owns the events log', async () => {
+  it('recognizes a live legacy PID writer marker before pruning', async () => {
     writeEvents(tmp, [ev({ first_user_sha8: 'keepme' })]);
     fs.writeFileSync(tmp.eventsFile + '.writer.lock', `${process.pid}\n`);
     await expect(prune(tmp, { sessionId: 'keepme', force: true })).rejects.toThrow(
-      'owned',
+      `owned by writer pid ${process.pid}`,
     );
     expect(fs.readFileSync(tmp.eventsFile, 'utf8')).toContain('keepme');
   });

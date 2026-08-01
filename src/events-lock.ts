@@ -29,18 +29,25 @@ function processIsAlive(pid: number): boolean {
 }
 
 function readRecord(lockPath: string): LockRecord | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(lockPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    parsed = JSON.parse(raw);
   } catch {
-    // Backward compatibility with the old PID-only writer marker.
-    try {
-      const pid = Number(fs.readFileSync(lockPath, 'utf8').trim());
-      if (Number.isSafeInteger(pid) && pid > 0) {
-        return { pid, role: 'writer', token: `legacy:${pid}` };
-      }
-    } catch {
-      /* handled below */
+    return undefined;
+  }
+
+  // Backward compatibility with the old PID-only writer marker. A plain PID
+  // is valid JSON, so it must be handled after parsing rather than in catch.
+  if (typeof parsed === 'number') {
+    if (Number.isSafeInteger(parsed) && parsed > 0) {
+      return { pid: parsed, role: 'writer', token: `legacy:${parsed}` };
     }
     return undefined;
   }
