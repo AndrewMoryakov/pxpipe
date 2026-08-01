@@ -1420,6 +1420,33 @@ describe('proxy usage extraction', () => {
     expect(upstreamAuth).toBe('Bearer chatgpt-oauth-token');
   });
 
+  it('keeps bypassed Codex Responses on OpenAI accounting and scans headerless SSE', async () => {
+    const sse = `data: ${JSON.stringify({
+      type: 'response.completed', response: { usage: { input_tokens: 21, output_tokens: 3 } },
+    })}\n\n`;
+    const restore = mockUpstream(() => {
+      const response = new Response(sse, { status: 200 });
+      response.headers.delete('content-type');
+      return response;
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.test',
+      onRequest: (event) => { captured = event; },
+    });
+    const response = await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-pxpipe-bypass': '1' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: true }),
+    }));
+    await response.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(captured?.accountingProvider).toBe('openai');
+    expect(captured?.usage).toMatchObject({ input_tokens: 21, output_tokens: 3 });
+  });
+
   it('marks a Responses refusal instead of overwriting it with a successful stop', async () => {
     const sseBody =
       `data: ${JSON.stringify({ type: 'response.refusal.delta', delta: 'cannot comply' })}\n\n` +

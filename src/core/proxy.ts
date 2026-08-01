@@ -1195,7 +1195,7 @@ let responseContentType: string | undefined;
           // GPT image/baseline telemetry and renders As text / Saved as dashes.
           accountingProvider: isGoogleRoute
             ? 'google'
-            : isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages
+            : isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages
               ? 'openai'
               : 'anthropic',
           status,
@@ -1225,9 +1225,15 @@ let responseContentType: string | undefined;
     const bypassHeader = req.headers.get('x-pxpipe-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
     const providerPrefixed = isProviderPrefixedPath(url.pathname);
-    const isMessages = !bypass && req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChat = !bypass && req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponses = !bypass && req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    // Wire-shape detection stays independent from transform eligibility. A
+    // bypassed Codex request is still an OpenAI Responses request for routing,
+    // accounting, and response scanning; only its body transformation is off.
+    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
+    const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(url.pathname);
+    const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isMessages = !bypass && isMessagesWire;
+    const isOpenAIChat = !bypass && isOpenAIChatWire;
+    const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
     const googleModel = req.method === 'POST'
       ? parseGoogleModelFromPath(url.pathname)
       : null;
@@ -1656,8 +1662,8 @@ let teed: Response;
       ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
         teeForUsage(
           upstreamRes,
-          isOpenAIResponses && responsesStreaming,
-          isOpenAIResponses && !responsesStreaming,
+          isOpenAIResponsesWire && (responsesStreaming || isChatGPTCodexPath(url.pathname)),
+          isOpenAIResponsesWire && !responsesStreaming && !isChatGPTCodexPath(url.pathname),
         ));
     } catch (e) {
       releaseInFlight();
