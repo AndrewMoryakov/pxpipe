@@ -15,7 +15,11 @@ import {
   dashboardPath,
   officialInputUsdPerMtokForModel,
 } from '../src/dashboard.js';
-import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicability.js';
+import {
+  getAllowedModelBases,
+  isPxpipeSupportedGptModel,
+  setAllowedModelBases,
+} from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
@@ -307,6 +311,25 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toEqual([]);
       dash.handleModelsSet('');
       expect(getAllowedModelBases()).toEqual([]);
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
+  it('renders and disables a child enabled by a broad model scope', async () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      process.env.PXPIPE_MODELS = 'gpt-5.6';
+      setAllowedModelBases(null);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
+      const html = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(html).toContain('GPT 5.6 Sol ✓');
+
+      dash.handleModelsToggle('gpt-5.6-sol', false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
+      expect(getAllowedModelBases()).not.toContain('gpt-5.6');
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;

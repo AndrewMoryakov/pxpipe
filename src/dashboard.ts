@@ -74,6 +74,7 @@ import {
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
+  isModelScopeEnabled,
   isPxpipeSupportedModel,
   setAllowedModelBases,
 } from './core/applicability.js';
@@ -1854,7 +1855,15 @@ export class DashboardState {
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);
-    else next.delete(model);
+    else {
+      // A broad configured base (e.g. gpt-5.6) also enables every matching
+      // child. Removing only the child's exact id would leave it silently
+      // active while the chip says off; remove every scope entry that enables
+      // this model so the toggle truthfully disables it.
+      for (const base of next) {
+        if (isModelScopeEnabled(model, [base])) next.delete(base);
+      }
+    }
     this.applyModelBases([...next]);
   }
 

@@ -62,6 +62,19 @@ function allowedModelBases(): string[] {
   return envOrDefaultBases();
 }
 
+/** Whether a concrete model id is enabled by a scope list. Kept separate from
+ * the route eligibility helpers so the dashboard can display the same prefix
+ * semantics that the proxy applies (for example `gpt-5.6` → `gpt-5.6-sol`). */
+export function isModelScopeEnabled(model: string, bases: readonly string[] = allowedModelBases()): boolean {
+  const base = baseModelId(model).toLowerCase();
+  const unqualified = unqualifiedModelId(base);
+  return bases.some((candidate) => {
+    const target = candidate.toLowerCase();
+    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
+    return hit(base) || (unqualified !== null && hit(unqualified));
+  });
+}
+
 /** Current effective allowed-model scope (Claude + GPT). */
 export function getAllowedModelBases(): string[] {
   return allowedModelBases();
@@ -100,12 +113,7 @@ function isAllowed(model: string | null | undefined): boolean {
   // (e.g. an unmeasured Gemini sibling falling through to the OpenAI fallback).
   // Which ids those are is profile-table knowledge, not a rule maintained here.
   if (isMisresolvedModelId(base)) return false;
-  const unqualified = unqualifiedModelId(base);
-  return allowedModelBases().some((b) => {
-    const target = b.toLowerCase();
-    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
-    return hit(base) || (unqualified !== null && hit(unqualified));
-  });
+  return isModelScopeEnabled(base);
 }
 
 /** True when pxpipe may transform this Anthropic model. */

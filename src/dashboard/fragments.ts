@@ -3,6 +3,7 @@
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
+import { isModelScopeEnabled } from '../core/applicability.js';
 import { groupCodexQuotaWindows } from '../codex-usage.js';
 import type {
   StatsPayload,
@@ -248,7 +249,6 @@ export function renderModelsFragment(
   configured: string[],
   enabled: boolean,
 ): string {
-  const on = new Set(active);
   const labelOf = new Map(
     [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG, ...GEMINI_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
@@ -271,7 +271,7 @@ export function renderModelsFragment(
     }
   }
   const chipFor = (id: string): string => {
-    const lit = on.has(id);
+    const lit = isModelScopeEnabled(id, active);
     const label = labelOf.get(id) ?? id;
     const r = readinessOf(id);
     const tip =
