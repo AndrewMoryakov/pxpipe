@@ -135,6 +135,32 @@ describe('Node dashboard security', () => {
     expect(output.join('')).toContain('OPENAI_API_KEY');
   });
 
+  it('does not mistake a 127-prefixed DNS hostname for a loopback IP literal', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-node-security-'));
+    const port = await freePort();
+    const output: string[] = [];
+    child = spawn(process.execPath, [tsxCli, 'src/node.ts'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.example.com',
+        PXPIPE_LOG: path.join(dir, 'events.jsonl'),
+        PXPIPE_CONFIG: path.join(dir, 'config.json'),
+        OPENAI_API_KEY: 'server-owned-test-key',
+        PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout?.on('data', (b) => output.push(String(b)));
+    child.stderr?.on('data', (b) => output.push(String(b)));
+    const exitCode = await new Promise<number | null>((resolve) => child!.once('exit', resolve));
+
+    expect(exitCode).toBe(1);
+    expect(output.join('')).toContain('refusing non-loopback HOST=127.example.com');
+    expect(output.join('')).toContain('OPENAI_API_KEY');
+  });
+
   it('allows the explicit loopback-published Docker credential boundary', async () => {
     const { base } = await startNode({
       HOST: '0.0.0.0',

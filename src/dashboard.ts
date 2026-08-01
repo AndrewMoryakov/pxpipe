@@ -30,6 +30,7 @@
 
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
+import * as crypto from 'node:crypto';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
 import type { CodexUsageSnapshot } from './codex-usage.js';
@@ -587,12 +588,16 @@ function gptEff(args: {
 
 export class DashboardState {
   private recent: RecentRow[] = [];
-  /** Per-session dollar-weighted totals, keyed by `info.firstUserSha8`. The
+  /** Per-session dollar-weighted totals, keyed by a first-user/project cohort. The
    *  dashboard surfaces ONLY the most-recently-active session via the
    *  `serveCurrentSessionJson` endpoint — older sessions linger in the Map
    *  so a tab refresh during a brief lull still finds the previous session,
    *  but get evicted at `SESSION_CAP` to bound memory in long-running hosts. */
   private sessions: Map<string, SessionTotals> = new Map();
+  /** First known project for each first-user fingerprint. A fingerprint is not
+   * globally unique: a second project must not share live totals or cache warmth
+   * with the first one. Mirrors the disk-backed session aggregation policy. */
+  private readonly primaryProjectByFirstUser = new Map<string, string | undefined>();
   /** sha8 of the most-recently-active session id. null when no events have
    *  ever carried a `firstUserSha8` (e.g. a cold start with only passthrough
    *  hits that the upstream probe never tagged). */
@@ -724,6 +729,22 @@ export class DashboardState {
     return totals;
   }
 
+  /** Derive the same best-effort cohort key used by the disk sessions view. */
+  private sessionCohortId(info: ProxyEvent['info']): string | undefined {
+    const firstUser = info?.firstUserSha8;
+    if (!firstUser) return undefined;
+    const project = info.env?.cwd;
+    if (!this.primaryProjectByFirstUser.has(firstUser)) {
+      this.primaryProjectByFirstUser.set(firstUser, project);
+    } else if (!this.primaryProjectByFirstUser.get(firstUser) && project) {
+      this.primaryProjectByFirstUser.set(firstUser, project);
+    }
+    const primaryProject = this.primaryProjectByFirstUser.get(firstUser);
+    if (!project || !primaryProject || project === primaryProject) return firstUser;
+    const suffix = crypto.createHash('sha256').update(project, 'utf8').digest('hex').slice(0, 8);
+    return `${firstUser}@${suffix}`;
+  }
+
   private lifetimeTotals(): Totals {
     const combined = emptyTotals(this.startedAt);
     for (const totals of this.totalsByModel.values()) {
@@ -788,6 +809,7 @@ export class DashboardState {
 
     const u = ev.usage;
     const info = ev.info;
+    const liveSessionId = this.sessionCohortId(info);
     const compressed = info?.compressed === true;
     const totals = this.totalsForModel(ev.model);
 
@@ -945,7 +967,7 @@ export class DashboardState {
       // reused/grown split for the text baseline. Use request start for that
       // lookup; an overlapping request that had not completed could not provide a
       // prior prefix size for this in-flight request.
-      const sidNow = info?.firstUserSha8;
+      const sidNow = liveSessionId;
       const prefixShaNow = info?.systemSha8;
       const completionSec = Date.now() / 1000;
       const requestStartSec = completionSec - Math.max(0, ev.durationMs || 0) / 1000;
@@ -1132,12 +1154,13 @@ export class DashboardState {
     }
 
     // Per-session aggregation. Uses the SAME baseline/actual/output math as
-    // the global accumulators above, partitioned by `info.firstUserSha8`
+    // the global accumulators above, partitioned by the same first-user/project
+    // cohort used by disk session aggregation
     // so the dashboard's "current session" panel can show what's happening
     // RIGHT NOW instead of stale lifetime numbers. Untagged events (no
     // firstUserSha8 — cold start, passthrough probe failures) are skipped
     // rather than bucketed into a synthetic "unknown" session.
-    const sid = info?.firstUserSha8;
+    const sid = liveSessionId;
     if (typeof sid === 'string' && sid.length > 0) {
       this.currentSessionId = sid;
       let s = this.sessions.get(sid);
@@ -1342,7 +1365,10 @@ export class DashboardState {
         // Warm/cold is reconstructed from server-observed cr only. Persisted
         // completion ts + duration_ms are used only to find a prior prefix size
         // for the reused/grown split after cr>0 has proved warmth.
-        const sidR = (t as { first_user_sha8?: string }).first_user_sha8;
+        const sidR = this.sessionCohortId({
+          firstUserSha8: (t as { first_user_sha8?: string }).first_user_sha8,
+          env: { cwd: (t as { cwd?: string }).cwd },
+        } as ProxyEvent['info']);
         const prefixShaR = (t as { system_sha8?: string }).system_sha8;
         const completionSecR = Date.parse(t.ts) / 1000;
         const requestStartSecR = completionSecR - Math.max(0, t.duration_ms || 0) / 1000;

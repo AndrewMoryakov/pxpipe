@@ -247,6 +247,23 @@ describe('serveFragment', () => {
     expect(pinned).toMatchObject({ sessionId: 'session-a' });
   });
 
+  it('keeps live totals and cache cohorts separate for identical first prompts in different projects', async () => {
+    dash.update({
+      path: '/v1/messages', model: 'claude-opus-4-8', usage: { input_tokens: 10 },
+      info: { compressed: true, firstUserSha8: 'same-prompt', env: { cwd: '/project/a' } },
+    } as never);
+    dash.update({
+      path: '/v1/messages', model: 'claude-opus-4-8', usage: { input_tokens: 20 },
+      info: { compressed: true, firstUserSha8: 'same-prompt', env: { cwd: '/project/b' } },
+    } as never);
+
+    const latest = await dash.serveCurrentSessionJson().json();
+    const first = await dash.serveCurrentSessionJson('same-prompt').json();
+    expect(latest.sessionId).toMatch(/^same-prompt@[0-9a-f]{8}$/);
+    expect(latest.allActualInputWeighted).toBe(20);
+    expect(first).toMatchObject({ sessionId: 'same-prompt', allActualInputWeighted: 10 });
+  });
+
   it('transitions Sonnet 5 from its introductory price at the documented UTC boundary', () => {
     expect(officialInputUsdPerMtokForModel(
       'claude-sonnet-5', Date.parse('2026-08-31T23:59:59.999Z'),

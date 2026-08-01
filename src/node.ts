@@ -40,6 +40,7 @@ import { evaluateHealth } from './core/health.js';
 import { HealthCounters } from './health-counters.js';
 import { buildHealthReport, buildHealthState } from './health-state.js';
 import { CodexUsageIndex } from './codex-usage.js';
+import { acquireEventsFileLock, type EventsFileLock } from './events-lock.js';
 import {
   modelScopeFile,
   loadPersistedModelScope,
@@ -449,8 +450,10 @@ function injectedCredentialSources(opts: RuntimeConfig): string[] {
 }
 
 function assertCredentialInjectionIsLocal(opts: RuntimeConfig): void {
-  const loopbackBind = opts.host.toLowerCase() === 'localhost'
-    || isLoopbackAddress(opts.host);
+  // Bind hosts may be DNS names. Do not treat an arbitrary hostname beginning
+  // with "127." as loopback: only validated 127/8 IP literals, ::1, and the
+  // exact localhost name are local.
+  const loopbackBind = isLoopbackHostname(opts.host);
   const sources = injectedCredentialSources(opts);
   if (loopbackBind || sources.length === 0 || opts.allowNonLoopbackCredentials) return;
   throw new Error(
@@ -637,46 +640,12 @@ class FileTracker implements Tracker {
   private bytesWritten = 0;
   private brokenLogged = false;
   private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
+  private readonly writerLock: EventsFileLock;
 
   constructor(private readonly filePath: string) {
-    // Publish writer activity before the dashboard can offer any operation
-    // that rewrites the log. This closes the pre-first-event race.
-    this.markWriterActive();
-  }
-
-  private get writerLockPath(): string {
-    return this.filePath + '.writer.lock';
-  }
-
-  private markWriterActive(): void {
-    try {
-      fs.mkdirSync(path.dirname(this.writerLockPath), { recursive: true, mode: 0o700 });
-      try {
-        const owner = Number(fs.readFileSync(this.writerLockPath, 'utf8').trim());
-        if (Number.isSafeInteger(owner) && owner > 0 && owner !== process.pid) {
-          try {
-            process.kill(owner, 0);
-            return; // another live process already protects this shared log
-          } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'ESRCH') return;
-          }
-        }
-      } catch {
-        /* absent/unreadable lock: replace below */
-      }
-      fs.writeFileSync(this.writerLockPath, `${process.pid}\n`, { mode: 0o600 });
-    } catch {
-      // Tracking remains best-effort; prune also performs a second lock check.
-    }
-  }
-
-  private clearWriterActive(): void {
-    try {
-      const owner = fs.readFileSync(this.writerLockPath, 'utf8').trim();
-      if (owner === String(process.pid)) fs.unlinkSync(this.writerLockPath);
-    } catch {
-      /* already absent */
-    }
+    // Fail startup explicitly rather than allow two append fds whose rotations
+    // and prune coordination could silently split or lose the log.
+    this.writerLock = acquireEventsFileLock(filePath, 'writer');
   }
 
   private ensureOpen(): boolean {
@@ -770,7 +739,7 @@ class FileTracker implements Tracker {
       }
       this.fd = null;
     }
-    this.clearWriterActive();
+    this.writerLock.release();
   }
 }
 

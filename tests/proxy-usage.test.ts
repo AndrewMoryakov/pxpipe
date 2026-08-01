@@ -1505,6 +1505,61 @@ describe('proxy usage extraction', () => {
     expect(captured?.status).toBe(413);
   });
 
+  it('streams an oversized chunked bypass body without buffering it for model sniffing', async () => {
+    let releaseTail!: () => void;
+    const tailReady = new Promise<void>((resolve) => { releaseTail = resolve; });
+    let markUpstreamStarted!: () => void;
+    const upstreamStarted = new Promise<void>((resolve) => { markUpstreamStarted = resolve; });
+    let upstreamBytes = 0;
+    const restore = mockUpstream(async (req) => {
+      markUpstreamStarted();
+      upstreamBytes = (await req.arrayBuffer()).byteLength;
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test' });
+    const prefix = new Uint8Array(600 * 1024);
+    const tail = new Uint8Array(5 * 1024 * 1024);
+    let step = 0;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (step < 2) {
+          step++;
+          controller.enqueue(prefix);
+          return;
+        }
+        if (step === 2) await tailReady;
+        if (step < 5) {
+          step++;
+          controller.enqueue(tail);
+          return;
+        }
+        controller.close();
+      },
+    });
+    const request = new Request('http://localhost/v1/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-pxpipe-bypass': '1' },
+      body,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    expect(request.headers.has('content-length')).toBe(false);
+
+    const responsePromise = proxy(request);
+    const startedBeforeTail = await Promise.race([
+      upstreamStarted.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    releaseTail();
+    const response = await responsePromise;
+    await response.text();
+    restore();
+
+    expect(startedBeforeTail).toBe(true);
+    expect(response.status).toBe(200);
+    expect(upstreamBytes).toBe((2 * prefix.byteLength) + (3 * tail.byteLength));
+    expect(upstreamBytes).toBeGreaterThan(16 * 1024 * 1024);
+  });
+
   it('keeps bypassed Codex Responses on OpenAI accounting and scans headerless SSE', async () => {
     const sse = `data: ${JSON.stringify({
       type: 'response.completed', response: { usage: { input_tokens: 21, output_tokens: 3 } },

@@ -291,12 +291,11 @@ function readStreamField(body: Uint8Array): boolean {
   }
 }
 
-/** Read only a bounded clone of a bypassed JSON request. Bypass must keep the
- * original body byte-for-byte, but Responses telemetry still needs to know
- * whether a headerless Codex reply is SSE or JSON. */
-async function readStreamFieldFromClone(req: Request): Promise<boolean> {
+/** Read only a bounded clone of a request while leaving its original body
+ * untouched for streaming passthrough. */
+async function readBoundedClone(req: Request): Promise<Uint8Array | null> {
   const reader = req.clone().body?.getReader();
-  if (!reader) return false;
+  if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
@@ -304,7 +303,7 @@ async function readStreamFieldFromClone(req: Request): Promise<boolean> {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MODEL_SNIFF_MAX_BYTES) return false;
+      if (total > MODEL_SNIFF_MAX_BYTES) return null;
       chunks.push(value);
     }
     const body = new Uint8Array(total);
@@ -313,12 +312,20 @@ async function readStreamFieldFromClone(req: Request): Promise<boolean> {
       body.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return readStreamField(body);
+    return body;
   } catch {
-    return false;
+    return null;
   } finally {
     void reader.cancel().catch(() => undefined);
   }
+}
+
+/** Read only a bounded clone of a bypassed JSON request. Bypass must keep the
+ * original body byte-for-byte, but Responses telemetry still needs to know
+ * whether a headerless Codex reply is SSE or JSON. */
+async function readStreamFieldFromClone(req: Request): Promise<boolean> {
+  const body = await readBoundedClone(req);
+  return body !== null && readStreamField(body);
 }
 
 // Claude Code only admits gateway-discovered ids beginning with "claude" or
@@ -1562,12 +1569,12 @@ const model = googleModel ?? readModelField(bodyIn);
         declaredType.toLowerCase().includes('json') &&
         !(Number.isFinite(declaredLength) && declaredLength > MODEL_SNIFF_MAX_BYTES);
       if (worthBuffering) {
-        const bodyIn = new Uint8Array(await req.arrayBuffer());
-        requestModel ??= readModelField(bodyIn) ?? undefined;
-        bodyOut = bodyIn;
-      } else {
-        bodyOut = req.body; // pass through unchanged, model stays unknown
+        const sniffed = await readBoundedClone(req);
+        if (sniffed !== null) requestModel ??= readModelField(sniffed) ?? undefined;
       }
+      // Label-only inspection must never consume/buffer the actual request. A
+      // large or chunked JSON body remains byte-for-byte streaming passthrough.
+      bodyOut = req.body;
     } else {
       bodyOut = req.body; // pass through unchanged
     }

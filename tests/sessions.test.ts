@@ -9,6 +9,7 @@ import {
   type SessionsPaths,
 } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
+import { acquireEventsFileLock } from '../src/events-lock.js';
 
 // ---- Test scaffolding ------------------------------------------------------
 
@@ -115,9 +116,29 @@ describe('aggregateSessions', () => {
     writeEvents(tmp, [ev({ first_user_sha8: 'keepme' })]);
     fs.writeFileSync(tmp.eventsFile + '.writer.lock', `${process.pid}\n`);
     await expect(prune(tmp, { sessionId: 'keepme', force: true })).rejects.toThrow(
-      'active writer',
+      'owned',
     );
     expect(fs.readFileSync(tmp.eventsFile, 'utf8')).toContain('keepme');
+  });
+
+  it('never deletes a sidecar path outside the configured sidecar directory', async () => {
+    const outside = path.join(path.dirname(tmp.eventsFile), 'must-survive.json.gz');
+    fs.writeFileSync(outside, 'important');
+    writeEvents(tmp, [ev({ first_user_sha8: 'victim', req_body_sample_path: outside })]);
+    await prune(tmp, { sessionId: 'victim', force: true });
+    expect(fs.existsSync(outside)).toBe(true);
+  });
+
+  it('serializes writers and prune with one exclusive lock', () => {
+    const writer = acquireEventsFileLock(tmp.eventsFile, 'writer');
+    expect(() => acquireEventsFileLock(tmp.eventsFile, 'writer')).toThrow('owned');
+    expect(() => acquireEventsFileLock(tmp.eventsFile, 'prune')).toThrow('owned');
+    writer.release();
+    const pruneOwner = acquireEventsFileLock(tmp.eventsFile, 'prune');
+    expect(() => acquireEventsFileLock(tmp.eventsFile, 'writer')).toThrow('owned');
+    pruneOwner.release();
+    const nextWriter = acquireEventsFileLock(tmp.eventsFile, 'writer');
+    nextWriter.release();
   });
 
   it('uses earliest ts for firstSeen and latest for lastSeen even when input is unordered', async () => {
@@ -150,6 +171,19 @@ describe('aggregateSessions', () => {
     expect(sidecarsBySession.get('aaaaaaaa')?.has(sidecar)).toBe(true);
   });
 
+  it('counts a repeated sidecar once and preserves it while a kept session references it', async () => {
+    const sidecar = writeSidecar(tmp, 'shared.json.gz', 512);
+    writeEvents(tmp, [
+      ev({ first_user_sha8: 'remove', req_body_sample_path: sidecar }),
+      ev({ first_user_sha8: 'remove', req_body_sample_path: sidecar }),
+      ev({ first_user_sha8: 'keep', req_body_sample_path: sidecar }),
+    ]);
+    const { sessions } = await aggregateSessions(tmp);
+    expect(sessions.get('remove')?.sidecarBytes).toBe(512);
+    await prune(tmp, { sessionId: 'remove', force: true });
+    expect(fs.existsSync(sidecar)).toBe(true);
+  });
+
   it('returns empty when events.jsonl is missing', async () => {
     const missing: SessionsPaths = {
       eventsFile: path.join(path.dirname(tmp.eventsFile), 'nope.jsonl'),
@@ -171,6 +205,15 @@ describe('aggregateSessions', () => {
     );
     const { sessions } = await aggregateSessions(tmp);
     expect(sessions.get('aaaaaaaa')?.requestCount).toBe(2);
+  });
+
+  it('drops schema-invalid JSON values without aborting aggregation', async () => {
+    fs.writeFileSync(
+      tmp.eventsFile,
+      '{}\n' + JSON.stringify(ev({ first_user_sha8: 'validrow' })) + '\n',
+    );
+    const { sessions } = await aggregateSessions(tmp);
+    expect([...sessions.keys()]).toEqual(['validrow']);
   });
 
   it('credits the real prefix compression (image prefix fewer tokens than text prefix)', async () => {

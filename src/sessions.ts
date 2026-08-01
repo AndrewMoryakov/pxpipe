@@ -38,6 +38,7 @@ import {
   computeOpenAIActualInputEff,
   computeOpenAIBaselineInputEff,
 } from './core/openai-savings.js';
+import { acquireEventsFileLock } from './events-lock.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -109,15 +110,57 @@ export async function* readEvents(
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
-    let ev: TrackEvent;
+    let parsed: unknown;
     try {
-      ev = JSON.parse(line) as TrackEvent;
+      parsed = JSON.parse(line);
     } catch {
       continue;
     }
+    if (!isTrackEvent(parsed)) continue;
     // +1 for the newline FileTracker writes after each row.
-    yield { ev, rawBytes: Buffer.byteLength(line, 'utf8') + 1 };
+    yield { ev: parsed, rawBytes: Buffer.byteLength(line, 'utf8') + 1 };
   }
+}
+
+function isTrackEvent(value: unknown): value is TrackEvent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const ev = value as Record<string, unknown>;
+  if (typeof ev.ts !== 'string' || !Number.isFinite(Date.parse(ev.ts))) return false;
+  if (typeof ev.method !== 'string' || typeof ev.path !== 'string') return false;
+  if (typeof ev.status !== 'number' || !Number.isFinite(ev.status)) return false;
+  if (typeof ev.duration_ms !== 'number' || !Number.isFinite(ev.duration_ms) || ev.duration_ms < 0) {
+    return false;
+  }
+  const optionalStrings = [
+    'model', 'cwd', 'first_user_sha8', 'system_sha8', 'req_body_sample_path',
+  ];
+  for (const key of optionalStrings) {
+    if (ev[key] !== undefined && typeof ev[key] !== 'string') return false;
+  }
+  if (
+    ev.accounting_provider !== undefined
+    && ev.accounting_provider !== 'anthropic'
+    && ev.accounting_provider !== 'openai'
+    && ev.accounting_provider !== 'google'
+  ) return false;
+  if (ev.compressed !== undefined && typeof ev.compressed !== 'boolean') return false;
+  if (
+    ev.baseline_probe_status !== undefined
+    && ev.baseline_probe_status !== 'ok'
+    && ev.baseline_probe_status !== 'partial'
+    && ev.baseline_probe_status !== 'failed'
+  ) return false;
+  const optionalNonNegativeNumbers = [
+    'input_tokens', 'output_tokens', 'cache_create_tokens', 'cache_read_tokens',
+    'cached_tokens', 'cache_create_5m_tokens', 'cache_create_1h_tokens',
+    'baseline_tokens', 'baseline_cacheable_tokens', 'image_tokens',
+    'baseline_imaged_tokens', 'native_injected_tokens',
+  ];
+  for (const key of optionalNonNegativeNumbers) {
+    const n = ev[key];
+    if (n !== undefined && (typeof n !== 'number' || !Number.isFinite(n) || n < 0)) return false;
+  }
+  return true;
 }
 
 // ---- Aggregation -----------------------------------------------------------
@@ -310,14 +353,17 @@ export async function aggregateSessions(
       s.cacheReadTokens += cacheRead;
     }
     if (ev.req_body_sample_path) {
+      const sidecarPath = confinedSidecarPath(paths.sidecarDir, ev.req_body_sample_path);
+      if (!sidecarPath) continue;
       let set = sidecarsBySession.get(id);
       if (!set) {
         set = new Set();
         sidecarsBySession.set(id, set);
       }
-      set.add(ev.req_body_sample_path);
-      const size = sidecarSizes.get(ev.req_body_sample_path);
-      if (typeof size === 'number') s.sidecarBytes += size;
+      const firstReference = !set.has(sidecarPath);
+      set.add(sidecarPath);
+      const size = sidecarSizes.get(sidecarPath);
+      if (firstReference && typeof size === 'number') s.sidecarBytes += size;
     }
   }
 
@@ -367,7 +413,7 @@ function sidecarFileSizes(dir: string): Map<string, number> {
     return out;
   }
   for (const name of entries) {
-    const full = path.join(dir, name);
+    const full = path.resolve(dir, name);
     try {
       const st = fs.statSync(full);
       if (st.isFile()) out.set(full, st.size);
@@ -376,6 +422,16 @@ function sidecarFileSizes(dir: string): Map<string, number> {
     }
   }
   return out;
+}
+
+/** FileTracker writes sidecars directly inside this directory. Reject nested,
+ * sibling and absolute-escape paths before they can reach stat/unlink. */
+function confinedSidecarPath(dir: string, candidate: string): string | undefined {
+  const root = path.resolve(dir);
+  const resolved = path.resolve(candidate);
+  if (path.dirname(resolved) !== root) return undefined;
+  if (path.basename(resolved) === '') return undefined;
+  return resolved;
 }
 
 // ---- prune -----------------------------------------------------------------
@@ -405,30 +461,6 @@ export interface PruneReport {
   sidecarBytesFreed: number;
   /** True when this was a real run (force=true). False for dry-run. */
   applied: boolean;
-}
-
-function hasActiveWriter(eventsFile: string): boolean {
-  const lock = eventsFile + '.writer.lock';
-  let raw: string;
-  try {
-    raw = fs.readFileSync(lock, 'utf8').trim();
-  } catch {
-    return false;
-  }
-  const pid = Number(raw);
-  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') return true;
-    try {
-      fs.unlinkSync(lock);
-    } catch {
-      /* raced another stale-lock cleaner */
-    }
-    return false;
-  }
 }
 
 /** Decide which sessions to remove based on the prune options. Pure — no
@@ -485,9 +517,8 @@ export async function prune(
   opts: PruneOptions,
   now: Date = new Date(),
 ): Promise<PruneReport> {
-  if (hasActiveWriter(paths.eventsFile)) {
-    throw new Error('cannot prune while the events log has an active writer');
-  }
+  const pruneLock = acquireEventsFileLock(paths.eventsFile, 'prune');
+  try {
   const { sessions, sidecarsBySession, primaryProjectByBase } = await aggregateSessions(paths);
   const toRemove = selectSessionsToRemove(sessions, opts, now);
 
@@ -505,13 +536,21 @@ export async function prune(
 
   // Collect sidecar paths up for deletion (and their on-disk sizes).
   const sidecarsToDelete: { path: string; size: number }[] = [];
+  const sidecarsStillReferenced = new Set<string>();
+  for (const [id, refs] of sidecarsBySession) {
+    if (toRemove.has(id)) continue;
+    for (const p of refs) sidecarsStillReferenced.add(p);
+  }
   for (const id of toRemove) {
     const set = sidecarsBySession.get(id);
     if (!set) continue;
     for (const p of set) {
+      const safePath = confinedSidecarPath(paths.sidecarDir, p);
+      if (!safePath || sidecarsStillReferenced.has(safePath)) continue;
       try {
-        const st = fs.statSync(p);
-        sidecarsToDelete.push({ path: p, size: st.size });
+        const st = fs.statSync(safePath);
+        if (!st.isFile()) continue;
+        sidecarsToDelete.push({ path: safePath, size: st.size });
       } catch {
         /* already gone — fine */
       }
@@ -537,11 +576,6 @@ export async function prune(
 
   // Atomic rewrite: stream the original through a filter into events.jsonl.tmp,
   // fsync, then rename. Any partial state on crash leaves the original intact.
-  // Re-check after the potentially long scan so a writer that started while
-  // the dry-run report was being built cannot race the rename.
-  if (hasActiveWriter(paths.eventsFile)) {
-    throw new Error('cannot prune while the events log has an active writer');
-  }
   await rewriteEventsFile(paths.eventsFile, toRemove, primaryProjectByBase);
 
   for (const { path: p } of sidecarsToDelete) {
@@ -554,6 +588,9 @@ export async function prune(
 
   report.applied = true;
   return report;
+  } finally {
+    pruneLock.release();
+  }
 }
 
 async function rewriteEventsFile(
