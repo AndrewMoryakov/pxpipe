@@ -40,6 +40,13 @@ import { evaluateHealth, summarizeHealth } from './core/health.js';
 import { HealthCounters } from './health-counters.js';
 import { buildHealthState } from './health-state.js';
 import { CodexUsageIndex } from './codex-usage.js';
+import {
+  modelScopeFile,
+  loadPersistedModelScope,
+  savePersistedModelScope,
+  clearPersistedModelScope,
+} from './model-scope-store.js';
+import { setAllowedModelBases } from './core/applicability.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -95,48 +102,6 @@ function applyConfigFileDefaults(): void {
   if (process.env.PXPIPE_MODELS === undefined) {
     const models = normalizeModelsConfig(cfg.models);
     if (models !== undefined) process.env.PXPIPE_MODELS = models;
-  }
-}
-
-/** Dashboard persistence hook: write the runtime model scope back to the
- *  config file's `models` key so chip toggles survive a restart. Other keys
- *  are preserved; an invalid existing file is left untouched.
- *  NOTE: on the next start an explicit PXPIPE_MODELS env still wins over the
- *  persisted value (same precedence as every other config-file default). */
-function persistModelBasesToConfig(bases: readonly string[]): void {
-  const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
-  let cfg: Record<string, unknown> = {};
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      console.warn(`[pxpipe] could not persist model scope: invalid config object ${file}`);
-      return;
-    }
-    cfg = parsed as Record<string, unknown>;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.warn(`[pxpipe] could not persist model scope: invalid config ${file}: ${(e as Error).message}`);
-      return;
-    }
-  }
-  // Empty array round-trips as 'off' via normalizeModelsConfig on load.
-  cfg.models = [...bases];
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    const parentExists = fs.existsSync(path.dirname(file));
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    if (!parentExists) fs.chmodSync(path.dirname(file), 0o700);
-    // Write-then-rename so a crash mid-write can't corrupt the config.
-    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    fs.chmodSync(file, 0o600);
-  } catch (e) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      // The write may have failed before the temporary file was created.
-    }
-    console.warn(`[pxpipe] could not persist model scope to ${file}: ${(e as Error).message}`);
   }
 }
 
@@ -448,7 +413,9 @@ function isLoopbackHostname(hostname: string): boolean {
 function isDashboardMutation(route: DashboardRoute, method: string): boolean {
   return method === 'POST' && (
     route.kind === 'api-compression'
-    || (route.kind === 'fragment' && (route.name === 'toggle' || route.name === 'models'))
+    || (route.kind === 'fragment' && (
+      route.name === 'toggle' || route.name === 'models' || route.name === 'models/reset'
+    ))
   );
 }
 
@@ -568,6 +535,10 @@ async function dispatchDashboard(
         }
         if (list !== null) dashboard.handleModelsSet(list);
         else if (model) dashboard.handleModelsToggle(model, on);
+        return dashboard.serveFragment('models', url, port);
+      }
+      if (route.name === 'models/reset' && method === 'POST') {
+        dashboard.handleModelsReset();
         return dashboard.serveFragment('models', url, port);
       }
       if (method !== 'GET') return undefined;
@@ -1112,13 +1083,22 @@ async function main(): Promise<void> {
   // without reaching back into module-scope globals.
   const codexUsage = new CodexUsageIndex();
   codexUsage.start();
+  // A dashboard choice is an explicit operator override: it takes precedence
+  // over PXPIPE_MODELS and survives launcher restarts. Reset deletes only this
+  // sidecar, preserving any deliberately configured PXPIPE_CONFIG defaults.
+  const scopeFile = modelScopeFile(opts.eventsFile);
+  const persistedScope = loadPersistedModelScope(scopeFile);
+  if (persistedScope !== null) setAllowedModelBases(persistedScope);
   const dashboard = new DashboardState(
     {
       eventsFile: opts.eventsFile,
       sidecarDir: bodySidecarDir,
     },
     undefined,
-    persistModelBasesToConfig,
+    (bases) => {
+      if (bases === null) clearPersistedModelScope(scopeFile);
+      else savePersistedModelScope(scopeFile, bases);
+    },
     () => codexUsage.snapshot(),
   );
   // Rolling counter of recent /backend-api/codex/* traffic, feeding the

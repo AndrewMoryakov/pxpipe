@@ -319,9 +319,9 @@ describe('serveFragment', () => {
     try {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null);
-      const saved: string[][] = [];
+      const saved: Array<string[] | null> = [];
       const persisting = new DashboardState(tmp, async () => new Map(), (bases) => {
-        saved.push([...bases]);
+        saved.push(bases === null ? null : [...bases]);
       });
 
       persisting.handleModelsToggle('gpt-5.6-sol', true);
@@ -331,7 +331,10 @@ describe('serveFragment', () => {
       // Empty scope persists too (round-trips as 'off' on load).
       persisting.handleModelsSet('off');
       expect(saved.at(-1)).toEqual([]);
-      expect(saved).toHaveLength(3);
+      persisting.handleModelsReset();
+      expect(getAllowedModelBases()).toContain('claude-fable-5');
+      expect(saved.at(-1)).toBeNull();
+      expect(saved).toHaveLength(4);
 
       // A throwing hook must not break the live flip or the endpoint.
       const throwing = new DashboardState(tmp, async () => new Map(), () => {

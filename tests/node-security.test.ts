@@ -152,6 +152,25 @@ describe('Node dashboard security', () => {
     expect(response.status).toBe(403);
   });
 
+  it('resets the persisted dashboard model override locally', async () => {
+    const { base, eventsFile } = await startNode();
+    const turnOff = await fetch(`${base}/fragments/models`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'list=off',
+    });
+    expect(turnOff.status).toBe(200);
+    const scopeFile = path.join(path.dirname(eventsFile), 'model-scope.json');
+    expect(fs.existsSync(scopeFile)).toBe(true);
+    const reset = await fetch(`${base}/fragments/models/reset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    });
+    expect(reset.status).toBe(200);
+    expect(await reset.text()).toContain('Fable 5 ✓');
+    expect(fs.existsSync(scopeFile)).toBe(false);
+  });
+
   it('creates the event log and containing directory with private permissions', async () => {
     const { base, eventsFile } = await startNode();
     await fetch(`${base}/v1/messages`, {

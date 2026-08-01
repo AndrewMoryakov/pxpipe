@@ -685,12 +685,14 @@ export class DashboardState {
    *  override stays in-memory (Edge-safe); a Node host passes a saver that
    *  writes the `models` key of the config file so chip toggles survive a
    *  restart. Best-effort: failures are the hook's problem, never the API's. */
-  private readonly persistModelBases: ((bases: readonly string[]) => void) | undefined;
+  /** `null` means Reset: remove the host's persisted override and fall back to
+   * its configured/default scope. */
+  private readonly persistModelBases: ((bases: readonly string[] | null) => void) | undefined;
 
   constructor(
     paths?: SessionsPaths,
     ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
-    persistModelBases?: (bases: readonly string[]) => void,
+    persistModelBases?: (bases: readonly string[] | null) => void,
     codexUsageFn?: () => CodexUsageSnapshot,
   ) {
     this.paths = paths;
@@ -1866,6 +1868,17 @@ export class DashboardState {
         ? []
         : trimmed.split(',').map((s) => s.trim()).filter(Boolean);
     this.applyModelBases(bases);
+  }
+
+  /** Reset removes the runtime and persisted override. It is intentionally
+   * distinct from an empty scope, which means "compress nothing". */
+  handleModelsReset(): void {
+    setAllowedModelBases(null);
+    try {
+      this.persistModelBases?.(null);
+    } catch {
+      // The live reset still took effect even when persistence cleanup fails.
+    }
   }
 
   private applyModelBases(bases: string[]): void {
