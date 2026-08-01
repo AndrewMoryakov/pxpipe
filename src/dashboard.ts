@@ -1852,8 +1852,8 @@ export class DashboardState {
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
    *  runtime compress scope. The model checks read this live. Persisted via
    *  the host's `persistModelBases` hook when provided (Node writes the
-   *  config file); otherwise in-memory only and restart resets to the
-   *  PXPIPE_MODELS env / built-in default. */
+   *  sidecar); otherwise in-memory only and restart resets to the configured
+   *  PXPIPE_CONFIG / PXPIPE_MODELS / built-in default. */
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);

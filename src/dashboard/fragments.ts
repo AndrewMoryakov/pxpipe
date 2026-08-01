@@ -306,7 +306,7 @@ export function renderModelsFragment(
     'claude-model-scope', 'Image Claude models',
     'The Claude model families currently eligible for context imaging.',
     'Model scope prevents experimental or unsupported models from being transformed unintentionally.',
-    'A highlighted chip with a check mark is enabled. Your choice is saved and survives restart until you press Reset (which falls back to PXPIPE_MODELS or the built-in default).',
+    'A highlighted chip with a check mark is enabled. Your choice is saved and survives restart until you press Reset (which falls back to PXPIPE_CONFIG, PXPIPE_MODELS, or the built-in default).',
   );
   const grokHelp = helpTip(
     'grok-model-scope', 'Image Grok models',
@@ -343,7 +343,7 @@ export function renderModelsFragment(
     `<div class="models models-reset">` +
     `<button class="chip" type="button" ` +
     `hx-post="/fragments/models/reset" hx-target="#frag-models">Reset to default</button>` +
-    `<span class="hint">clears your saved choice · falls back to PXPIPE_MODELS or the built-in default</span>` +
+    `<span class="hint">clears your saved choice · falls back to configured defaults</span>` +
     `</div>` +
     `<div class="models">` +
     `<span class="models-label">PXPIPE_MODELS</span>` +
