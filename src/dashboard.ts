@@ -75,7 +75,6 @@ import {
   getAllowedModelBases,
   getConfiguredModelBases,
   isModelScopeEnabled,
-  isPxpipeSupportedModel,
   setAllowedModelBases,
 } from './core/applicability.js';
 import type {
@@ -603,9 +602,9 @@ export class DashboardState {
    *  comfortably under a MB even with fat bucket/passthrough histograms. */
   private static readonly SESSION_CAP = 50;
   private readonly startedAt = Date.now() / 1000;
-  /** Lifetime accounting partitioned by exact model id. The dashboard sums
-   * only currently enabled model families, so toggling a model updates the
-   * overall numbers without discarding its history. */
+  /** Lifetime accounting partitioned by exact model id. Overview combines
+   * every since-restart row: scope controls future transforms, not whether a
+   * later settings click erases prior traffic from the displayed totals. */
   private readonly totalsByModel = new Map<string, Totals>();
   /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
    *  Each request that rendered an image pushes one entry; the matching
@@ -717,10 +716,9 @@ export class DashboardState {
     return totals;
   }
 
-  private enabledTotals(): Totals {
+  private lifetimeTotals(): Totals {
     const combined = emptyTotals(this.startedAt);
-    for (const [model, totals] of this.totalsByModel) {
-      if (!isPxpipeSupportedModel(model)) continue;
+    for (const totals of this.totalsByModel.values()) {
       for (const key of Object.keys(combined) as Array<keyof Totals>) {
         if (key !== 'startedAt') combined[key] += totals[key];
       }
@@ -1044,13 +1042,18 @@ export class DashboardState {
     // baseline. An
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
-    const dollarEligible = !google;
+    // Only Claude rows with a known model-specific price may enter dollar
+    // totals. OpenAI/Responses and Google rows still enter token, activity,
+    // and session accounting, but their savings are deliberately disclosed as
+    // modeled/unpriced rather than silently repriced at a Claude fallback.
+    const inputUsdPerMtok = !gpt && !google ? inputUsdPerMtokForModel(ev.model) : undefined;
+    const pricedEligible = inputUsdPerMtok !== undefined;
     if (creditSaving) {
       const savedInputEquivalents = baselineInputEff - actualInputEff;
       totals.baselineInputWeighted += baselineInputEff;
       totals.actualInputWeighted += actualInputEff;
       totals.outputWeighted += outputEquiv;
-      if (dollarEligible) {
+      if (pricedEligible) {
         totals.pricedBaselineInputWeighted += baselineInputEff;
         totals.pricedActualInputWeighted += actualInputEff;
         totals.pricedOutputWeighted += outputEquiv;
@@ -1064,11 +1067,10 @@ export class DashboardState {
         totals.measuredSavingsRequests += 1;
         totals.measuredClaudeSavedInputEquivalents += savedInputEquivalents;
         totals.measuredCacheCreateTierUnknownTokens += cacheCreateUnknownTokens(cc, cacheCreate);
-        const inputRate = inputUsdPerMtokForModel(ev.model);
-        if (inputRate === undefined) totals.unpricedMeasuredSavingsRequests += 1;
+        if (inputUsdPerMtok === undefined) totals.unpricedMeasuredSavingsRequests += 1;
         else {
           totals.pricedMeasuredSavingsRequests += 1;
-          totals.pricedMeasuredSavingsUsd += savedInputEquivalents * inputRate / 1e6;
+          totals.pricedMeasuredSavingsUsd += savedInputEquivalents * inputUsdPerMtok / 1e6;
         }
       }
     } else if (!gpt && !google && compressed && haveUsage) {
@@ -1084,7 +1086,7 @@ export class DashboardState {
     // can't measure the counterfactual, so actual ≈ baseline). This
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
-    if (haveUsage && dollarEligible) {
+    if (haveUsage) {
       if (!gpt && !google) {
         totals.cacheCreate5mTokens += cacheCreate?.fiveMinuteTokens ?? 0;
         totals.cacheCreate1hTokens += cacheCreate?.oneHourTokens ?? 0;
@@ -1152,7 +1154,7 @@ export class DashboardState {
       // update() so the lifetime totals block (above) and the per-session
       // block (here) read the same values. Re-deriving them here would
       // duplicate the cache-aware-baseline math and invite drift.
-      if (creditSaving && dollarEligible) {
+      if (creditSaving) {
         s.baselineInputWeighted += baselineInputEff;
         s.actualInputWeighted += actualInputEff;
         s.baselineMeasuredCount += 1;
@@ -1165,7 +1167,7 @@ export class DashboardState {
       // above (allActualInputWeighted / allOutputWeighted). Used as the
       // honest denominator for the session's saved-% so caching wins on
       // unmeasured requests still count toward "what you actually paid".
-      if (haveUsage && dollarEligible) {
+      if (haveUsage) {
         s.allActualInputWeighted += actualInputEff;
         s.allOutputWeighted += outputEquiv;
       }
@@ -1504,7 +1506,7 @@ export class DashboardState {
     //     What Anthropic's weekly limit actually meters — input × 1.0 +
     //     output × 5.0 (the same ratio as the per-MTok price card). This is
     //     the number that moves your "%% used this week" indicator.
-    const totals = this.enabledTotals();
+    const totals = this.lifetimeTotals();
     const baseline = totals.baselineInputWeighted;
     const actual = totals.actualInputWeighted;
     const output = totals.outputWeighted; // already × OUTPUT_TOKEN_RATE

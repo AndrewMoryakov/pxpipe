@@ -796,6 +796,9 @@ describe('Gemini savings split', () => {
     const stats = (await dash.serveStats().json()) as StatsPayload;
     expect(stats.saved_input_tokens).toBe(280);
     expect(stats.saved_usd).toBe(0);
+    expect(stats.usage_bearing_responses).toBe(1);
+    expect(stats.all_usage_requests).toBe(1);
+    expect(stats.all_baseline_equivalent_weighted).toBe(400);
     const recent = (await dash.serveRecent().json()) as RecentPayload;
     expect(recent.recent.at(-1)?.baseline_input).toBe(400);
     expect(recent.recent.at(-1)?.actual_input).toBe(120);
@@ -821,6 +824,44 @@ describe('Gemini savings split', () => {
     const stats = (await dash.serveStats().json()) as StatsPayload;
     expect(stats.saved_input_tokens).toBe(280);
     expect(stats.saved_usd).toBe(0);
+  });
+
+  it('keeps modeled Responses savings out of Claude dollar totals', async () => {
+    setAllowedModelBases(['claude-fable-5', 'gpt-5.6-sol']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-fable-5', status: 200, durationMs: 1,
+      usage: { input_tokens: 100, output_tokens: 0 },
+      info: { compressed: true, baselineTokens: 300, baselineCacheableTokens: 300, baselineProbeStatus: 'ok' },
+    } as never);
+    const claudeOnly = (await dash.serveStats().json()) as StatsPayload;
+    expect(claudeOnly.saved_usd).toBeGreaterThan(0);
+    dash.update({
+      method: 'POST', path: '/v1/responses', accountingProvider: 'openai', model: 'gpt-5.6-sol', status: 200, durationMs: 1,
+      usage: { input_tokens: 100, output_tokens: 0 },
+      info: { compressed: true, imageTokens: 100, baselineImagedTokens: 500 },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    // Only the Claude row is priced; adding a modeled Responses row must not
+    // change its model-priced dollar estimate.
+    expect(stats.saved_usd).toBe(claudeOnly.saved_usd);
+    expect(stats.estimated_openai_savings_requests).toBe(1);
+    expect(stats.usage_bearing_responses).toBe(2);
+  });
+
+  it('keeps since-restart totals after a model is later disabled', async () => {
+    setAllowedModelBases(['claude-fable-5']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-fable-5', status: 200, durationMs: 1,
+      usage: { input_tokens: 100, output_tokens: 0 },
+      info: { compressed: true, baselineTokens: 300, baselineCacheableTokens: 300, baselineProbeStatus: 'ok' },
+    } as never);
+    setAllowedModelBases([]);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.requests).toBe(1);
+    expect(stats.usage_bearing_responses).toBe(1);
+    expect(stats.saved_input_tokens).toBeGreaterThan(0);
   });
 
   it('shows estimated savings when optional Gemini measurement fails', async () => {
