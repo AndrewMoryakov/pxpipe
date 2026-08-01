@@ -799,6 +799,8 @@ describe('Gemini savings split', () => {
     const stats = (await dash.serveStats().json()) as StatsPayload;
     expect(stats.saved_input_tokens).toBe(280);
     expect(stats.saved_usd).toBe(0);
+    expect(stats.estimated_google_savings_requests).toBe(1);
+    expect(stats.modeled_google_saved_input_equivalents).toBe(280);
     expect(stats.usage_bearing_responses).toBe(1);
     expect(stats.all_usage_requests).toBe(1);
     expect(stats.all_baseline_equivalent_weighted).toBe(400);
@@ -916,8 +918,12 @@ describe('Gemini savings split', () => {
     const stats = (await dash.serveStats().json()) as StatsPayload;
     expect(stats.saved_input_tokens).toBe(2900);
     expect(stats.saved_usd).toBe(0);
+    expect(stats.estimated_google_savings_requests).toBe(1);
+    expect(stats.modeled_google_saved_input_equivalents).toBe(2900);
     const header = await (await dash.serveFragment('header', new URL('http://localhost/fragments/header'), 1)).text();
     expect(header).not.toContain('$0.03');
+    expect(header).toContain('Gemini');
+    expect(header).toContain('provider usage + modeled baseline · 1 rows');
     const html = await (await dash.serveFragment('recent', new URL('http://localhost/fragments/recent'), 1)).text();
     expect(html).toContain('Details →');
     const details = await (await dash.serveFragment(

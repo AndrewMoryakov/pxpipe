@@ -48,6 +48,10 @@ export interface StatsPayload {
   estimated_openai_savings_requests: number;
   /** Locally modeled OpenAI/Responses savings, in input-token equivalents. */
   modeled_openai_saved_input_equivalents: number;
+  /** Gemini/Google rows with provider usage and a probe- or transform-derived baseline. */
+  estimated_google_savings_requests: number;
+  /** Gemini/Google input reduction estimate, kept separate from Claude and Responses evidence. */
+  modeled_google_saved_input_equivalents: number;
   /** Compressed paid Anthropic rows withheld from the numerator when a probe failed. */
   baseline_probe_excluded_requests: number;
   /** Server-reported cache-create tier coverage for Anthropic actual usage. */

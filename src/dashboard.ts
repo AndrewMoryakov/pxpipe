@@ -311,6 +311,11 @@ interface Totals {
   /** OpenAI/Responses savings modeled from local tokenizer/vision accounting,
    *  in input-token equivalents. Never presented as measured Claude savings. */
   modeledOpenAISavedInputEquivalents: number;
+  /** Gemini/Google rows have provider usage, but their text-versus-image
+   * baseline is either optional-provider-probe or local transform accounting.
+   * Keep them visible as their own unpriced evidence bucket. */
+  estimatedGoogleSavingsRequests: number;
+  modeledGoogleSavedInputEquivalents: number;
   /** Paid compressed rows deliberately excluded because their baseline probe was unavailable. */
   baselineProbeExcludedRequests: number;
   pricedMeasuredSavingsRequests: number;
@@ -363,6 +368,8 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     measuredClaudeSavedInputEquivalents: 0,
     estimatedOpenAISavingsRequests: 0,
     modeledOpenAISavedInputEquivalents: 0,
+    estimatedGoogleSavingsRequests: 0,
+    modeledGoogleSavedInputEquivalents: 0,
     baselineProbeExcludedRequests: 0,
     pricedMeasuredSavingsRequests: 0,
     unpricedMeasuredSavingsRequests: 0,
@@ -1064,6 +1071,13 @@ export class DashboardState {
         // count_tokens-measured Anthropic numerator.
         totals.estimatedOpenAISavingsRequests += 1;
         totals.modeledOpenAISavedInputEquivalents += savedInputEquivalents;
+      } else if (google) {
+        // Google reports actual provider usage, but the comparable text side
+        // is an optional probe or transform-side estimate. Show it separately
+        // rather than mislabelling it as Claude measurement or losing it from
+        // the evidence breakdown altogether.
+        totals.estimatedGoogleSavingsRequests += 1;
+        totals.modeledGoogleSavedInputEquivalents += savedInputEquivalents;
       } else if (!google) {
         totals.measuredSavingsRequests += 1;
         totals.measuredClaudeSavedInputEquivalents += savedInputEquivalents;
@@ -1629,6 +1643,9 @@ export class DashboardState {
       estimated_openai_savings_requests: totals.estimatedOpenAISavingsRequests,
       modeled_openai_saved_input_equivalents:
         Math.round(totals.modeledOpenAISavedInputEquivalents),
+      estimated_google_savings_requests: totals.estimatedGoogleSavingsRequests,
+      modeled_google_saved_input_equivalents:
+        Math.round(totals.modeledGoogleSavedInputEquivalents),
       baseline_probe_excluded_requests: totals.baselineProbeExcludedRequests,
       cache_create_5m_tokens: Math.round(totals.cacheCreate5mTokens),
       cache_create_1h_tokens: Math.round(totals.cacheCreate1hTokens),

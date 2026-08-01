@@ -456,6 +456,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const unpricedRows = s.unpriced_measured_savings_requests ?? 0;
   const measuredClaudeRows = s.measured_anthropic_savings_requests ?? 0;
   const estimatedResponsesRows = s.estimated_openai_savings_requests ?? 0;
+  const estimatedGeminiRows = s.estimated_google_savings_requests ?? 0;
   const excludedProbeRows = s.baseline_probe_excluded_requests ?? 0;
   const cacheCreate5m = s.cache_create_5m_tokens ?? 0;
   const cacheCreate1h = s.cache_create_1h_tokens ?? 0;
@@ -475,19 +476,21 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     : '0.0';
   const measuredClaudeSaved = s.measured_claude_saved_input_equivalents ?? 0;
   const modeledResponsesSaved = s.modeled_openai_saved_input_equivalents ?? 0;
+  const modeledGeminiSaved = s.modeled_google_saved_input_equivalents ?? 0;
   const usageBearingResponses = s.usage_bearing_responses ?? s.all_usage_requests ?? 0;
   const paidCompressed = s.compressed_paid_requests ?? 0;
   const paidPassthrough = s.passthrough_paid_requests ?? 0;
-  const evidenceLabel = measuredClaudeRows > 0 && estimatedResponsesRows > 0
+  const modeledRows = estimatedResponsesRows + estimatedGeminiRows;
+  const evidenceLabel = measuredClaudeRows > 0 && modeledRows > 0
     ? 'Mixed evidence'
     : measuredClaudeRows > 0
       ? 'Provider-measured'
-      : estimatedResponsesRows > 0
+      : modeledRows > 0
         ? 'Modeled only'
         : 'Collecting data';
-  const evidenceClass = measuredClaudeRows > 0 && estimatedResponsesRows === 0 && excludedProbeRows === 0
+  const evidenceClass = measuredClaudeRows > 0 && modeledRows === 0 && excludedProbeRows === 0
     ? 'good'
-    : measuredClaudeRows > 0 || estimatedResponsesRows > 0
+    : measuredClaudeRows > 0 || modeledRows > 0
       ? 'mixed'
       : 'waiting';
   const outcomeClass = (s.saved_input_tokens ?? 0) < 0 ? ' negative' : '';
@@ -495,7 +498,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     'overview', 'Overview',
     'A since-restart summary of PXPIPE effect, paid response activity, and evidence quality.',
     'These values have different meanings. Keeping effect, activity, and confidence separate prevents token savings from being confused with provider usage.',
-    'Start with input change, then check whether it is Claude measured or Responses modeled. Use Paid LLM responses for sample size and Reliability for limitations.',
+    'Start with input change, then check whether it is Claude measured or Responses/Gemini modeled. Use Paid LLM responses for sample size and Reliability for limitations.',
   );
   const changeHelp = helpTip(
     'input-change', 'Estimated input change',
@@ -512,8 +515,8 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const reliabilityHelp = helpTip(
     'reliability', 'Estimate reliability',
     'A summary of where the estimate came from and how much of the Claude value has an exact configured model price.',
-    'Provider-measured Claude rows are stronger evidence than locally modeled Responses rows. Missing probes and missing prices reduce what can be claimed.',
-    'Provider-measured is strongest. Mixed evidence combines measured and modeled rows. Modeled only should be treated as directional. Open Audit for formulas and exclusions.',
+    'Provider-measured Claude rows are stronger evidence than locally modeled Responses or Gemini rows. Missing probes and missing prices reduce what can be claimed.',
+    'Provider-measured is strongest. Mixed evidence combines measured and modeled rows. Modeled-only provider groups should be treated as directional. Open Audit for formulas and exclusions.',
   );
   const claudeMeasuredHelp = helpTip(
     'claude-measured', 'Claude provider-measured reduction',
@@ -526,6 +529,12 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     'OpenAI Responses input change estimated locally with the matching text tokenizer and the vision-token model used for imaged content.',
     'Responses does not provide the same count endpoint as Claude, so PXPIPE cannot claim this part as provider-measured.',
     'Use it as a directional token-equivalent estimate. It is disclosed separately and deliberately excluded from dollar savings.',
+  );
+  const geminiModeledHelp = helpTip(
+    'gemini-modeled', 'Gemini provider-usage reduction',
+    'Gemini actual input comes from Google provider usage. The text counterfactual comes from an optional baseline probe when available, otherwise PXPIPE\'s transform-side token estimate.',
+    'Google does not share the Claude count_tokens evidence path, so this value is shown separately and is never assigned Claude dollar pricing.',
+    'Use it as a provider-usage-backed but unpriced input-reduction estimate.',
   );
   const imagedHelp = helpTip(
     'paid-imaged', 'Imaged paid responses',
@@ -568,6 +577,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<div class="effect-breakdown">` +
     `<div class="effect-row measured"><span class="effect-name"><span><b>Claude</b><small>provider-measured · ${numFmt(measuredClaudeRows)} rows</small></span>${claudeMeasuredHelp}</span><span class="effect-result"><strong>${numFmt(measuredClaudeSaved)}</strong>${pricedRows > 0 ? `<span class="price-callout"><small>Model-priced input value</small><b class="price-value">$${(s.saved_usd ?? 0).toFixed(2)}</b><em>${pricedRows}/${priceCoverageTotal} priced Claude rows</em></span>` : '<em>unpriced</em>'}</span></div>` +
     `<div class="effect-row modeled"><span class="effect-name"><span><b>Responses</b><small>locally modeled · ${numFmt(estimatedResponsesRows)} rows</small></span>${responsesModeledHelp}</span><strong>${numFmt(modeledResponsesSaved)} <em>not priced</em></strong></div>` +
+    `<div class="effect-row modeled"><span class="effect-name"><span><b>Gemini</b><small>provider usage + modeled baseline · ${numFmt(estimatedGeminiRows)} rows</small></span>${geminiModeledHelp}</span><strong>${numFmt(modeledGeminiSaved)} <em>not priced</em></strong></div>` +
     `</div></article>` +
     `<article class="overview-card">` +
     `<div class="block-label-row"><div class="card-eyebrow">Paid LLM responses</div>${paidHelp}</div>` +
@@ -583,6 +593,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<div class="overview-lines compact">` +
     `<span><b>${numFmt(measuredClaudeRows)}</b> Claude rows measured by provider</span>` +
     `<span><b>${numFmt(estimatedResponsesRows)}</b> Responses rows modeled locally</span>` +
+    `<span><b>${numFmt(estimatedGeminiRows)}</b> Gemini rows with provider usage + modeled baseline</span>` +
     `<span><span class="field-label"><b>${priceCoverage}</b> exact model-price coverage${priceCoverageHelp}</span></span>` +
     `</div><a class="text-link" href="#audit-drawer">See methodology and assumptions ↓</a>` +
     `</article>` +
@@ -681,10 +692,12 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
     mathRow('Claude measured reduction', measuredClaudeSaved, 'provider count_tokens baseline + upstream usage') +
     mathRow('Responses modeled reduction', modeledResponsesSaved, 'local tokenizer/vision counterfactual; not dollar-priced') +
+    mathRow('Gemini reduction', modeledGeminiSaved, 'provider usage + optional probe or transform-side baseline; not dollar-priced') +
     mathRow('TTL sensitivity (unknown creates→1h)', s.saved_if_unknown_cache_create_1h, 'downside scenario for rows whose server response omitted the 5m/1h split; not a confidence interval') +
     `<div class="sp"></div>` +
     mathRow('measured Claude rows', s.measured_anthropic_savings_requests, 'count_tokens + upstream usage; high-confidence part of the headline') +
     mathRow('estimated Responses rows', s.estimated_openai_savings_requests, 'local tokenizer/vision model; disclosed separately in this mixed legacy aggregate') +
+    mathRow('estimated Gemini rows', s.estimated_google_savings_requests, 'provider usage + optional probe or transform-side baseline; disclosed separately') +
     mathRow('probe-excluded rows', s.baseline_probe_excluded_requests, 'compressed paid requests with no successful baseline; zero saving credited') +
     mathRow('cache-create 5m / 1h / unknown', `${numFmt(s.cache_create_5m_tokens)} / ${numFmt(s.cache_create_1h_tokens)} / ${numFmt(s.cache_create_tier_unknown_tokens)}`, 'unknown tier retains the legacy 5m assumption; not proof of its TTL') +
     `<span class="src">output excluded — identical with/without compression; baseline cache TTL remains a modeled counterfactual</span>`;
@@ -745,7 +758,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const drawer =
     `<details class="drawer" id="audit-drawer">` +
     `<summary>Show the math &amp; honesty receipts <span class="summary-q" aria-hidden="true">?</span></summary>` +
-    `<div class="drawer-intro"><strong>Audit note:</strong> the savings headline is a counterfactual (the same request as plain text), not an invoice. Claude credit requires upstream usage and a successful text probe; OpenAI/Responses rows use a local text-versus-image estimate. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
+    `<div class="drawer-intro"><strong>Audit note:</strong> the savings headline is a counterfactual (the same request as plain text), not an invoice. Claude credit requires upstream usage and a successful text probe; OpenAI/Responses use a local text-versus-image estimate; Gemini uses provider usage plus an optional probe or transform-side baseline. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
     `<div class="math-grid">` +
 
     mathBlock('Input tokens saved', savedMath, helpTip(
