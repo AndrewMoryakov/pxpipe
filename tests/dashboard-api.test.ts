@@ -318,7 +318,7 @@ describe('serveFragment', () => {
     }
   });
 
-  it('renders and disables a child enabled by a broad model scope', async () => {
+  it('disables one child of a broad model scope without disabling its known siblings', async () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
       process.env.PXPIPE_MODELS = 'gpt-5.6';
@@ -330,6 +330,9 @@ describe('serveFragment', () => {
       dash.handleModelsToggle('gpt-5.6-sol', false);
       expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('gpt-5.6');
+      expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(true);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-lun')).toBe(true);
+      expect(getAllowedModelBases()).toEqual(['gpt-5.6-terra', 'gpt-5.6-lun']);
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;

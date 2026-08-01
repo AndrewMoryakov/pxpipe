@@ -61,6 +61,7 @@ import {
   renderPage,
   renderToggleFragment,
   renderModelsFragment,
+  KNOWN_MODEL_SCOPE_IDS,
   renderContextMapFragment,
   renderSessionSummaryFragment,
   renderHeaderFragment,
@@ -1861,12 +1862,29 @@ export class DashboardState {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);
     else {
-      // A broad configured base (e.g. gpt-5.6) also enables every matching
-      // child. Removing only the child's exact id would leave it silently
-      // active while the chip says off; remove every scope entry that enables
-      // this model so the toggle truthfully disables it.
-      for (const base of next) {
-        if (isModelScopeEnabled(model, [base])) next.delete(base);
+      // A broad base (for example gpt-5.6) enables every matching child.
+      // Expand it to its known concrete siblings before removing the child:
+      // deleting the broad base outright would unexpectedly disable Terra and
+      // Lun when the user only turned Sol off.
+      const known = new Set([
+        ...KNOWN_MODEL_SCOPE_IDS,
+        ...getConfiguredModelBases(),
+        ...next,
+      ]);
+      for (const base of [...next]) {
+        if (!isModelScopeEnabled(model, [base])) continue;
+        next.delete(base);
+        for (const candidate of known) {
+          // A candidate that also enables `base` is that broad base (or an
+          // even broader alias), not a concrete sibling to preserve.
+          if (
+            candidate !== model
+            && isModelScopeEnabled(candidate, [base])
+            && !isModelScopeEnabled(base, [candidate])
+          ) {
+            next.add(candidate);
+          }
+        }
       }
     }
     this.applyModelBases([...next]);

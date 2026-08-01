@@ -184,6 +184,15 @@ const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
 ];
 
+/** Known concrete model ids used when a broad scope must be expanded while
+ * preserving its sibling chips. The broad shortcut itself is intentionally
+ * omitted from the expansion by the caller. */
+export const KNOWN_MODEL_SCOPE_IDS: readonly string[] = [
+  ...MODEL_CATALOG.map((model) => model.id),
+  ...GPT_MODEL_CATALOG.map((model) => model.id),
+  ...GROK_MODEL_CATALOG.map((model) => model.id),
+  ...GEMINI_MODEL_CATALOG.map((model) => model.id),
+];
 
 /** Per-model readiness for pxpipe imaging, keyed to committed eval receipts —
  *  NOT opinion (see FINDINGS.md / applicability.ts). The dashboard derives its
