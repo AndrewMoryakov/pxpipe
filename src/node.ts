@@ -1054,6 +1054,32 @@ async function main(): Promise<void> {
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
+  // Subscription bearers expire. A client that froze its bearer at startup — a
+  // container handed CLAUDE_CODE_OAUTH_TOKEN as an env var — cannot renew one,
+  // so its max session length is the token's remaining life. When this is set we
+  // resolve the bearer per request from the file instead, which keeps rotation
+  // on the host with a single writer: N parallel containers refreshing their own
+  // copies would rotate each other's credential out from under them.
+  // Cached on mtime, so it costs a stat per request rather than a read.
+  const authTokenFile = process.env.ANTHROPIC_OAUTH_TOKEN_FILE?.trim() || undefined;
+  let authTokenCache: { mtimeMs: number; token: string } | undefined;
+  const anthropicAuthToken = authTokenFile
+    ? (): string | undefined => {
+        try {
+          const { mtimeMs } = fs.statSync(authTokenFile);
+          if (authTokenCache?.mtimeMs !== mtimeMs) {
+            authTokenCache = { mtimeMs, token: fs.readFileSync(authTokenFile, 'utf8').trim() };
+          }
+          return authTokenCache.token || undefined;
+        } catch {
+          // Mid-rotation the writer may have unlinked it; last good beats none.
+          return authTokenCache?.token;
+        }
+      }
+    : undefined;
+  if (authTokenFile) {
+    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
+  }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
   // legibility audits, demo inspection). Best-effort — never affects requests.
@@ -1108,6 +1134,7 @@ async function main(): Promise<void> {
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
   const config: ProxyConfig = {
+    authToken: anthropicAuthToken,
     provider: opts.provider,
     gatewayBaseUrl: opts.gatewayBaseUrl,
     gatewayHeaders: opts.gatewayHeaders,

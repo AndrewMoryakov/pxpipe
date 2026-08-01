@@ -49,7 +49,17 @@ TARGET_PORT="${PORT:-47821}"
 
 # --- 1. Discover running proxies ------------------------------------------
 # `[c]li.js` keeps pgrep from matching itself if anyone pipes us through grep.
-PIDS_RAW=$(pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null || true)
+#
+# `cli.js warp -- <cmd>` matches that pattern too, and warp is not a proxy we
+# may restart: it owns a child process (often the Claude Code session running
+# this very script). SIGTERM to warp takes the child with it, so the restart
+# would kill the caller. Serving proxies only.
+PIDS_RAW=$(pgrep -f 'node.*bin/[c]li\.js' 2>/dev/null | while read -r p; do
+  case "$(ps -o args= -p "$p" 2>/dev/null)" in
+    *"cli.js warp"*) ;;
+    *) echo "$p" ;;
+  esac
+done || true)
 if [ -n "$PIDS_RAW" ]; then
   # Convert to space-separated list, sorted numerically for stable output.
   PIDS=$(echo "$PIDS_RAW" | tr '\n' ' ' | xargs -n1 | sort -n | tr '\n' ' ')
