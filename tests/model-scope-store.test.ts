@@ -71,4 +71,9 @@ describe('model-scope-store (Variant A persistence)', () => {
     );
     expect(loadPersistedModelScope(file)).toEqual(['claude-fable-5', 'gpt-5.6-sol']);
   });
+
+  it('all-invalid non-empty arrays → null instead of disabling every model', () => {
+    fs.writeFileSync(file, JSON.stringify({ modelBases: [42, {}, '  '] }));
+    expect(loadPersistedModelScope(file)).toBeNull();
+  });
 });

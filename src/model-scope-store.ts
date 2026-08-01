@@ -37,10 +37,14 @@ export function loadPersistedModelScope(file: string): string[] | null {
     const parsed = JSON.parse(raw) as { modelBases?: unknown };
     const bases = parsed?.modelBases;
     if (!Array.isArray(bases)) return null;
-    return bases
+    const normalized = bases
       .filter((b): b is string => typeof b === 'string')
       .map((b) => b.trim())
       .filter(Boolean);
+    // [] is an intentional "disable every model" choice. A non-empty array
+    // that normalizes to nothing, however, is corrupt and must not silently
+    // turn compression off for every model.
+    return bases.length > 0 && normalized.length === 0 ? null : normalized;
   } catch {
     return null;
   }
