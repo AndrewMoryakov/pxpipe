@@ -353,12 +353,12 @@ function makeReq(toolResultText: string) {
 
 describe('paging end-to-end (transformRequest)', () => {
   it('tool_result under cap renders normally (no truncation counters)', async () => {
-    // Above the multi-col break-even (~22k chars), well under the 10-image
+    // Above the compression break-even, well under the 10-image
     // single-column budget (~920k chars = 10 × ~92k DENSE at the 5×8 atlas).
     // charsPerToken:2 reflects reality (tool_result content is code/logs, ~2 ch/tok)
-    // and ensures the gate accepts this size at numCols=1.
+    // and ensures the gate accepts this size.
     const text = 'x'.repeat(50_000);
-    const { info } = await transformRequest(makeReq(text), { multiCol: 1, charsPerToken: 2 });
+    const { info } = await transformRequest(makeReq(text), { charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect((info.toolResultImgs ?? 0)).toBeGreaterThan(0);
     expect(info.truncatedToolResults ?? 0).toBe(0);
@@ -375,7 +375,7 @@ describe('paging end-to-end (transformRequest)', () => {
     expect(lockish.length).toBeGreaterThan(2 * DENSE_CONTENT_CHARS_PER_IMAGE);
     expect(lockish.length).toBeLessThan(80_000);
 
-    const { info } = await transformRequest(makeReq(lockish), { multiCol: 1, charsPerToken: 2 });
+    const { info } = await transformRequest(makeReq(lockish), { charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect(info.truncatedToolResults ?? 0).toBe(0);
     expect(info.omittedChars ?? 0).toBe(0);
@@ -393,7 +393,7 @@ describe('paging end-to-end (transformRequest)', () => {
     const log = lines.join('\n');
     expect(log.length).toBeGreaterThan(400_000);
 
-    const { info } = await transformRequest(makeReq(log), { multiCol: 1, charsPerToken: 2 });
+    const { info } = await transformRequest(makeReq(log), { charsPerToken: 2 });
     expect(info.compressed).toBe(true);
     expect(info.truncatedToolResults).toBe(1);
     expect(info.omittedChars).toBeGreaterThan(0);
@@ -411,12 +411,25 @@ describe('paging end-to-end (transformRequest)', () => {
 
     // Tight budget of 2 images = ~28k chars.
     const { info } = await transformRequest(makeReq(log), {
-      multiCol: 1,
       charsPerToken: 2,
       maxImagesPerToolResult: 2,
     });
     expect(info.truncatedToolResults).toBe(1);
     expect(info.toolResultImgs).toBeLessThanOrEqual(3); // 2 + slack
+  });
+
+  it('uses Claude profile rows when enforcing the tool-result image cap', async () => {
+    const log = Array.from(
+      { length: 10_000 },
+      (_, i) => `2026-05-18T12:00:00Z entry ${i} payload content here`,
+    ).join('\n');
+    const { info } = await transformRequest(makeReq(log), {
+      model: 'claude-opus-4-8',
+      charsPerToken: 2,
+      maxImagesPerToolResult: 2,
+    });
+    expect(info.truncatedToolResults).toBe(1);
+    expect(info.toolResultImgs).toBeLessThanOrEqual(3);
   });
 
   it('counts multiple tool_results that all exceed the budget', async () => {
@@ -442,10 +455,10 @@ describe('paging end-to-end (transformRequest)', () => {
         ],
       }),
     );
-    const { info } = await transformRequest(req, { multiCol: 1, charsPerToken: 2 });
+    const { info } = await transformRequest(req, { charsPerToken: 2 });
     expect(info.truncatedToolResults).toBe(2);
     // Both should have been truncated → omittedChars roughly doubled. The
-    // exact bound depends on renderer config: at multiCol=1 each image
+    // Exact bound depends on renderer configuration: each image
     // packs ~19.5k chars worst-case. Threshold below covers the single-col case.
     expect(info.omittedChars).toBeGreaterThan(600_000);
   });
@@ -476,7 +489,7 @@ describe('paging end-to-end (transformRequest)', () => {
         ],
       }),
     );
-    const { info } = await transformRequest(req, { multiCol: 1, charsPerToken: 2 });
+    const { info } = await transformRequest(req, { charsPerToken: 2 });
     expect(info.truncatedToolResults).toBe(1);
     expect(info.omittedChars).toBeGreaterThan(0);
     expect(info.toolResultImgs).toBeLessThanOrEqual(11);

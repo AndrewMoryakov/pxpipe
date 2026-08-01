@@ -29,9 +29,20 @@ afterEach(() => {
 });
 
 describe('public library API', () => {
-  it('recognizes Fable 5 (with suffix aliases) as the default scope; Opus is OFF by default', () => {
+  it('recognizes the default scope (Fable 5 + Opus 5 + Gemini 3.6 Flash); legacy Opus is OFF by default', () => {
     expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
     expect(isPxpipeSupportedModel('claude-fable-5-high')).toBe(true);
+    expect(isPxpipeSupportedModel('google/gemini-3.6-flash')).toBe(true);
+    expect(isPxpipeSupportedModel('gemini-3.6-flash-preview')).toBe(false);
+    // Any prefix depth is stripped to the last segment, because real gateway
+    // ids nest more than one level (`workers-ai/@cf/moonshotai/kimi-k3`). The
+    // vendor segments pick an upstream, not a geometry, so they do not gate
+    // scope — an unrecognized prefix in front of a known id still matches.
+    expect(isPxpipeSupportedModel('untrusted/google/gemini-3.6-flash')).toBe(true);
+    // Opus 5 IS in the default scope (applicability.ts :: DEFAULT_MODEL_BASES), so it
+    // ships compressed with no opt-in. Its dense-hex score is still unmeasured
+    // (README "—") — the same axis that excluded Opus 4.8 at 0/15.
+    expect(isPxpipeSupportedModel('claude-opus-5')).toBe(true);
     // Opus 4.8 is OPT-IN, not in the default scope — same pipeline/render as
     // Fable, but it reads imaged content at a tax (FINDINGS.md 2026-06-16), so
     // the default doesn't silently compress the operator's main driver. Enable
@@ -49,7 +60,8 @@ describe('public library API', () => {
   it('strips bracketed variant tags like [1m] before matching', () => {
     expect(isPxpipeSupportedModel('claude-fable-5[1m]')).toBe(true);
     expect(isPxpipeSupportedModel('claude-fable-5-high[1m]')).toBe(true);
-    expect(isPxpipeSupportedModel('claude-opus-4-8[1m]')).toBe(false); // Opus opt-in, off by default
+    expect(isPxpipeSupportedModel('claude-opus-5[1m]')).toBe(true);    // in default scope, tag stripped
+    expect(isPxpipeSupportedModel('claude-opus-4-8[1m]')).toBe(false); // legacy Opus opt-in, off by default
     // a non-scoped base is still rejected even with a variant tag
     expect(isPxpipeSupportedModel('claude-opus-4-7[1m]')).toBe(false);
   });
@@ -80,7 +92,7 @@ describe('public library API', () => {
       // empty list = compress nothing
       setAllowedModelBases([]);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(false);
-      // null clears the override → back to the Fable-only default
+      // null clears the override → back to the default scope (Fable 5 + Opus 5 + Gemini)
       setAllowedModelBases(null);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
       expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
@@ -121,7 +133,7 @@ describe('public library API', () => {
       expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'gemini-3.6-flash']);
 
       process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);
@@ -308,6 +320,55 @@ describe('public library API', () => {
     expect(transformed.cache.markerCount).toBe(0);
   });
 
+  it('applies the Claude profile to direct Anthropic Messages rendering', async () => {
+    process.env.PXPIPE_MODELS = 'claude-fable-5,claude-opus-4-8';
+    const body = enc.encode(JSON.stringify({
+      model: 'claude-opus-4-8',
+      system: Array.from({ length: 1800 }, (_, i) => `setting_${i}=value_${i * 7919}`).join('\n'),
+      messages: [{ role: 'user', content: 'continue' }],
+    }));
+    const transformed = await transformAnthropicMessages({
+      body,
+      model: 'claude-opus-4-8',
+      options: { charsPerToken: 1, minCompressChars: 1, cols: undefined },
+    });
+    expect(transformed.applied).toBe(true);
+    expect(transformed.info.firstImageWidth).toBeLessThanOrEqual(1568);
+    expect(transformed.info.firstImageHeight).toBeLessThanOrEqual(728);
+  });
+
+  it('preserves the exact Claude Code OAuth identity as the first system block', async () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+    const body = enc.encode(JSON.stringify({
+      model: 'claude-fable-5',
+      system: [
+        { type: 'text', text: identity },
+        {
+          type: 'text',
+          text: 'Detailed Claude Code operating instructions. '.repeat(1200),
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      tools: [{
+        name: 'read_file',
+        description: 'Read a file from disk. '.repeat(200),
+        input_schema: { type: 'object', properties: { path: { type: 'string' } } },
+      }],
+      messages: [{ role: 'user', content: 'hello' }],
+    }));
+
+    const transformed = await transformAnthropicMessages({ body, model: 'claude-fable-5' });
+    expect(transformed.applied).toBe(true);
+    expect(transformed.info.imageCount).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(transformed.body)) as {
+      system?: Array<{ type: string; text?: string; cache_control?: unknown }>;
+    };
+    expect(out.system?.[0]).toEqual({ type: 'text', text: identity });
+    expect(out.system?.[0]?.cache_control).toBeUndefined();
+    expect(transformed.info.imageSourceText).not.toContain(identity);
+  });
+
   it('transforms GPT 5.5 chat completions using OpenAI image_url blocks', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.5',
@@ -345,7 +406,7 @@ describe('public library API', () => {
     expect(firstUser.content[0].type).toBe('image_url');
     expect(firstUser.content[0].image_url.url).toMatch(/^data:image\/png;base64,/);
     expect(out.messages[0].content).toContain('rendered into image');
-    expect(out.tools[0].function.description).toBe('Read a file from disk. '.repeat(100));
+    expect(out.tools[0].function.description).toBe('Full docs: see "## Tool: read_file" in the rendered context image.');
     expect(out.tools[0].function.parameters.description).toBeUndefined();
     expect(out.tools[0].function.parameters.properties.path.description).toBeUndefined();
     expect(JSON.stringify(out)).not.toContain('cache_control');

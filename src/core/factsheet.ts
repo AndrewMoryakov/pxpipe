@@ -18,8 +18,19 @@
  *  longest, most-identifying tokens are kept first when the substring filter runs. */
 const PATTERNS: readonly RegExp[] = [
   /\b[A-Z][A-Z0-9_]{2,}=[^\s)"'<>]+/g, // semantic LABEL=value pair (preserve association)
+  // Same association-preservation for lower/mixed-case `field=value`, which is what logs,
+  // CLI output and JSONL actually emit (`dur=4439`, `gold=c9c947f680ec`, `trial=0`). The
+  // uppercase pattern above skips those entirely, so only the bare value survives the image
+  // and the label↔value binding is lost: a reader keeps `4439` but not what `dur` meant, and
+  // silently rebinds it to a plausible wrong field (elapsed time, not the search key). That
+  // is a binding error, not a legibility one — the glyphs were never in doubt. Value side is
+  // restricted to opaque tokens so prose (`x=y`) and code (`const a=b`) cannot flood the sheet.
+  /\b[A-Za-z][A-Za-z0-9_]{2,}=[A-Za-z0-9_.:/+-]{1,64}/g,
   /\bhttps?:\/\/[^\s)"'<>]+/g, // URLs
+  /\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b/g, // email address
   /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, // UUID
+  /\b[A-Z]{2}\d{2}[A-Z0-9]{8,30}\b/g, // IBAN-like account string
+  /(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?\b/g, // currency amount
   /(?:[\w@~+-]+)?(?:\/[\w.@+-]+)+\.[A-Za-z]\w{0,8}\b/g, // path with a file extension (multi-dot ok: .test.ts)
   /\/[\w.@+-]+(?:\/[\w.@+-]+)+\/?/g, // dir path (>=2 segments)
   /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g, // git sha / long hex (must contain a digit)
@@ -56,6 +67,9 @@ const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (bas
  *  identifiers outrank long URLs when the budget is tight. Pure + total → deterministic →
  *  cache-stable. Tiers: 0 = protect always, 1 = paths/versions/misc, 2 = URLs (cap + last). */
 const SHAPE_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const SHAPE_EMAIL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
+const SHAPE_IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{8,30}$/;
+const SHAPE_CURRENCY = /^(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?$/;
 const SHAPE_HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,40}$/; // git sha / opaque hex
 const SHAPE_CONST = /^[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+$/; // CONST_IDS / env vars
 const SHAPE_TICKET = /^(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+$/; // PROJ-1482 / CVE-2024-30078
@@ -63,6 +77,12 @@ const SHAPE_FLAG = /^--?[A-Za-z][\w-]+$/; // CLI flag
 const SHAPE_NUM = /^\d[\d,_]*$|^\d+\.\d+$/; // port / large or separated number / decimal
 const SHAPE_URL = /^https?:\/\//;
 const SHAPE_CAMEL = /^(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+$/; // tokenLedgerShard / getUserById
+// Tier-0 assignment is deliberately UPPERCASE-only. Lowercase `field=value` is still
+// captured (see PATTERNS) so the label↔value binding survives, but it stays out of tier 0:
+// log lines carry one on every row, so promoting them floods the top tier, and because the
+// budget fills longest-first the `req=` prefix also inflates an 8-char hex id past a 9-char
+// ticket code — evicting the rare token the sheet exists to preserve. Rarity, not shape, is
+// what makes `dur=4439` worth keeping, and tier 1 is where that trade lands correctly.
 const SHAPE_ASSIGNMENT = /^[A-Z][A-Z0-9_]{2,}=\S+$/; // ACTIVE_MANIFEST=/path
 
 /** Lower tier = higher keep-priority. Pure function of the token → deterministic. */
@@ -71,6 +91,9 @@ function priorityTier(tok: string): 0 | 1 | 2 {
     SHAPE_ASSIGNMENT.test(tok) ||
     SHAPE_HEX.test(tok) ||
     SHAPE_UUID.test(tok) ||
+    SHAPE_EMAIL.test(tok) ||
+    SHAPE_IBAN.test(tok) ||
+    SHAPE_CURRENCY.test(tok) ||
     SHAPE_CONST.test(tok) ||
     SHAPE_TICKET.test(tok) ||
     SHAPE_FLAG.test(tok) ||
@@ -225,6 +248,10 @@ const OPEN =
  *  model can answer tally questions from the sheet instead of counting glyph rows. */
 const OPEN_COUNTS =
   '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: ';
+const OPEN_COMPACT = '[Exact rendered identifiers—quote verbatim: ';
+const OPEN_COMPACT_COUNTS = '[Exact rendered identifiers—quote verbatim; ×N=count: ';
+
+export type FactSheetFormat = 'full' | 'compact';
 
 /** Build the one-line fact-sheet string from a pre-extracted token list. */
 export function factSheetTextFromTokens(tokens: string[]): string {
@@ -233,70 +260,27 @@ export function factSheetTextFromTokens(tokens: string[]): string {
 
 /** Build the one-line fact-sheet string from token+count entries. Byte-identical to
  *  `factSheetTextFromTokens` when no token repeats, so existing sheets stay cache-stable. */
-export function factSheetTextFromEntries(entries: readonly FactSheetEntry[]): string {
+export function factSheetTextFromEntries(
+  entries: readonly FactSheetEntry[],
+  format: FactSheetFormat = 'full',
+): string {
   if (entries.length === 0) return '';
   const anyRepeat = entries.some((e) => e.count >= 2);
   const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
-  return (anyRepeat ? OPEN_COUNTS : OPEN) + body + ']';
+  const opener = format === 'compact'
+    ? (anyRepeat ? OPEN_COMPACT_COUNTS : OPEN_COMPACT)
+    : (anyRepeat ? OPEN_COUNTS : OPEN);
+  return opener + body + ']';
 }
 
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found.
  *  Single path for slab, history, and tool results: page long text so early-turn
  *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
-export function factSheetText(text: string): string {
+export function factSheetText(text: string, format: FactSheetFormat = 'full'): string {
   if (!text) return '';
   if (text.length <= MAX_SCAN) {
-    return factSheetTextFromEntries(extractFactSheetEntries(text));
+    return factSheetTextFromEntries(extractFactSheetEntries(text), format);
   }
   const { kept } = extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS);
-  return factSheetTextFromEntries(kept);
-}
-
-/** Shape label for an IDS-block line (visual OCR aid, not a factsheet). */
-function idsBlockLabel(tok: string): string {
-  if (SHAPE_HEX.test(tok)) return 'hex';
-  if (SHAPE_UUID.test(tok)) return 'uuid';
-  if (SHAPE_CAMEL.test(tok) && tok.length >= 8) return 'camel';
-  if (tok.includes('/')) return 'path';
-  if (SHAPE_NUM.test(tok) && tok.length <= 8) return 'port';
-  if (SHAPE_CONST.test(tok)) return 'const';
-  if (SHAPE_FLAG.test(tok)) return 'flag';
-  if (SHAPE_TICKET.test(tok)) return 'code';
-  return 'id';
-}
-
-/**
- * Append a short multi-line IDS block of precision-critical tokens so each ID
- * sits on its own rendered row (pure-image OCR aid at 5×8). Deterministic.
- * Used on every imaged path (Claude + GPT + Grok). Grok pure-image packing
- * validated 2026-07-11 (white+ids_block 7/7 4/4); other families get the same
- * visual isolation as defense in depth alongside the text fact-sheet.
- * Does not replace the text fact-sheet; the IDS block is rasterized into the PNG.
- */
-export function appendIdsBlock(text: string, maxIds = 16): string {
-  if (!text) return text;
-  if (/\nIDS\n/.test(text) || text.startsWith('IDS\n')) return text;
-  const entries =
-    text.length <= MAX_SCAN
-      ? extractFactSheetEntries(text)
-      : extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS).kept;
-  // Prefer tier-0 (hex, ports, camel, flags), then tier-1 paths — same
-  // consequence ranking as the fact-sheet budget, but keep a few paths so
-  // pure-image path probes stay visible as isolated rows.
-  const tokens: string[] = [];
-  const seen = new Set<string>();
-  const push = (t: string) => {
-    if (seen.has(t) || tokens.length >= maxIds) return;
-    seen.add(t);
-    tokens.push(t);
-  };
-  for (const { token } of entries) {
-    if (priorityTier(token) === 0) push(token);
-  }
-  for (const { token } of entries) {
-    if (priorityTier(token) === 1 && token.includes('/')) push(token);
-  }
-  if (tokens.length === 0) return text;
-  const lines = tokens.map((t) => `${idsBlockLabel(t)} ${t}`);
-  return `${text.replace(/\s+$/, '')}\nIDS\n${lines.join('\n')}\n`;
+  return factSheetTextFromEntries(kept, format);
 }

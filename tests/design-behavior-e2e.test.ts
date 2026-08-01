@@ -70,6 +70,10 @@ function fakeUpstream() {
 
 const FORCE = { charsPerToken: 1, minCompressChars: 1 } as const;
 const big = (n: number) => 'x'.repeat(n);
+const dense = (n: number) => Array.from({ length: Math.ceil(n / 17) }, (_, i) => `k${i.toString(16)}=v${i * 7919}`).join('\n').slice(0, n);
+const APPENDED_SYSTEM_SENTINEL = 'APPENDED_SYSTEM_SENTINEL_keep_live_text';
+const BASE_SYSTEM_SENTINEL = 'BASE_SYSTEM_SENTINEL_image_me';
+const LARGE_SYSTEM_CHARS = 80_000;
 
 async function drive(path: string, body: string): Promise<any> {
   const cap = fakeUpstream();
@@ -105,7 +109,7 @@ describe('design: SYSTEM PROMPT imaging (Anthropic)', () => {
       JSON.stringify({
         model: 'claude-fable-5',
         max_tokens: 16,
-        system: [{ type: 'text', text: 'SLAB_SECRET_' + big(80_000), cache_control: { type: 'ephemeral' } }],
+        system: [{ type: 'text', text: 'SLAB_SECRET_' + big(LARGE_SYSTEM_CHARS), cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: 'LIVE_QUESTION here' }],
       }),
     );
@@ -117,6 +121,30 @@ describe('design: SYSTEM PROMPT imaging (Anthropic)', () => {
     // The system field no longer carries the slab (Anthropic forbids images there).
     expect(JSON.stringify(out.system ?? '')).not.toContain('SLAB_SECRET_');
     // The live turn is preserved verbatim and legible.
+    expect(hay).toContain('LIVE_QUESTION here');
+  });
+
+  it('keeps non-cache-controlled appended system blocks as live text', async () => {
+    const out = await drive(
+      '/v1/messages',
+      JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 16,
+        system: [
+          {
+            type: 'text',
+            text: BASE_SYSTEM_SENTINEL + big(LARGE_SYSTEM_CHARS),
+            cache_control: { type: 'ephemeral' },
+          },
+          { type: 'text', text: APPENDED_SYSTEM_SENTINEL },
+        ],
+        messages: [{ role: 'user', content: 'LIVE_QUESTION here' }],
+      }),
+    );
+    const hay = JSON.stringify(out);
+    expect(imageCount(out)).toBeGreaterThan(0);
+    expect(hay).not.toContain(BASE_SYSTEM_SENTINEL);
+    expect(JSON.stringify(out.system ?? '')).toContain(APPENDED_SYSTEM_SENTINEL);
     expect(hay).toContain('LIVE_QUESTION here');
   });
 });
@@ -202,7 +230,7 @@ describe('design: RECENT REQUEST stays legible (GPT)', () => {
       '/v1/chat/completions',
       JSON.stringify({
         model: 'gpt-5.6-sol',
-        messages: [{ role: 'system', content: 'SYS ' + big(60_000) }, ...turns],
+        messages: [{ role: 'system', content: 'SYS ' + dense(60_000) }, ...turns],
       }),
     );
     const hay = JSON.stringify(out);

@@ -2,9 +2,7 @@ import { isPxpipeSupportedModel } from './applicability.js';
 import { countCacheControlMarkers } from './measurement.js';
 import {
   renderTextToPngsWithCharLimit,
-  renderTextToPngsMultiCol,
   measureContentCols,
-  maxFittingCols,
   reflow,
   DENSE_CONTENT_COLS,
   DENSE_CONTENT_CHARS_PER_IMAGE,
@@ -19,6 +17,7 @@ import {
   type KeepSharpBlock,
   type RecoverableBlock,
 } from './transform.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export type { KeepSharpBlock, RecoverableBlock };
 
@@ -118,7 +117,7 @@ export async function transformAnthropicMessages(
   }
 
   try {
-    const { body, info } = await transformRequest(original, input.options);
+    const { body, info } = await transformRequest(original, { ...input.options, model: input.model ?? undefined });
     const reason = classifyReason(info);
     const markerCount = countCacheControlMarkers(body);
     return {
@@ -149,23 +148,22 @@ export async function transformAnthropicMessages(
 // ---------------------------------------------------------------------------
 
 export interface RenderTextToImagesOptions {
-  /** Wrap-width cap in cols. Default DENSE_CONTENT_COLS (384). */
+  /** Model whose complete built-in render profile supplies defaults. */
+  readonly model?: string;
+  /** Wrap-width cap. Defaults to the model profile when `model` is set. */
   readonly cols?: number;
   /** Shrink the canvas to the widest actual line (default true). `false` keeps the
    *  full `cols` width — the proxy's eval-backed full-canvas behavior. */
   readonly shrink?: boolean;
-  /** Columns to pack side-by-side. `'auto'` (default) packs as many as fit the width
-   *  cap; a number forces that count (clamped to what fits). */
-  readonly multiCol?: number | 'auto';
   /** Reflow the text before rendering (minify + join hard newlines with the ↵ sentinel so
    *  short lines pack into full-width rows). This is the proxy's dense history format and is
    *  what `pxpipe export` uses. Default false (raw one-line-per-row). */
   readonly reflow?: boolean;
   /** Max source chars per page. Default DENSE_CONTENT_CHARS_PER_IMAGE. */
   readonly maxCharsPerImage?: number;
-  /** Render style. Default DENSE_RENDER_STYLE (bare 5×8 cell, anti-aliased). */
+  /** Render style. Defaults to the model profile when `model` is set. */
   readonly style?: RenderStyle;
-  /** Max page height in px. Default MAX_HEIGHT_PX (728 — Anthropic 1568-edge / ~1.15 MP safe). */
+  /** Max page height. Defaults to the model profile when `model` is set. */
   readonly maxHeightPx?: number;
 }
 
@@ -185,9 +183,8 @@ export interface RenderTextToImagesResult {
 
 /**
  * Render arbitrary text to dense PNG pages — the public, documented entry for the
- * renderer the proxy uses internally. Sizes a narrow canvas to the content (`shrink`)
- * and packs multiple columns (`multiCol`) so short-line content isn't priced at full
- * width. Returns raw PNG bytes + pixel dimensions, ready to write to disk or wrap in
+ * renderer the proxy uses internally. Sizes a narrow canvas to the content (`shrink`).
+ * Returns raw PNG bytes + pixel dimensions, ready to write to disk or wrap in
  * image blocks. This is the surface SDK consumers should use instead of reaching into
  * the internal leaf renderers in `render.ts`.
  */
@@ -195,9 +192,10 @@ export async function renderTextToImages(
   text: string,
   opts: RenderTextToImagesOptions = {},
 ): Promise<RenderTextToImagesResult> {
-  const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
-  const style = opts.style ?? DENSE_RENDER_STYLE;
-  const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
+  const profile = opts.model ? resolveGptProfile(opts.model) : undefined;
+  const maxCols = Math.max(1, (opts.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS) | 0);
+  const style = opts.style ?? profile?.style ?? DENSE_RENDER_STYLE;
+  const maxHeightPx = opts.maxHeightPx ?? profile?.maxHeightPx ?? MAX_HEIGHT_PX;
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
 
   // Reflow (the proxy's dense default; opt-in here): minify trailing whitespace + collapse
@@ -210,21 +208,10 @@ export async function renderTextToImages(
   // bails (→ raw text) only if the source already contains ↵, which is vanishingly rare.
   const source = opts.reflow ? reflow(text) ?? text : text;
 
-  // Width/columns: measure the content, then pack as many side-by-side columns as fit the
-  // width cap (auto) or the caller's explicit count. Reflowed source is one ↵-joined full-
-  // width line, so this collapses to a single dense 384-col column — byte-identical to the
-  // proxy's history render (renderTextToPngsWithCharLimit at DENSE_CONTENT_COLS).
+  // Measure the content width. Reflowed source is one joined full-width line, so this is
+  // byte-identical to the proxy's history render.
   const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
-  const requestedCols =
-    opts.multiCol === undefined || opts.multiCol === 'auto'
-      ? Math.max(1, maxFittingCols(cols))
-      : Math.max(1, opts.multiCol | 0);
-  const numCols = cols < maxCols ? 1 : requestedCols;
-
-  const imgs =
-    numCols > 1
-      ? await renderTextToPngsMultiCol(source, cols, numCols)
-      : await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
+  const imgs = await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 
   let droppedChars = 0;
   let pixels = 0;

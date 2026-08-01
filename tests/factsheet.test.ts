@@ -4,7 +4,6 @@ import {
   extractFactSheetEntries,
   extractFactSheetEntriesAllPages,
   factSheetText,
-  appendIdsBlock,
 } from '../src/core/factsheet.js';
 
 describe('factsheet extraction', () => {
@@ -21,6 +20,23 @@ describe('factsheet extraction', () => {
     expect(toks).toContain('LIVEKIT_API_SECRET');
     expect(toks).toContain('--max-tokens');
     expect(toks).toContain('97.82');
+  });
+
+  it('captures issue 55 exact-token classes for transactional text', () => {
+    const replyTo = 'ops.reply+invoice-55@example.co.uk';
+    const iban = 'UA383220010000026008';
+    const invoiceAmount = '$14,360';
+    const text = [
+      `reply-to ${replyTo}`,
+      `settle IBAN ${iban}`,
+      `invoice total ${invoiceAmount}, due today`,
+    ].join('\n');
+
+    const toks = extractFactSheetTokens(text);
+
+    expect(toks).toContain(replyTo);
+    expect(toks).toContain(iban);
+    expect(toks).toContain(invoiceAmount);
   });
 
   it('drops substrings of longer kept tokens', () => {
@@ -115,6 +131,17 @@ describe('ticket-style codes and occurrence counts', () => {
     expect(factSheetText(text)).not.toContain('×');
   });
 
+  it('supports compact profile framing without changing extracted facts', () => {
+    const text = 'retry DEPLOY-77 on src/core/openai.ts port 47821 DEPLOY-77';
+    const full = factSheetText(text);
+    const compact = factSheetText(text, 'compact');
+    expect(compact).toContain('DEPLOY-77 ×2');
+    expect(compact).toContain('src/core/openai.ts');
+    expect(compact).toContain('47821');
+    expect(compact).toContain('×N=count');
+    expect(compact.length).toBeLessThan(full.length);
+  });
+
   it('never double-counts one span matched by two patterns', () => {
     // 1.2.3 is hit by the version pattern; its 1.2 substring by decimal — offset dedup
     // plus substring-collapse must leave a single un-annotated v1.2.3-style entry.
@@ -150,7 +177,7 @@ describe('ticket-style codes and occurrence counts', () => {
 
 
   it('covers the Grok density-harness probes (hex/camel/path/port)', () => {
-    // Production Grok keeps 5x8 images and relies on the fact-sheet for exact
+    // Production Grok keeps native-14px images and relies on the fact-sheet for exact
     // IDs. If extraction drops any of these shapes, image-only confab returns.
     const text = [
       'token cache key is a3f9c1e0b7d2',
@@ -171,36 +198,4 @@ describe('ticket-style codes and occurrence counts', () => {
     }
   });
 
-});
-
-describe('appendIdsBlock (pure-image IDS rows for all models)', () => {
-  it('appends an IDS block with hex, camel, path, and port labels', () => {
-    const text = [
-      'Done. The token cache key is a3f9c1e0b7d2. I renamed the field to tokenLedgerShard',
-      'and moved the tier math into src/core/anthropic-vision.ts. Proxy stays on port 47821.',
-    ].join(' ');
-    const out = appendIdsBlock(text);
-    expect(out).toContain('\nIDS\n');
-    expect(out).toContain('hex a3f9c1e0b7d2');
-    expect(out).toContain('camel tokenLedgerShard');
-    expect(out).toContain('path src/core/anthropic-vision.ts');
-    expect(out).toContain('port 47821');
-    // original body preserved
-    expect(out.startsWith(text.trimEnd()) || out.includes('token cache key is a3f9c1e0b7d2')).toBe(true);
-  });
-
-  it('is idempotent — does not double-append', () => {
-    const text = 'key a3f9c1e0b7d2 path src/core/x.ts port 47821';
-    const once = appendIdsBlock(text);
-    expect(appendIdsBlock(once)).toBe(once);
-  });
-
-  it('is deterministic for cache stability', () => {
-    const text = 'hex a3f9c1e0b7d2 camel tokenLedgerShard path src/a/b.ts port 47821';
-    expect(appendIdsBlock(text)).toBe(appendIdsBlock(text));
-  });
-
-  it('returns the original text when nothing notable is present', () => {
-    expect(appendIdsBlock('the quick brown fox')).toBe('the quick brown fox');
-  });
 });

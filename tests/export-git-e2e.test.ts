@@ -10,8 +10,8 @@ import { fileURLToPath } from 'node:url';
 // Runs the actual CLI via tsx against a throwaway git repo and asserts the
 // untracked-file filtering. Kept in its own file because it spawns a subprocess.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// Execute tsx through node rather than spawning node_modules/.bin/tsx directly:
-// on Windows, spawnSync cannot execute the .cmd shim without a shell.
+// tsx's JS entry, run via process.execPath: the .bin/tsx shim is a .cmd on
+// Windows, which spawnSync can't execute without a shell.
 const tsxCli = path.join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 function git(cwd: string, args: string[]): void {

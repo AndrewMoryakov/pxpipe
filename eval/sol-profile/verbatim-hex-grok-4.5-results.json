@@ -1,8 +1,10 @@
 {
-  "generatedAt": "2026-07-11T20:47:49.180Z",
+  "generatedAt": "2026-07-23T22:58:38.033Z",
   "model": "grok-4.5",
   "live": true,
   "correct": 0,
+  "completed": 12,
+  "errors": 3,
   "n": 15,
   "rows": [
     {
@@ -11,18 +13,18 @@
       "gold": "c9c947f680ec",
       "got": "",
       "ok": false,
-      "raw": "c9c4176684",
-      "ms": 21274,
+      "raw": "c9c417688e",
+      "ms": 51091,
       "error": null
     },
     {
       "page": 0,
       "dur": 812,
       "gold": "851eb3af1bd1",
-      "got": "36efd6a5e76e",
+      "got": "",
       "ok": false,
-      "raw": "36efd6a5e76e",
-      "ms": 2477,
+      "raw": "e81eba41bd",
+      "ms": 78595,
       "error": null
     },
     {
@@ -31,9 +33,9 @@
       "gold": "ade34f70fd73",
       "got": "",
       "ok": false,
-      "raw": "non-json HTTP 503: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endi",
+      "raw": "fetch failed",
       "ms": null,
-      "error": "non-json HTTP 503: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endi"
+      "error": "fetch failed"
     },
     {
       "page": 1,
@@ -41,9 +43,9 @@
       "gold": "c5d68855f46d",
       "got": "",
       "ok": false,
-      "raw": "This operation was aborted",
+      "raw": "fetch failed",
       "ms": null,
-      "error": "This operation was aborted"
+      "error": "fetch failed"
     },
     {
       "page": 1,
@@ -51,9 +53,9 @@
       "gold": "92abade01aad",
       "got": "",
       "ok": false,
-      "raw": "This operation was aborted",
-      "ms": null,
-      "error": "This operation was aborted"
+      "raw": "15e6a8b1ac",
+      "ms": 6637,
+      "error": null
     },
     {
       "page": 1,
@@ -61,9 +63,9 @@
       "gold": "ffe21785b09d",
       "got": "",
       "ok": false,
-      "raw": "This operation was aborted",
-      "ms": null,
-      "error": "This operation was aborted"
+      "raw": "a1c1789be91",
+      "ms": 72408,
+      "error": null
     },
     {
       "page": 2,
@@ -71,9 +73,9 @@
       "gold": "87cb51eb0e99",
       "got": "",
       "ok": false,
-      "raw": "This operation was aborted",
-      "ms": null,
-      "error": "This operation was aborted"
+      "raw": "8b2e9ca1d7",
+      "ms": 98843,
+      "error": null
     },
     {
       "page": 2,
@@ -81,9 +83,9 @@
       "gold": "93c3ced96dac",
       "got": "",
       "ok": false,
-      "raw": "non-json HTTP 503: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endi",
-      "ms": null,
-      "error": "non-json HTTP 503: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endi"
+      "raw": "ecc4c0da5b",
+      "ms": 166938,
+      "error": null
     },
     {
       "page": 2,
@@ -91,19 +93,19 @@
       "gold": "f152ae9bfb8f",
       "got": "",
       "ok": false,
-      "raw": "This operation was aborted",
-      "ms": null,
-      "error": "This operation was aborted"
+      "raw": "a9c4ede0b1",
+      "ms": 98745,
+      "error": null
     },
     {
       "page": 3,
       "dur": 1622,
       "gold": "5a7373d4187f",
-      "got": "",
+      "got": "5d7370d381c8",
       "ok": false,
-      "raw": "non-json HTTP 503: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endi",
-      "ms": null,
-      "error": "non-json HTTP 503: <!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endi"
+      "raw": "5d7370d381c8",
+      "ms": 6716,
+      "error": null
     },
     {
       "page": 3,
@@ -111,8 +113,8 @@
       "gold": "44ea8c7aeedd",
       "got": "",
       "ok": false,
-      "raw": "4eac37aedd",
-      "ms": 45790,
+      "raw": "4ea0c79aedd",
+      "ms": 195132,
       "error": null
     },
     {
@@ -121,18 +123,18 @@
       "gold": "8145b5a0fd46",
       "got": "",
       "ok": false,
-      "raw": "This operation was aborted",
+      "raw": "fetch failed",
       "ms": null,
-      "error": "This operation was aborted"
+      "error": "fetch failed"
     },
     {
       "page": 4,
       "dur": 2921,
       "gold": "b8fce698f971",
-      "got": "",
+      "got": "b0fc26bf97f1",
       "ok": false,
-      "raw": "b0fce68f971",
-      "ms": 22070,
+      "raw": "b0fc26bf97f1",
+      "ms": 5369,
       "error": null
     },
     {
@@ -141,8 +143,8 @@
       "gold": "4a8164556b99",
       "got": "",
       "ok": false,
-      "raw": "a816655b0a",
-      "ms": 29812,
+      "raw": "a3f16e55b0a",
+      "ms": 98074,
       "error": null
     },
     {
@@ -151,11 +153,9 @@
       "gold": "e53112c4b5a4",
       "got": "",
       "ok": false,
-      "raw": "a316a558ba",
-      "ms": 30782,
+      "raw": "a3e16558ba",
+      "ms": 59686,
       "error": null
     }
-  ],
-  "completed": 6,
-  "errors": 9
+  ]
 }

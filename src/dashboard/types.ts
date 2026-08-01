@@ -38,6 +38,7 @@ export interface StatsPayload {
   compressed_minus_passthrough_avg_usd: number;
   split_sufficient_sample: boolean;
   split_min_sample_per_bucket: number;
+  /** Cache-tier-aware input-side dollar savings. */
   saved_usd: number;
   /** Audit coverage: rows in the Claude count_tokens + upstream-usage numerator. */
   measured_anthropic_savings_requests: number;
@@ -159,6 +160,8 @@ export interface FullStatsSummary {
   eventsWithBaseline: number;
   origCharsTotal: number;
   imageBytesTotal: number;
+  pinCharsTotal?: number;
+  pinEvents?: number;
   durationP50: number;
   durationP95: number;
   firstByteP50: number;

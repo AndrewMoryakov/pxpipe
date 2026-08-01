@@ -2,9 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   renderChunkToPng,
   renderTextToPngs,
-  renderTextToPngsMultiCol,
-  multiColWidth,
-  maxFittingCols,
   expandTabsInLine,
   minifyForRender,
   roleSlotSegment,
@@ -31,6 +28,7 @@ import {
   atlasRank,
   ATLAS_CELL_H,
   ATLAS_CELL_W,
+  ATLAS_OFFSETS,
   ATLAS_PIXELS,
   ATLAS_WIDE_FLAGS,
   ATLAS_NUM_GLYPHS,
@@ -45,17 +43,21 @@ import {
 } from './fixtures/real-shapes.js';
 
 describe('model-selectable font atlases', () => {
-  it('uses the JetBrains Mono 10 cell geometry without changing the default atlas', async () => {
+  it('uses native JetBrains Mono cell geometry without changing the default atlas', async () => {
     expect(renderCellWidth({ aa: true })).toBe(5);
     expect(renderCellHeight({ aa: true })).toBe(8);
     expect(renderCellWidth({ font: 'jetbrains-mono-10', aa: true })).toBe(6);
     expect(renderCellHeight({ font: 'jetbrains-mono-10', aa: true })).toBe(11);
+    expect(renderCellWidth({ font: 'jetbrains-mono-12', aa: true })).toBe(8);
+    expect(renderCellHeight({ font: 'jetbrains-mono-12', aa: true })).toBe(13);
+    expect(renderCellWidth({ font: 'jetbrains-mono-14', aa: true })).toBe(9);
+    expect(renderCellHeight({ font: 'jetbrains-mono-14', aa: true })).toBe(16);
 
     const text = 'tokenLedgerShard a3f9c1e0b7d2';
     const defaultImg = await renderChunkToPng(text, 40, { aa: true });
-    const solImg = await renderChunkToPng(text, 40, { font: 'jetbrains-mono-10', aa: true });
+    const solImg = await renderChunkToPng(text, 40, { font: 'jetbrains-mono-12', aa: true });
     expect(defaultImg.width).toBe(208);
-    expect(solImg.width).toBe(248);
+    expect(solImg.width).toBe(328);
     expect(solImg.height).toBeGreaterThan(defaultImg.height);
     expect(Buffer.from(solImg.png)).not.toEqual(Buffer.from(defaultImg.png));
   });
@@ -66,6 +68,59 @@ describe('model-selectable font atlases', () => {
       aa: true,
     });
     expect(img.droppedChars).toBe(0);
+
+    const largerImg = await renderChunkToPng('한글 test', 20, {
+      font: 'jetbrains-mono-12',
+      aa: true,
+    });
+    expect(largerImg.droppedChars).toBe(0);
+  });
+
+});
+
+// Spleen 5×8 glyph-confusability guard. See docs/LEGIBILITY-AUDIT-2026-07-01.md
+// §2: the stock K was 'H' minus one crossbar pixel (Hamming 1), the worst pair
+// in the atlas. gen-atlas.ts now surgeries K to a diagonal-legged bitmap.
+describe('Spleen 5×8 glyph confusability', () => {
+  const decode = (ch: string): Uint8Array => {
+    const rank = atlasRank(ch.codePointAt(0)!);
+    expect(rank).toBeGreaterThanOrEqual(0);
+    const wide = ATLAS_WIDE_FLAGS[rank] === 1;
+    const w = wide ? 2 * ATLAS_CELL_W : ATLAS_CELL_W;
+    const base = ATLAS_OFFSETS[rank]!;
+    const bits = new Uint8Array(w * ATLAS_CELL_H);
+    for (let p = 0; p < bits.length; p++) {
+      const bit = base + p;
+      bits[p] = (ATLAS_PIXELS[bit >>> 3]! >>> (7 - (bit & 7))) & 1;
+    }
+    return bits;
+  };
+  const hamming = (a: Uint8Array, b: Uint8Array): number => {
+    let d = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+    return d;
+  };
+
+  it('renders K far from H (surgery applied)', () => {
+    expect(hamming(decode('K'), decode('H'))).toBeGreaterThanOrEqual(6);
+  });
+
+  it('keeps every alphanumeric pair distinguishable (Hamming ≥ 2)', () => {
+    // Letters and digits are the recall-critical classes (identifiers, hex);
+    // this is where the H/K d=1 defect lived. Punctuation pairs the audit
+    // listed but left unfixed (',;' '.:' at d=1) are out of scope here.
+    const chars =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.split('');
+    const glyphs = chars.map(decode);
+    let worst = { a: '', b: '', d: Infinity };
+    for (let i = 0; i < glyphs.length; i++)
+      for (let j = i + 1; j < glyphs.length; j++) {
+        const d = hamming(glyphs[i]!, glyphs[j]!);
+        if (d < worst.d) worst = { a: chars[i]!, b: chars[j]!, d };
+      }
+    // No two distinct alphanumeric glyphs may collide (d=0) or differ by a
+    // single pixel (d=1, the K/H defect the surgery removed).
+    expect(worst.d, `closest pair '${worst.a}'~'${worst.b}' d=${worst.d}`).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -159,180 +214,6 @@ describe('renderer', () => {
     for (const img of imgs) expect(img.height).toBeLessThanOrEqual(1932);
   });
 
-  // ---- R2 multi-column renderer ------------------------------------------
-  // The multi-col path packs N source columns side-by-side per image so
-  // each image covers numCols×LINES_PER_IMAGE wrapped lines instead of one.
-  // Off by default (numCols=1) — these tests exercise the new path.
-
-  it('multi-col with numCols=1 is byte-identical to renderTextToPngs (default cache contract)', async () => {
-    // The cache_control story depends on identical bytes for identical
-    // inputs. numCols=1 MUST be a pure passthrough so toggling the flag
-    // back to 1 cannot regress cache hit rate.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
-    const single = await renderTextToPngs(text, 100);
-    const passthrough = await renderTextToPngsMultiCol(text, 100, 1);
-    expect(passthrough.length).toBe(single.length);
-    for (let i = 0; i < single.length; i++) {
-      expect(passthrough[i]!.png).toEqual(single[i]!.png);
-    }
-  });
-
-  it('multi-col emits a wider canvas with the predicted dimensions', async () => {
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(8)) + 'final line';
-    const single = await renderTextToPngs(text, 100);
-    const two = await renderTextToPngsMultiCol(text, 100, 2);
-    // numCols=2 with 100-col text content + 4-cell gutter at 5px/cell (5×8 production cell):
-    //   width = 2*PAD_X + 2*100*5 + 1*4*5 = 8 + 1000 + 20 = 1028 px
-    expect(two[0]!.width).toBe(multiColWidth(100, 2));
-    expect(two[0]!.width).toBeGreaterThan(single[0]!.width);
-    expect(two[0]!.width).toBeLessThanOrEqual(2000);
-  });
-
-  it('multi-col halves image count on row-heavy input', async () => {
-    // ~500 lines of narrow content. Single-col packs 240 lines/image →
-    // ~3 images. Two columns should drop that to ~2.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
-    const single = await renderTextToPngs(text, 100);
-    const two = await renderTextToPngsMultiCol(text, 100, 2);
-    expect(single.length).toBeGreaterThanOrEqual(3);
-    // Two-col image count ≤ ceil(single / 2). The +1 slack handles the
-    // pathological case where the boundary lands awkwardly.
-    expect(two.length).toBeLessThanOrEqual(Math.ceil(single.length / 2));
-    for (const img of two) expect(img.height).toBeLessThanOrEqual(1932);
-  });
-
-  it('multi-col render is deterministic (byte-identical across calls)', async () => {
-    const text = ('alpha beta gamma delta epsilon\n'.repeat(400));
-    const a = await renderTextToPngsMultiCol(text, 100, 2);
-    const b = await renderTextToPngsMultiCol(text, 100, 2);
-    expect(a.length).toBe(b.length);
-    for (let i = 0; i < a.length; i++) expect(a[i]!.png).toEqual(b[i]!.png);
-  });
-
-  it('multi-col per-image charsRendered sums to the input codepoint count', async () => {
-    // The honest-savings math (compressedChars in TransformInfo) relies on
-    // sum(charsRendered) matching the input we paid to render. Off-by-one
-    // here would silently mis-report savings.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(400));
-    let cpCount = 0;
-    for (const _ of text) cpCount++;
-    const imgs = await renderTextToPngsMultiCol(text, 100, 2);
-    let total = 0;
-    for (const img of imgs) total += img.charsRendered;
-    expect(total).toBe(cpCount);
-  });
-
-  it('estimateImageCount(numCols=2) tracks actual multi-col image count', async () => {
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
-    const actual = (await renderTextToPngsMultiCol(text, 100, 2)).length;
-    const estimated = estimateImageCount(text, 100, 2);
-    expect(estimated).toBe(actual);
-  });
-
-  it('maxFittingCols clamps an over-wide numCols flag instead of producing >2000px canvases', async () => {
-    // At cols=100 (5 px/cell + 4-cell gutter), the math says:
-    //   1: 508 px, 2: 1028, 3: 1548, 4: 2068 → 4 already exceeds 2000.
-    const fits = maxFittingCols(100);
-    expect(fits).toBe(3);
-    const text = 'short\n'.repeat(10);
-    // numCols=10 → should clamp; output canvas width must stay ≤ 2000.
-    const imgs = await renderTextToPngsMultiCol(text, 100, 10);
-    for (const img of imgs) expect(img.width).toBeLessThanOrEqual(2000);
-  });
-
-  it('multi-col preserves CJK wide-glyph wrap math (no dropped chars on Chinese input)', async () => {
-    // Wide glyphs are 2 cells in both layouts; multi-col must not regress
-    // the wrap math or atlas lookup.
-    const text = ('中文测试 mixed ASCII\n'.repeat(100));
-    const imgs = await renderTextToPngsMultiCol(text, 100, 2);
-    let dropped = 0;
-    for (const img of imgs) dropped += img.droppedChars;
-    expect(dropped).toBe(0);
-  });
-
-  it('multi-col draws a light-gray gutter divider (OCR column-boundary cue)', async () => {
-    // Same "visible whitespace" idea as the U+2192 tab arrow: surface the
-    // column boundary explicitly instead of relying on gap-of-whitespace
-    // alone. The pixel sits at MID-GRAY (~191/255), distinct from both
-    // background (255) and glyph ink (~0), so the vision encoder reads it
-    // as a structural cue without competing with text. Cost is ~one
-    // 1-pixel-wide column of identical gray that DEFLATE-collapses to ~5
-    // bytes per gutter.
-    //
-    // Verification: inflate the IDAT chunks of the rendered PNG, locate the
-    // expected divider x-coordinate (middle of the gutter between cols 0
-    // and 1), and assert at least 80% of rows at that x are mid-gray.
-    const zlib = await import('node:zlib');
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(200));
-    const imgs = await renderTextToPngsMultiCol(text, 100, 2);
-    expect(imgs.length).toBeGreaterThan(0);
-    const img = imgs[0]!;
-
-    // PNG layout: 8-byte signature, then chunks of (length-be32, type-4b,
-    // data, crc-be32). IHDR is first; concat all IDATs and inflate. The
-    // inflated stream has a 1-byte filter prefix per row; for grayscale our
-    // encoder always writes filter type 0 (none) so the row body is just
-    // the raw width bytes.
-    const png = img.png;
-    let pos = 8;
-    const idats: Uint8Array[] = [];
-    while (pos < png.length) {
-      const len =
-        (png[pos]! << 24) | (png[pos + 1]! << 16) | (png[pos + 2]! << 8) | png[pos + 3]!;
-      const type = String.fromCharCode(png[pos + 4]!, png[pos + 5]!, png[pos + 6]!, png[pos + 7]!);
-      const dataStart = pos + 8;
-      if (type === 'IDAT') idats.push(png.subarray(dataStart, dataStart + len));
-      if (type === 'IEND') break;
-      pos = dataStart + len + 4;
-    }
-    const concatenated = Buffer.concat(idats.map((u) => Buffer.from(u)));
-    const inflated = zlib.inflateSync(concatenated);
-
-    // Decode: each row is 1 filter byte + width pixel bytes. We expect
-    // filter=0 (none) on every row from our encoder, so the pixel-byte
-    // index for (x, y) is `y * (width + 1) + 1 + x`.
-    const width = img.width;
-    const height = img.height;
-    // Divider X: end of col 0's text area + half the gutter.
-    //   colEnd = PAD_X (4) + 0 * stride + 100 * 7 = 704
-    //   dividerX = 704 + floor((4 * 7) / 2) = 704 + 14 = 718
-    const PAD_X = 4;
-    const GUTTER_CELLS = 4;
-    const cols = 100;
-    const dividerX =
-      PAD_X + 0 + cols * CELL_W + Math.floor((GUTTER_CELLS * CELL_W) / 2);
-    expect(dividerX).toBeLessThan(width);
-
-    let midGrayRows = 0;
-    const rowStride = width + 1;
-    for (let y = 2; y < height - 2; y++) {
-      const px = inflated[y * rowStride + 1 + dividerX];
-      // GUTTER_DIVIDER_INK=64 pre-invert → 191 post-invert. Allow a small
-      // band in case the constant is tuned later — anywhere in [120, 230]
-      // is "mid-gray, not full ink, not background".
-      if (px !== undefined && px >= 120 && px <= 230) midGrayRows++;
-    }
-    // Most rows at the divider column should be mid-gray. The inset trims a
-    // few top/bottom pixels and there might be glyph encroachments on a
-    // handful of rows in pathological content, but >80% is the floor.
-    const liveRows = height - 4;
-    expect(midGrayRows).toBeGreaterThan(liveRows * 0.8);
-  });
-
-  it('multi-col single-column path skips the divider (byte-identical to renderTextToPngs)', async () => {
-    // The divider only paints when numCols >= 2. The numCols=1 passthrough
-    // path must remain byte-identical to the single-col renderer so the
-    // cache-control deterministic-bytes story stays intact for single-col
-    // deployments.
-    const text = ('lorem ipsum dolor sit amet\n'.repeat(100));
-    const passthrough = await renderTextToPngsMultiCol(text, 100, 1);
-    const single = await renderTextToPngs(text, 100);
-    expect(passthrough.length).toBe(single.length);
-    for (let i = 0; i < passthrough.length; i++) {
-      expect(passthrough[i]!.png).toEqual(single[i]!.png);
-    }
-  });
-
   // ---- Unicode coverage tests (hybrid atlas fallback) -------------------------------
   // These confirm the sparse-codepoint + wide-glyph machinery works end-to-end.
   // None of them assert specific PNG bytes (the byte-deterministic guarantee
@@ -363,15 +244,24 @@ describe('renderer', () => {
     expect(img.droppedChars).toBe(0);
   });
 
-  it('treats codepoints outside the atlas as dropped (e.g. emoji)', async () => {
+  it('escapes codepoints outside the atlas instead of dropping them (e.g. emoji)', async () => {
     // 😀 is U+1F600 — Supplementary Plane, not in BMP. Even `full-bmp` profile
-    // wouldn't cover it. Renderer must advance by 1 cell and bump the counter,
-    // not crash on the surrogate pair.
+    // wouldn't cover it. It renders as the lossless ASCII escape [U+1F600]
+    // (see escapeMissingGlyphs), not as a blank cell — and must not crash on
+    // the surrogate pair.
     const img = await renderChunkToPng('hi 😀 world');
-    expect(img.droppedChars).toBe(1);
-    // charsRendered counts codepoints, NOT UTF-16 units — the emoji is one
-    // codepoint even though it occupies two UTF-16 units.
+    expect(img.droppedChars).toBe(0);
+    // charsRendered counts SOURCE codepoints, NOT UTF-16 units — the emoji is
+    // one codepoint even though it occupies two UTF-16 units.
     expect(img.charsRendered).toBe(10); // 'hi ' (3) + 😀 (1) + ' world' (6) = 10
+  });
+
+  it('treats escape-exempt invisibles as dropped with 1-cell advance (e.g. VS16)', async () => {
+    // U+FE0F (variation selector-16) is deliberately NOT escaped — it's an
+    // emoji presentation modifier, noise if spelled out. Renderer must advance
+    // by 1 cell and bump the counter.
+    const img = await renderChunkToPng('hi ️ world');
+    expect(img.droppedChars).toBe(1);
   });
 
   it('CJK characters advance two cells; mixed lines wrap correctly', async () => {
@@ -496,21 +386,21 @@ describe('renderer', () => {
   });
 
   it('droppedCodepoints map is populated correctly when drops occur', async () => {
-    // 😀 is supplementary-plane (not in atlas regardless of profile). The
-    // codepoint should appear in the map with count 1; charsRendered counts
-    // it as a single codepoint.
-    const img = await renderChunkToPng('hi 😀 there');
+    // Emoji now escape to [U+HEX] instead of dropping, so the drop path is
+    // exercised via an escape-EXEMPT codepoint: U+FE0F (variation selector).
+    // The codepoint should appear in the map with count 1.
+    const img = await renderChunkToPng('hi ️ there');
     expect(img.droppedChars).toBe(1);
     expect(img.droppedCodepoints.size).toBe(1);
-    expect(img.droppedCodepoints.get(0x1f600)).toBe(1);
+    expect(img.droppedCodepoints.get(0xfe0f)).toBe(1);
   });
 
   it('droppedCodepoints tallies repeat drops correctly', async () => {
-    // Three occurrences of the same dropped codepoint → count 3.
-    const img = await renderChunkToPng('😀😀😀');
+    // Three occurrences of the same dropped (exempt) codepoint → count 3.
+    const img = await renderChunkToPng('a️b️c️');
     expect(img.droppedChars).toBe(3);
     expect(img.droppedCodepoints.size).toBe(1);
-    expect(img.droppedCodepoints.get(0x1f600)).toBe(3);
+    expect(img.droppedCodepoints.get(0xfe0f)).toBe(3);
   });
 
   // --- Whitespace minify (HANDOFF R1) ---------------------------------------
@@ -803,9 +693,9 @@ describe('transform', () => {
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]
-    // keeps the structural contract (type/properties/required/enum) for the
-    // validator, annotations (description/default/$schema) move into the
-    // imaged reference where they cost image rates.
+    // keeps the structural contract (type/properties/required/enum) AND the
+    // `$schema` dialect declaration for the validator; annotations
+    // (description/default) move into the imaged reference at image rates.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -877,9 +767,11 @@ describe('transform', () => {
     expect(Object.keys(s0.properties)).toEqual(['file_path', 'mode']);
     expect(s0.required).toEqual(['file_path']);
     expect(s0.properties.mode.enum).toEqual(['read', 'binary']);
-    // Annotations are stripped from tools[] everywhere in the tree.
+    // Annotations are stripped from tools[] everywhere in the tree — but the
+    // `$schema` dialect declaration survives (stripping it re-dialects a
+    // draft-07 schema to 2020-12 and the validator 400s legal draft-07 syntax).
     expect(JSON.stringify(s0)).not.toContain('description');
-    expect(s0.$schema).toBeUndefined();
+    expect(s0.$schema).toBe('http://json-schema.org/draft-07/schema#');
     expect(s0.properties.mode.default).toBeUndefined();
     const s1 = out.tools[1].input_schema;
     expect(s1.required).toEqual(['command']);
@@ -893,6 +785,67 @@ describe('transform', () => {
     // Stubs cite the reference heading.
     expect(out.tools[0].description).toContain('"## Tool: Read"');
     expect(out.tools[1].description).toContain('"## Tool: Bash"');
+  });
+
+  it('keeps $schema so draft-07 tuple items stay valid under the declared dialect', async () => {
+    // Regression (2026-07-05): Voiceflow MCP's voiceflow_transcript declares
+    // draft-07 and uses tuple-form `items: [...]`, which is illegal in the
+    // API's default dialect (2020-12, where tuples are `prefixItems`).
+    // Stripping `$schema` re-dialected the schema and every compressed request
+    // 400'd: "tools.N.custom.input_schema: JSON schema is invalid. It must
+    // match JSON Schema draft 2020-12". Passthrough of the same schema is
+    // accepted — so the transform must keep the declaration.
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          name: 'voiceflow_transcript',
+          description: 'Search transcripts',
+          input_schema: {
+            $schema: 'http://json-schema.org/draft-07/schema#',
+            type: 'object',
+            properties: {
+              filters: {
+                type: 'array',
+                items: {
+                  oneOf: [
+                    {
+                      type: 'object',
+                      properties: {
+                        op: { type: 'string', enum: ['between'], description: 'operator' },
+                        // draft-07 tuple validation — array-form `items`.
+                        value: {
+                          type: 'array',
+                          items: [
+                            { type: 'number', description: 'lower bound' },
+                            { type: 'number', description: 'upper bound' },
+                          ],
+                        },
+                      },
+                      required: ['op', 'value'],
+                    },
+                  ],
+                },
+              },
+            },
+            required: ['filters'],
+          },
+        },
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+    const s = out.tools[0].input_schema;
+    // Dialect declaration survives — the tuple `items` stays legal.
+    expect(s.$schema).toBe('http://json-schema.org/draft-07/schema#');
+    const between = s.properties.filters.items.oneOf[0];
+    expect(Array.isArray(between.properties.value.items)).toBe(true);
+    expect(between.properties.value.items).toEqual([{ type: 'number' }, { type: 'number' }]);
+    // Annotations still stripped.
+    expect(between.properties.op.description).toBeUndefined();
   });
 
   it('passes a bare {type:"object"} schema through with no advisory', async () => {
@@ -924,6 +877,73 @@ describe('transform', () => {
     const { body } = await transformRequest(new TextEncoder().encode(req));
     const out = JSON.parse(new TextDecoder().decode(body));
     expect('input_schema' in out.tools[0]).toBe(false);
+  });
+
+  // #43: Anthropic's native server-side tools (versioned `type`, e.g.
+  // advisor_20260301, web_search_20250305) have a fixed API schema that rejects
+  // a `description` field on the tool entry ("Extra inputs are not permitted"
+  // → 400). Only client-defined tools (no `type`, or explicit type:"custom")
+  // may be stubbed and imaged; everything else must pass through byte-identical.
+  it('passes native typed tools through untouched and keeps them out of the imaged reference (#43)', async () => {
+    const nativeAdvisor = { type: 'advisor_20260301', name: 'advisor' };
+    const nativeSearch = { type: 'web_search_20250305', name: 'web_search', max_uses: 3 };
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          name: 'BigTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+        nativeAdvisor,
+        nativeSearch,
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+
+    // Client tool alongside is still compressed — the guard must not disable
+    // the rewrite for the rest of the array.
+    expect(out.tools[0].description).toContain('"## Tool: BigTool"');
+
+    // Native typed entries: byte-identical passthrough. Any injected key
+    // (description, input_schema, …) is a 400 upstream.
+    expect(out.tools[1]).toEqual(nativeAdvisor);
+    expect(out.tools[2]).toEqual(nativeSearch);
+
+    // And they contribute nothing to the imaged Tool Reference — their docs
+    // live server-side; an empty "## Tool: <name>" heading is pure noise.
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).toContain('## Tool: BigTool');
+    expect(imgSrc).not.toContain('## Tool: advisor');
+    expect(imgSrc).not.toContain('## Tool: web_search');
+  });
+
+  it('still rewrites explicit type:"custom" tools (#43 guard must not over-block)', async () => {
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          type: 'custom',
+          name: 'CustomTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+    // type:"custom" is the client-defined shape — it accepts description, so it
+    // gets the same stub-and-image treatment as untyped entries.
+    expect(out.tools[0].type).toBe('custom');
+    expect(out.tools[0].description).toContain('"## Tool: CustomTool"');
+    expect(info.imageSourceText ?? '').toContain('## Tool: CustomTool');
   });
 
   // Snapshot-style tests against real-world Claude Code tool schemas.
@@ -1652,77 +1672,10 @@ describe('transform', () => {
     expect(cached.length).toBe(0);
   });
 
-  it('compresses long <system-reminder> blocks in the first user message', async () => {
-    // 'a long policy note. ' = 20 chars. 1550× = 31k chars + reminder tags
-    // — past the 14k minReminderChars threshold AND past the multi-col
-    // 1-image break-even (~30.7k chars at n=2, 7×10 cell).
-    // 1550 × 20 = 31,000 chars → 310 visual rows → 1 image at n=2 (capacity 312 rows)
-    // image cost 7665 tokens < text cost 31000/4=7750 → profitable.
-    const reminder = '<system-reminder>\n' + 'a long policy note. '.repeat(1550) + '\n</system-reminder>';
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        model: 'claude',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: 'real user prompt' },
-              { type: 'text', text: reminder },
-            ],
-          },
-        ],
-        system: 'x'.repeat(150000),
-      }),
-    );
-    const { body: outBytes, info } = await transformRequest(body);
-    expect(info.reminderImgs).toBeGreaterThanOrEqual(1);
-
-    const out = JSON.parse(new TextDecoder().decode(outBytes));
-    const content = out.messages[0].content as any[];
-    // Reminder text must NOT appear as a text block anymore.
-    for (const b of content) {
-      if (b.type === 'text') expect(b.text).not.toContain('<system-reminder>');
-    }
-    // But the user's actual prompt must still be there.
-    const userTexts = content.filter((b: any) => b.type === 'text').map((b: any) => b.text);
-    expect(userTexts.some((t: string) => t.includes('real user prompt'))).toBe(true);
-
-    // Reminder images carry NO cache_control (only the system+tools image
-    // does — Anthropic caps at 4 breakpoints).
-    const reminderImageBlocks = content.filter(
-      (b: any) => b.type === 'image' && !b.cache_control,
-    );
-    expect(reminderImageBlocks.length).toBeGreaterThanOrEqual(info.reminderImgs ?? 0);
-  });
-
-  it('leaves short <system-reminder> blocks alone (below minReminderChars)', async () => {
-    const shortReminder = '<system-reminder>\nshort note\n</system-reminder>';
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        model: 'claude',
-        messages: [
-          {
-            role: 'user',
-            content: [{ type: 'text', text: shortReminder }],
-          },
-        ],
-        system: 'x'.repeat(150000),
-      }),
-    );
-    const { body: outBytes, info } = await transformRequest(body);
-    expect(info.reminderImgs ?? 0).toBe(0);
-    const out = JSON.parse(new TextDecoder().decode(outBytes));
-    const allText = (out.messages[0].content as any[])
-      .filter((b: any) => b.type === 'text')
-      .map((b: any) => b.text)
-      .join('\n');
-    expect(allText).toContain('<system-reminder>');
-  });
-
   it('compresses large tool_result text content across user messages', async () => {
     // 'output line. ' = 13 chars × 2400 = 31.2k chars — past minToolResultChars
-    // (14k) AND past the multi-col 1-image break-even (~30.7k chars at n=2, 7×10 cell).
-    // 2400 × 13 = 31,200 chars → 312 visual rows → 1 image at n=2 (capacity 312 rows)
+    // (14k) and past the one-image break-even.
+    // 2400 × 13 = 31,200 chars → 312 visual rows → 1 image (capacity 312 rows)
     // image cost 7665 tokens < text cost 31200/4=7800 → profitable.
     const bigResult = 'output line. '.repeat(2400);
     const body = new TextEncoder().encode(
@@ -1793,17 +1746,19 @@ describe('transform', () => {
   // capture & inspect the request body.
 
   it('populates droppedCodepointsTop when drops occur, sorted by count', async () => {
-    // System slab forces compression. The slab contains drops for two distinct
-    // supplementary-plane codepoints at different rates so we can verify the
-    // sort order.
-    const cpA = String.fromCodePoint(0x1f600); // 😀
-    const cpB = String.fromCodePoint(0x1f604); // 😄
-    const cpC = String.fromCodePoint(0x1f60a); // 😊
+    // System slab forces compression. Emoji now escape to [U+HEX] instead of
+    // dropping, so the drop path is exercised via escape-EXEMPT codepoints:
+    // plane-14 variation selectors (U+E01xx — astral, guaranteed absent from
+    // the BMP atlas, and deliberately never escaped). Three distinct
+    // codepoints at different rates so we can verify the sort order.
+    const cpA = String.fromCodePoint(0xe0100);
+    const cpB = String.fromCodePoint(0xe0104);
+    const cpC = String.fromCodePoint(0xe010a);
     const sys =
       'x'.repeat(150000) + // bulk to force compression
-      '\n' + cpA.repeat(10) +  // 10 drops of U+1F600
-      '\n' + cpB.repeat(3) +   // 3  drops of U+1F604
-      '\n' + cpC.repeat(1);    // 1  drop  of U+1F60A
+      '\n' + cpA.repeat(10) +  // 10 drops of U+E0100
+      '\n' + cpB.repeat(3) +   // 3  drops of U+E0104
+      '\n' + cpC.repeat(1);    // 1  drop  of U+E010A
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -1814,9 +1769,9 @@ describe('transform', () => {
     expect(info.droppedChars).toBeGreaterThanOrEqual(14);
     expect(info.droppedCodepointsTop).toBeDefined();
     const top = info.droppedCodepointsTop!;
-    expect(top['U+1F600']).toBe(10);
-    expect(top['U+1F604']).toBe(3);
-    expect(top['U+1F60A']).toBe(1);
+    expect(top['U+E0100']).toBe(10);
+    expect(top['U+E0104']).toBe(3);
+    expect(top['U+E010A']).toBe(1);
     // Ensure key format is the expected U+HHHH uppercase with no surprises.
     for (const k of Object.keys(top)) {
       expect(k).toMatch(/^U\+[0-9A-F]{4,}$/);
@@ -1824,7 +1779,7 @@ describe('transform', () => {
     // Sorted by count desc: iteration of object keys preserves insertion order
     // in V8/JSC, so the first key is the highest-count drop.
     const keys = Object.keys(top);
-    expect(keys[0]).toBe('U+1F600');
+    expect(keys[0]).toBe('U+E0100');
   });
 
   it('omits droppedCodepointsTop entirely when no drops occur', async () => {
@@ -1841,13 +1796,15 @@ describe('transform', () => {
   });
 
   it('caps droppedCodepointsTop at 20 entries', async () => {
-    // 25 distinct supplementary-plane codepoints, each appearing N times so
-    // we can verify the cap drops the smallest counts.
+    // 25 distinct escape-exempt codepoints (plane-14 variation selectors —
+    // astral, so guaranteed atlas misses; exempt, so guaranteed drops rather
+    // than [U+HEX] escapes), each appearing N times so we can verify the cap
+    // drops the smallest counts.
     let payload = 'x'.repeat(150000) + '\n';
     for (let i = 0; i < 25; i++) {
-      // U+1F300..U+1F318 — 25 distinct codepoints, each occurring (25 - i) times
-      // so U+1F300 occurs 25 times, U+1F318 occurs 1 time.
-      payload += String.fromCodePoint(0x1f300 + i).repeat(25 - i);
+      // U+E0100..U+E0118 — 25 distinct codepoints, each occurring (25 - i) times
+      // so U+E0100 occurs 25 times, U+E0118 occurs 1 time.
+      payload += String.fromCodePoint(0xe0100 + i).repeat(25 - i);
     }
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
@@ -1861,11 +1818,11 @@ describe('transform', () => {
     // The 5 smallest-count codepoints (last in the input) must be dropped
     // from the top-20.
     for (let i = 20; i < 25; i++) {
-      const hex = (0x1f300 + i).toString(16).toUpperCase().padStart(4, '0');
+      const hex = (0xe0100 + i).toString(16).toUpperCase().padStart(4, '0');
       expect(top[`U+${hex}`]).toBeUndefined();
     }
     // The top entry is the most-frequent.
-    expect(top['U+1F300']).toBe(25);
+    expect(top['U+E0100']).toBe(25);
   });
 
   // --- Per-block break-even gate (URGENT slice, supersedes prior threshold tests) ---
@@ -1921,7 +1878,7 @@ describe('transform', () => {
   // (textEq=42_408) while actual upstream billed 148_891 tokens (ch/tok=
   // 1.14). With the override (1.14 ch/tok), the gate flips to ACCEPT.
 
-  it('isCompressionProfitable: live α≈0.88 (1.14 ch/tok) flips a single-image slab at numCols=1', () => {
+  it('isCompressionProfitable: live α≈0.88 (1.14 ch/tok) flips a single-image slab', () => {
     // A dense 6060-char slab (60 long lines, no big newline penalty) that:
     //   • At default 4 ch/tok: textEq = 6060/4 = 1515 < imgCost 2500 → REJECT
     //   • At live α=1.14:      textEq = 6060/1.14 ≈ 5316 > imgCost 2500 → ACCEPT
@@ -1930,8 +1887,8 @@ describe('transform', () => {
     // pull net-loser blocks across the line on lighter content).
     const line = 'A'.repeat(100) + '\n';
     const slab = line.repeat(60); // 6060 chars, fits in 1 image at cols=100
-    expect(isCompressionProfitable(slab, 100, undefined, 1, 4)).toBe(true);
-    expect(isCompressionProfitable(slab, 100, undefined, 1, 1.14)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 4)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 1.14)).toBe(true);
   });
 
   it('isCompressionProfitable: defensive clamp on bogus chars/token (≤0 / NaN → falls back to 4)', () => {
@@ -1939,10 +1896,10 @@ describe('transform', () => {
     // decisions. The function falls back to CHARS_PER_TOKEN=4 silently.
     // Confirm: a 5000-char input is rejected at 4 ch/tok regardless of
     // whether we pass 0, -1, NaN, or Infinity.
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, 0)).toBe(true);
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, -1)).toBe(true);
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, NaN)).toBe(true);
-    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 1, Infinity)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, 0)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, -1)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, NaN)).toBe(true);
+    expect(isCompressionProfitable('a'.repeat(5000), 100, undefined, Infinity)).toBe(true);
   });
 
   // --- Slab-specific cpt: built-in 2.0 cpt unlocks production-shape slabs ---
@@ -1958,7 +1915,7 @@ describe('transform', () => {
   it('transformRequest: production-shape 161k slab compresses without an explicit cpt override', async () => {
     // Build a dense ~161k-char slab matching the production passthrough event
     // (orig_chars=161101). 60-100 char lines, modest blank density —
-    // representative of system + tool-doc slab shape under multi-col=2.
+    // representative of a production system + tool-doc slab shape.
     const parts: string[] = [];
     let acc = 0;
     const target = 161_101;
@@ -1975,18 +1932,17 @@ describe('transform', () => {
     });
     const bytes = new TextEncoder().encode(req);
 
-    // No host-supplied cpt: built-in SLAB_CHARS_PER_TOKEN flips this to ACCEPT
-    // at multi-col=2 (production default). This is the regression guard for
+    // No host-supplied cpt: built-in SLAB_CHARS_PER_TOKEN flips this to ACCEPT.
+    // This is the regression guard for
     // the 2026-05-20 zero-compression production bug.
-    const out = await transformRequest(bytes, { multiCol: 2 });
+    const out = await transformRequest(bytes);
     expect(out.info.compressed).toBe(true);
     expect(out.info.imageCount ?? 0).toBeGreaterThan(0);
   });
 
   it('isCompressionProfitable: 7x10 atlas makes a 161k production-shape slab profitable at cpt=2', () => {
     // With 7×10 atlas (CELL_H=10): LINES_PER_IMAGE=156, MaxCharsPerImage=15600.
-    // At numCols=2: images = ceil(rows/312). The 161k slab has ~2001 rows →
-    // ceil(2001/312)=7 images. imageCost = 7 × 7665 = 53,655 tokens.
+    // The single-column gate uses the production renderer geometry.
     // At cpt=2 (SLAB_CHARS_PER_TOKEN): text = 161101/2 = 80,550 → profitable.
     // At cpt=4: text = 161101/4 = 40,275 < 53,655 → NOT profitable.
     const parts: string[] = [];
@@ -1997,8 +1953,8 @@ describe('transform', () => {
       acc += len + 1;
     }
     const slab = parts.join('\n').slice(0, 161_101);
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 2)).toBe(true);
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 2.5)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 2)).toBe(true);
+    expect(isCompressionProfitable(slab, 100, undefined, 2.5)).toBe(true);
   });
 
   // --- Adaptive break-even: CHARS_PER_IMAGE derived from atlas cell, not hardcoded ---
@@ -2096,21 +2052,6 @@ describe('transform', () => {
       (b) => b.type === 'tool_result',
     );
     expect(Array.isArray(tr!.content)).toBe(true);
-  });
-
-  it('break-even gate: 25000-char reminder images (above threshold and profitable)', async () => {
-    // With charsPerToken=2 (dense code/log), profitable: textCost=12500 vs imgCost=2*3484=6968.
-    const reminder = '<system-reminder>' + 'x'.repeat(25000) + '</system-reminder>';
-    const req = JSON.stringify({
-      model: 'claude-3-5-sonnet',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: reminder }] },
-      ],
-      system: 'x'.repeat(150000),
-    });
-    const { info } = await transformRequest(new TextEncoder().encode(req), { charsPerToken: 2 });
-    expect(info.compressed).toBe(true);
-    expect((info.reminderImgs ?? 0)).toBeGreaterThan(0);
   });
 
   it('break-even gate: passthroughReasons omitted when no passthrough happened', async () => {
@@ -2338,17 +2279,17 @@ describe('transform', () => {
     // the *constants*. Refresh the shape constants from a fresh events.jsonl
     // when that happens; see tests/fixtures/real-shapes.ts.
 
-    it('production slab (161k chars, multi-col): ACCEPTED at slab cpt=2.0', () => {
+    it('production slab (161k chars): ACCEPTED at slab cpt=2.0', () => {
       const shape = PRODUCTION_SLAB_161K;
       const text = synthesizeText(shape);
       // The body that motivated the cpt calibration. Conservative cpt=4 would
       // reject many dense slabs under the older geometry; cpt=2.0 reflects
       // Opus 4.7 telemetry and keeps this shape accepted with margin.
       expect(
-        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+        isCompressionProfitable(text, 100, undefined, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
       // Default cpt=4 must still REJECT — proves the constant is what flips it.
-      expect(isCompressionProfitable(text, 100, undefined, shape.numCols)).toBe(true);
+      expect(isCompressionProfitable(text, 100)).toBe(true);
     });
 
     it('production slab (135k chars, newline-heavy): synthetic shape REJECTED at slab cpt=2.0', () => {
@@ -2361,7 +2302,7 @@ describe('transform', () => {
       // fixture pins the gate's decision on the *synthetic* shape — see the
       // comment in real-shapes.ts for why this divergence is expected.
       expect(
-        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+        isCompressionProfitable(text, 100, undefined, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
     });
 
@@ -2370,10 +2311,10 @@ describe('transform', () => {
       const text = synthesizeText(shape);
       // The largest real-event shape we logged. Even at cpt=2.0 the body
       // (169632/2.0 = 84816 tok) doesn't clear the image cost (37 imgs × 5500
-      // × 2 = 407k tok at multiCol=2). Gate stays conservative — the
+      // in the production geometry). Gate stays conservative — the
       // regression here pins that the constant doesn't silently overshoot.
       expect(
-        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+        isCompressionProfitable(text, 100, undefined, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
     });
 

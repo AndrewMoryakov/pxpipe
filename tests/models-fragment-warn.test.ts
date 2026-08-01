@@ -10,7 +10,7 @@ const BELOW_BAR = ['claude-opus-4-8', 'claude-opus-4-7', 'gpt-5.5', 'gpt-5.6-sol
 /** Extract the <button> for one model id from rendered html. */
 function chip(html: string, id: string): string {
   const esc = id.replace(/\./g, '\\.');
-  return html.match(new RegExp(`<button[^>]*"model":"${esc}"[^>]*>[^<]*</button>`))?.[0] ?? '';
+  return html.match(new RegExp(`<button[^>]*&quot;model&quot;:&quot;${esc}&quot;[^>]*>[^<]*</button>`))?.[0] ?? '';
 }
 
 describe('renderModelsFragment — readiness-tiered warnings', () => {

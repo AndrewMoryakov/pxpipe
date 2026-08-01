@@ -19,7 +19,7 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
-import { renderPage } from '../src/dashboard/fragments.js';
+import { renderHeaderFragment, renderPage } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -58,6 +58,7 @@ beforeEach(() => {
   dash = new DashboardState(tmp, async () => new Map());
 });
 afterEach(() => {
+  setAllowedModelBases(null);
   try {
     fs.rmSync(path.dirname(tmp.eventsFile), { recursive: true, force: true });
   } catch {
@@ -203,7 +204,7 @@ describe('serveFragment', () => {
 
     // A different model/session is explicitly excluded from the cohort.
     dash.update({
-      path: '/v1/messages', model: 'claude-sonnet-5', usage: { input_tokens: 10 },
+      path: '/v1/messages', model: 'claude-fable-5', usage: { input_tokens: 10 },
       info: { compressed: false, firstUserSha8: 'session-b' },
     } as never);
 
@@ -258,10 +259,12 @@ describe('serveFragment', () => {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(off).toContain('Image GPT models');
+      expect(off).toContain('Image OpenAI Responses models');
       expect(off).not.toContain('<div class="models" style="display:none">');
+
       expect(off).toContain('>GPT 5.6</button>');
       expect(off).toContain('GPT 5.6 Terra</button>');
+
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
       expect(off.indexOf('GPT 5.6 Terra')).toBeLessThan(off.indexOf('GPT 5.6 Sol'));
@@ -281,6 +284,66 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('gpt-5.5');
       expect(getAllowedModelBases()).toContain('gpt-5.6-terra');
       expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
+      // Chip flips are reflected back into the textbox CSV.
+      expect(onBoth).toContain('value="claude-fable-5,claude-opus-5,gemini-3.6-flash,gpt-5.6-terra,gpt-5.6-sol,gpt-5.5"');
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
+  it('replaces the whole scope from the PXPIPE_MODELS textbox CSV', async () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      dash.handleModelsSet(' claude-fable-5 , grok-4.5 ,');
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'grok-4.5']);
+      const html = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(html).toContain('value="claude-fable-5,grok-4.5"');
+      expect(html).toContain('Grok 4.5 ✓');
+      // Same falsey vocabulary as the env var: off/false/0 → compress nothing.
+      dash.handleModelsSet('off');
+      expect(getAllowedModelBases()).toEqual([]);
+      dash.handleModelsSet('');
+      expect(getAllowedModelBases()).toEqual([]);
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
+  it('invokes the host persistence hook on scope mutations', () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      setAllowedModelBases(null);
+      const saved: string[][] = [];
+      const persisting = new DashboardState(tmp, async () => new Map(), (bases) => {
+        saved.push([...bases]);
+      });
+
+      persisting.handleModelsToggle('gpt-5.6-sol', true);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'claude-opus-5', 'gemini-3.6-flash', 'gpt-5.6-sol']);
+      persisting.handleModelsSet('claude-fable-5');
+      expect(saved.at(-1)).toEqual(['claude-fable-5']);
+      // Empty scope persists too (round-trips as 'off' on load).
+      persisting.handleModelsSet('off');
+      expect(saved.at(-1)).toEqual([]);
+      expect(saved).toHaveLength(3);
+
+      // A throwing hook must not break the live flip or the endpoint.
+      const throwing = new DashboardState(tmp, async () => new Map(), () => {
+        throw new Error('disk full');
+      });
+      throwing.handleModelsToggle('gpt-5.5', true);
+      expect(getAllowedModelBases()).toContain('gpt-5.5');
+
+      // No hook (legacy/Worker host) keeps the old in-memory behavior.
+      const bare = new DashboardState(tmp, async () => new Map());
+      bare.handleModelsToggle('grok-4.5', true);
+      expect(getAllowedModelBases()).toContain('grok-4.5');
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -330,7 +393,7 @@ describe('serveFragment', () => {
     expect(html).toContain('Native tool JSON');
     expect(html).toContain('Function outputs eligible in old closed pairs');
     expect(html).toContain('Function outputs actually imaged this request');
-    expect(html).toContain('Adjacent completed pairs');
+    expect(html).toContain('Completed tool pairs');
     expect(html).toContain('Open calls kept native');
     expect(html).toContain('56.0k tok');
     expect(html).toContain('sent to gpt-5.6-sol');
@@ -407,6 +470,23 @@ describe('dashboard page help UI', () => {
     expect(html).toContain('d.toggleAttribute(\'open\', state.open)');
     expect(html).toContain('position: sticky; top: 0; z-index: 200');
   });
+
+  it('compares imaged requests with their own without-pxpipe counterfactual', () => {
+    const html = renderHeaderFragment({
+      compressed_paid_requests: 600,
+      compressed_actual_usd: 96.42,
+      compressed_avg_usd_per_request: 0.1607,
+      passthrough_paid_requests: 36,
+      passthrough_actual_usd: 2.5992,
+      passthrough_avg_usd_per_request: 0.0722,
+      saved_usd: 194.83,
+      pricing_assumptions: { input_per_mtok: 10, output_multiplier: 5 },
+    } as StatsPayload, 47821);
+
+    expect(html).toContain('Observed path cost index');
+    expect(html).toContain('16,070');
+    expect(html).not.toContain('without pxpipe');
+  });
 });
 
 // ---- GPT (OpenAI) savings split ------------------------------------------
@@ -415,6 +495,10 @@ describe('dashboard page help UI', () => {
 // GPT branch in update()/replay(): vision-token actual vs o200k text-token
 // baseline, 0.1× automatic prefix cache, no count_tokens probe.
 describe('GPT savings split', () => {
+  beforeEach(() => {
+    setAllowedModelBases(['gpt-5.5']);
+  });
+
   // Imaged 50k o200k text tokens down to 8k vision tokens, with a 2k cached
   // prefix served at 0.1×:
   //   actual   = (10000 - 2000) + 2000×0.1               = 8200
@@ -449,12 +533,14 @@ describe('GPT savings split', () => {
     expect(stats.saved_pct_input_only).toBeGreaterThan(0);
   });
 
+
   it('separates measured Claude from modeled OpenAI savings and counts usage-bearing responses', async () => {
+    setAllowedModelBases(['gpt-5.5', 'claude-fable-5']);
     dash.update(structuredClone(gptUpdate) as never); // modeled OpenAI: 4,200
     dash.update({
       method: 'POST',
       path: '/v1/messages',
-      model: 'claude-sonnet-5',
+      model: 'claude-fable-5',
       status: 200,
       durationMs: 100,
       usage: { input_tokens: 400, output_tokens: 10 },
@@ -478,6 +564,7 @@ describe('GPT savings split', () => {
     expect(stats.estimated_openai_savings_requests).toBe(1);
     expect(stats.usage_bearing_responses).toBe(2);
     expect(stats.all_usage_requests).toBe(stats.usage_bearing_responses);
+
   });
 
   it('populates As-text / Sent / Cache-hits / Saved recent columns for GPT', async () => {
@@ -532,6 +619,61 @@ describe('GPT savings split', () => {
     expect(recent.recent.at(-1)!.session_saved_so_far_delta ?? 0).toBe(0);
   });
 
+  it('uses the Anthropic 1-hour cache-write split in dashboard savings', async () => {
+    setAllowedModelBases(['claude-fable-5']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-fable-5-20260609', status: 200,
+      durationMs: 1,
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 2000,
+        cache_read_input_tokens: 0,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 0,
+          ephemeral_1h_input_tokens: 2000,
+        },
+      },
+      info: {
+        compressed: true,
+        baselineTokens: 10000,
+        baselineCacheableTokens: 9000,
+        baselineProbeStatus: 'ok',
+        firstUserSha8: 'onehour',
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.actual_input_weighted).toBe(5000);
+    expect(stats.baseline_input_weighted).toBe(19000);
+    expect(stats.saved_input_tokens).toBe(14000);
+    expect(stats.saved_usd).toBe(0.14);
+  });
+
+  it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
+    writeEvents(tmp, [
+      ev({
+        model: 'claude-fable-5-20260609',
+        compressed: true,
+        input_tokens: 1000,
+        cache_create_tokens: 2000,
+        cache_create_5m_tokens: 0,
+        cache_create_1h_tokens: 2000,
+        baseline_tokens: 10000,
+        baseline_cacheable_tokens: 9000,
+        baseline_probe_status: 'ok',
+        first_user_sha8: 'onehour-replay',
+      }),
+    ]);
+    await dash.replay(tmp.eventsFile);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.actual_input).toBe(5000);
+    expect(row.baseline_input).toBe(19000);
+    expect(row.session_saved_so_far_delta).toBe(14000);
+  });
+
   it('replay() reconstructs GPT recent rows byte-identically to the live path', async () => {
     writeEvents(tmp, [
       ev({
@@ -554,6 +696,192 @@ describe('GPT savings split', () => {
     expect(row.baseline_input).toBe(12400);
     expect(row.actual_input).toBe(8200);
     expect(row.session_saved_so_far_delta).toBe(4200);
+  });
+
+  it('uses OpenAI accounting for a bridged Sol Messages event and subtracts proxy overhead', async () => {
+    setAllowedModelBases(['gpt-5.6-sol']);
+    dash.update({
+      ...structuredClone(gptUpdate),
+      path: '/v1/messages',
+      accountingProvider: 'openai',
+      model: 'gpt-5.6-sol',
+      usage: { input_tokens: 10000, output_tokens: 200, cached_tokens: 2000 },
+      info: {
+        ...structuredClone(gptUpdate.info),
+        nativeInjectedTokens: 1000,
+        firstUserSha8: 'bridgedsol',
+      },
+    } as never);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    // actual=8200; baseline=8200+(50000-8000-1000)*0.1=12300
+    expect(row.actual_input).toBe(8200);
+    expect(row.baseline_input).toBe(12300);
+    expect(row.session_saved_so_far_delta).toBe(4100);
+  });
+
+  it('replays bridged Sol Messages with the same provider and overhead semantics', async () => {
+    setAllowedModelBases(['gpt-5.6-sol']);
+    writeEvents(tmp, [ev({
+      path: '/v1/messages',
+      accounting_provider: 'openai',
+      model: 'gpt-5.6-sol',
+      compressed: true,
+      input_tokens: 10000,
+      output_tokens: 200,
+      cached_tokens: 2000,
+      image_tokens: 8000,
+      baseline_imaged_tokens: 50000,
+      native_injected_tokens: 1000,
+      image_count: 1,
+      first_user_sha8: 'bridgedsol',
+    })]);
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.actual_input).toBe(8200);
+    expect(row.baseline_input).toBe(12300);
+    expect(row.session_saved_so_far_delta).toBe(4100);
+  });
+});
+
+describe('Gemini savings split', () => {
+  beforeEach(() => {
+    setAllowedModelBases(['gemini-3.6-flash']);
+  });
+
+  it('shows measured token savings without applying Claude dollar pricing', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 120, output_tokens: 10 },
+      info: {
+        compressed: true,
+        baselineTokens: 400,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.saved_input_tokens).toBe(280);
+    expect(stats.saved_usd).toBe(0);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    expect(recent.recent.at(-1)?.baseline_input).toBe(400);
+    expect(recent.recent.at(-1)?.actual_input).toBe(120);
+    expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(280);
+  });
+
+  it('does not apply Claude dollar pricing to legacy Gemini rows without provider metadata', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 120, output_tokens: 10 },
+      info: {
+        compressed: true,
+        baselineTokens: 400,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.saved_input_tokens).toBe(280);
+    expect(stats.saved_usd).toBe(0);
+  });
+
+  it('shows estimated savings when optional Gemini measurement fails', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 1200, output_tokens: 10 },
+      info: {
+        compressed: true,
+        baselineProbeStatus: 'failed',
+        imageCount: 1,
+        imagePngs: [new Uint8Array([137, 80, 78, 71])],
+        imageDims: [{ width: 312, height: 728 }],
+        bucketChars: { static_slab: 14000 },
+        imageTokens: 1000,
+        baselineImagedTokens: 4000,
+        nativeInjectedTokens: 100,
+      },
+    } as never);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.baseline_input).toBe(4100);
+    expect(row.actual_input).toBe(1200);
+    expect(row.session_saved_so_far_delta).toBe(2900);
+    expect(row.img_id).toBeDefined();
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.saved_input_tokens).toBe(2900);
+    expect(stats.saved_usd).toBe(0);
+    const header = await (await dash.serveFragment('header', new URL('http://localhost/fragments/header'), 1)).text();
+    expect(header).not.toContain('$0.03');
+    const html = await (await dash.serveFragment('recent', new URL('http://localhost/fragments/recent'), 1)).text();
+    expect(html).toContain('Details →');
+    const details = await (await dash.serveFragment(
+      'context-map',
+      new URL(`http://localhost/fragments/context-map?req=${row.img_id}`),
+      1,
+    )).text();
+    expect(details).toContain('gemini-3.6-flash');
+    expect(details).toContain('System prompt + tool docs');
+  });
+
+  it('preserves Gemini cached-token rows during replay', async () => {
+    writeEvents(tmp, [ev({
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      accounting_provider: 'google',
+      compressed: true,
+      input_tokens: 120,
+      output_tokens: 10,
+      cached_tokens: 40,
+      baseline_tokens: 400,
+      baseline_probe_status: 'ok',
+      image_count: 1,
+    })]);
+
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    expect(recent.recent.at(-1)?.cache_read).toBe(40);
+    expect(recent.recent.at(-1)?.baseline_input).toBe(400);
+    expect(recent.recent.at(-1)?.actual_input).toBe(120);
+  });
+
+  it('replays estimated Gemini savings after an optional probe failure', async () => {
+    writeEvents(tmp, [ev({
+      path: '/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      model: 'gemini-3.6-flash',
+      accounting_provider: 'google',
+      compressed: true,
+      input_tokens: 1200,
+      output_tokens: 10,
+      image_tokens: 1000,
+      baseline_imaged_tokens: 4000,
+      native_injected_tokens: 100,
+      baseline_probe_status: 'failed',
+      image_count: 1,
+    })]);
+
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    expect(recent.recent.at(-1)?.baseline_input).toBe(4100);
+    expect(recent.recent.at(-1)?.actual_input).toBe(1200);
+    expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(2900);
   });
 });
 

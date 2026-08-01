@@ -156,10 +156,11 @@ export function renderToggleFragment(
 /** Chip catalog — UNION with env scope + active set, so env-var models stay toggleable. Labels are cosmetic. */
 const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-fable-5', label: 'Fable 5' },
+  { id: 'claude-opus-5', label: 'Opus 5' },
+  // Retained as explicit opt-in chips so their benchmarked below-bar status
+  // remains visible rather than silently becoming an unmeasured unknown.
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
   { id: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { id: 'claude-sonnet-5', label: 'Sonnet 5' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
 ];
 
 const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
@@ -177,6 +178,11 @@ const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'grok-4.5', label: 'Grok 4.5' },
 ];
+
+const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+];
+
 
 /** Per-model readiness for pxpipe imaging, keyed to committed eval receipts —
  *  NOT opinion (see FINDINGS.md / applicability.ts). The dashboard derives its
@@ -236,6 +242,7 @@ function readinessOf(id: string): { status: Readiness; evidence?: string } {
   return MODEL_READINESS[id] ?? { status: 'unmeasured' };
 }
 
+
 export function renderModelsFragment(
   active: string[],
   configured: string[],
@@ -243,16 +250,18 @@ export function renderModelsFragment(
 ): string {
   const on = new Set(active);
   const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
+    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG, ...GEMINI_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
   // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split by family for the two sections.
+  // families always show as toggles, then split into chip rows (Claude /
+  // OpenAI Responses / Gemini) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
     ...MODEL_CATALOG.map((m) => m.id),
     ...GPT_MODEL_CATALOG.map((m) => m.id),
     ...GROK_MODEL_CATALOG.map((m) => m.id),
+    ...GEMINI_MODEL_CATALOG.map((m) => m.id),
     ...configured,
     ...active,
   ]) {
@@ -280,16 +289,18 @@ export function renderModelsFragment(
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
       `aria-pressed="${lit}"${titleAttr}${confirmAttr} ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
-      `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}${warnMark}</button>`
+      `hx-vals='${escapeHtml(JSON.stringify({ model: id, on: !lit }))}'>${escapeHtml(label)}${lit ? ' ✓' : ''}${warnMark}</button>`
     );
   };
   const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
+  const geminiChips = ids.filter((id) => id.includes('gemini')).map(chipFor).join('');
   const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
   const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
   const otherChips = ids
-    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
+    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok') && !id.includes('gemini'))
     .map(chipFor)
     .join('');
+
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   const claudeHelp = helpTip(
     'claude-model-scope', 'Image Claude models',
@@ -304,15 +315,18 @@ export function renderModelsFragment(
     'Enable only models you intentionally want PXPIPE to image. Savings for this path are locally modeled, not provider-measured.',
   );
   const gptHelp = helpTip(
-    'gpt-model-scope', 'Image GPT models',
+    'gpt-model-scope', 'Image OpenAI Responses models',
     'GPT model bases currently eligible for context imaging on the Responses path.',
     'It controls transformation only; it does not change the configured upstream model or provider.',
     'Checked chips are enabled. Their reduction is locally modeled and kept separate from Claude provider-measured savings.',
   );
+
   return (
+    moot +
     `<div class="models">` +
     `<span class="models-label">Image Claude models</span>${claudeHelp}` +
     claudeChips +
+
     `<span class="hint">everything else is sent as normal text · your choice is saved until Reset</span>${moot}` +
     `</div>` +
     `<div class="models">` +
@@ -322,7 +336,7 @@ export function renderModelsFragment(
     `<span class="hint">opt-in only · OpenAI Responses path · your choice is saved until Reset</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image GPT models</span>${gptHelp}` +
+    `<span class="models-label">Image OpenAI Responses models</span>${gptHelp}` +
     gptChips +
     `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · your choice is saved until Reset</span>${moot}` +
     `</div>` +
@@ -330,6 +344,11 @@ export function renderModelsFragment(
     `<button class="chip" type="button" ` +
     `hx-post="/fragments/models/reset" hx-target="#frag-models">Reset to default</button>` +
     `<span class="hint">clears your saved choice · falls back to PXPIPE_MODELS or the built-in default</span>` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">PXPIPE_MODELS</span>` +
+    `<input class="models-csv" id="models-csv" type="text" name="list" value="${escapeHtml(active.join(','))}" spellcheck="false" autocomplete="off" hx-post="/fragments/models" hx-target="#frag-models" hx-trigger="change">` +
+    `<span class="hint">CSV of bases, or off · applies on enter/blur</span>` +
     `</div>`
   );
 }
@@ -364,6 +383,7 @@ export function renderSessionSummaryFragment(s: CurrentSessionPayload): string {
   );
   if (!s.sessionId) {
     return (
+
       `<div class="hero hero-empty" data-session-id="">` +
       `<div class="block-label-row"><div class="hero-eyebrow">Current session</div>${help}</div>` +
       `<div class="hero-headline">Waiting for session traffic…</div>` +
@@ -381,6 +401,7 @@ export function renderSessionSummaryFragment(s: CurrentSessionPayload): string {
       `<div class="hero-headline">Waiting for a comparable response…</div>` +
       `<div class="hero-sub">Traffic exists, but this session does not yet have both an actual input count and a text counterfactual.</div>` +
       `<div class="hero-meta"><span>Watching this session · no input-change claim yet</span><button class="session-follow" type="button" onclick="ppWatchLatest()">Follow latest activity</button></div>` +
+
       `</div>`
     );
   }
@@ -391,6 +412,7 @@ export function renderSessionSummaryFragment(s: CurrentSessionPayload): string {
   const rawOutput = s.rawOutputTokens ?? 0;
 
   return (
+
     `<div class="hero${positive ? '' : ' hero-neg'}" data-session-id="${escapeHtml(s.sessionId)}">` +
     `<div class="block-label-row"><div class="hero-eyebrow">Current session · ${escapeHtml(s.sessionId.slice(0, 8))} · ${numFmt(measured)} comparable response${measured === 1 ? '' : 's'}</div>${help}</div>` +
     `<div class="hero-headline"><span class="hero-number-group"><span class="hero-num">${bigNum}</span>${percentHelp}</span> ${word} after caching</div>` +
@@ -401,6 +423,7 @@ export function renderSessionSummaryFragment(s: CurrentSessionPayload): string {
     `<div class="hero-meta">` +
     `<span>Watching this session · output untouched (${kFmt(rawOutput)}) · no dollar assumptions</span>` +
     `<button class="session-follow" type="button" onclick="ppWatchLatest()">Follow latest activity</button>` +
+
     `</div>` +
     `</div>`
   );
@@ -419,6 +442,7 @@ function mathBlock(title: string, body: string, help: string): string {
 
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
+
   const pricedRows = s.priced_measured_savings_requests ?? 0;
   const unpricedRows = s.unpriced_measured_savings_requests ?? 0;
   const measuredClaudeRows = s.measured_anthropic_savings_requests ?? 0;
@@ -635,13 +659,16 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<p class="quality-caveat"><strong>Usage, not savings.</strong> Cached input is included in input; reasoning is included in output. Deleted or unavailable rollouts are outside this coverage.</p>` +
     `</div></details>`;
 
+
   // math drawer
   const savedMath =
     `<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>` +
+
     `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create_5m×1.25, cache_create_1h×2.0, cache_read×0.10</span></div>` +
     `<div class="sp"></div>` +
     mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable×weight + cold_tail)') +
     mathRow('actual', s.actual_input_weighted, '(input + server-reported cache tier + cache-read from usage)') +
+
     mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
     mathRow('Claude measured reduction', measuredClaudeSaved, 'provider count_tokens baseline + upstream usage') +
     mathRow('Responses modeled reduction', modeledResponsesSaved, 'local tokenizer/vision counterfactual; not dollar-priced') +
@@ -653,12 +680,15 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathRow('cache-create 5m / 1h / unknown', `${numFmt(s.cache_create_5m_tokens)} / ${numFmt(s.cache_create_1h_tokens)} / ${numFmt(s.cache_create_tier_unknown_tokens)}`, 'unknown tier retains the legacy 5m assumption; not proof of its TTL') +
     `<span class="src">output excluded — identical with/without compression; baseline cache TTL remains a modeled counterfactual</span>`;
 
+
   const usdMath =
     `<div><span class="k">formula:</span> <span class="v">$ saved = Σ(row_saved × that model’s input rate)</span></div>` +
+
     `<div class="sp"></div>` +
     mathRow('priced Claude rows', pricedRows, `${numFmt(unpricedRows)} measured Claude rows excluded until configured`) +
     mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> sum of model-priced rows`) +
     `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')} · override: PXPIPE_MODEL_INPUT_USD_PER_MTOK JSON</span>`;
+
 
   const usdToTokenEquiv = (usd: number | undefined): number =>
     pa.input_per_mtok > 0 ? ((usd ?? 0) * 1e6) / pa.input_per_mtok : 0;
@@ -676,6 +706,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
         : `(small sample: need ≥ ${s.split_min_sample_per_bucket} per bucket; treat as noisy)`,
     ) +
     `<span class="src">observed normalized cost index; mixed-provider and not a currency value</span>`;
+
 
   const pctMath =
     `<div><span class="k">formula:</span> <span class="v">reduction_share = combined_reduction / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
@@ -707,6 +738,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<summary>Show the math &amp; honesty receipts <span class="summary-q" aria-hidden="true">?</span></summary>` +
     `<div class="drawer-intro"><strong>Audit note:</strong> the savings headline is a counterfactual (the same request as plain text), not an invoice. Claude credit requires upstream usage and a successful text probe; OpenAI/Responses rows use a local text-versus-image estimate. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
     `<div class="math-grid">` +
+
     mathBlock('Input tokens saved', savedMath, helpTip(
       'audit-input', 'Input tokens saved math',
       'The exact cache-aware counterfactual formula behind the input-change headline.',
@@ -737,6 +769,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
       'It places input and output on one normalized scale for limit and cost diagnostics.',
       'Output appears on both actual and baseline sides because PXPIPE does not compress it. Encrypted blocks can be billed even when their characters are not measurable.',
     )) +
+
     `</div></details>`;
 
   // NOTE: tests assert the header fragment contains the port number.
@@ -867,7 +900,7 @@ export function renderContextMapFragment(
         `<div class="ctx-row"><span class="ctx-lbl">${label}</span><span class="ctx-val">${kFmt(n)} tok</span></div>`,
       ).join('') +
       `<div class="ctx-row"><span class="ctx-lbl">Imageable text baseline</span><span class="ctx-val">${kFmt(c.baselineImagedTokens ?? 0)} tok</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Adjacent completed pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Completed tool pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Open calls kept native</span><span class="ctx-val">${rc.openFunctionCalls ?? 0}</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Native image parts</span><span class="ctx-val">${rc.imageParts}</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Provider tokens not explained locally</span><span class="ctx-val">${kFmt(c.responsesUnexplainedTokens ?? 0)} tok</span></div>` +
@@ -894,6 +927,7 @@ export function renderContextMapFragment(
   // request's observed cache state: cache_read > 0 means warm, cache_read === 0
   // means cold. No wall-clock-only counterfactual is credited.
   const warm = showCompare && c.warm;
+  const google = c.model?.startsWith('gemini-') === true;
   const textNoun = warm ? 'cached text' : 'text';
   // Raw count_tokens can grow (imaging bloated a short prompt), so say so rather
   // than rendering a nonsensical "shrank -36%".
@@ -902,13 +936,19 @@ export function renderContextMapFragment(
   const headline = !showCompare
     ? `<strong>${kFmt(c.actualInputEff || c.realInput)}</strong> billing-equivalent input tokens sent`
     : pct >= 0
-      ? `<span class="ctx-big">${pct}%</span> smaller — ${textNoun} would bill as <strong>${kFmt(base)}</strong> input tokens; images billed as <strong>${kFmt(real)}</strong>`
-      : `<span class="ctx-big">${-pct}%</span> bigger — images billed as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for ${textNoun}`;
+      ? google
+        ? `<span class="ctx-big">${pct}%</span> smaller — text would account as <strong>${kFmt(base)}</strong> input tokens; images account as <strong>${kFmt(real)}</strong>`
+        : `<span class="ctx-big">${pct}%</span> smaller — ${textNoun} would bill as <strong>${kFmt(base)}</strong> input tokens; images billed as <strong>${kFmt(real)}</strong>`
+      : google
+        ? `<span class="ctx-big">${-pct}%</span> bigger — images account as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for text`
+        : `<span class="ctx-big">${-pct}%</span> bigger — images billed as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for ${textNoun}`;
   // Clarifying sub-line. It must match the actual request's cache state: claiming
   // a 0.1× read discount when cache_read===0 would count hypothetical cache as a
   // pxpipe effect, so cold rows price both paths cold.
   const subnote = !showCompare
     ? 'Billed tokens count cache discounts (reads at 0.1×) — no trustworthy text baseline for this request yet.'
+    : google
+      ? `Same provider-token basis as the Saved column. The gap is token count. ${rawPhrase}`
     : !warm
       ? `No warm text cache this turn — the text counterfactual's prefix is priced at the 1.25× create rate (the same event the imaged path pays), identical basis to the Saved column. The gap is purely token count. ${rawPhrase}`
       : pct < 0 && rawShrink > 0
@@ -1036,11 +1076,13 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>Result</th>` +
     `<th>Endpoint</th>` +
     `<th>Model</th>` +
+
     `<th><span class="th-help">Sent as${sentAsHelp}</span></th>` +
     `<th class="num"><span class="th-help">Cache hits${cacheHitsHelp}</span></th>` +
     `<th class="num"><span class="th-help">As text${asTextHelp}</span></th>` +
     `<th class="num"><span class="th-help">Sent${sentHelp}</span></th>` +
     `<th class="num"><span class="th-help">Saved/lost${savedHelp}</span></th>` +
+
     `<th></th>` +
     `</tr></thead><tbody>${body}</tbody></table>`
   );
@@ -1096,7 +1138,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
       sourceText == null
         ? `<div class="evicted">source text wasn't captured for this image</div>`
         : `<div class="pairing">` +
-          `<div class="pair-col"><div class="pair-head pair-img">What Claude sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
+          `<div class="pair-col"><div class="pair-head pair-img">What the model sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
           `<div class="pair-mid">made from ↓</div>` +
           `<div class="pair-col"><div class="pair-head pair-txt">The original text · byte-exact</div><pre class="src-pane">${escapeHtml(sourceText)}</pre></div>` +
           `</div>`;
@@ -1178,6 +1220,12 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('original chars', numFmt(s.origCharsTotal)) +
     tr('image bytes', numFmt(s.imageBytesTotal)) +
     tr('bytes / char', charRatio) +
+    (s.pinEvents
+      ? tr(
+          'pin footer (uncached)',
+          `${numFmt(s.pinCharsTotal ?? 0)} chars / ${numFmt(s.pinEvents)} req`,
+        )
+      : '') +
     tr('latency p50 / p95', `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
     tr('first-byte p50 / p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
     `</tbody></table>`
@@ -1331,11 +1379,40 @@ const CSS = `
   /* model chips */
   .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
   .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  .models-csv { flex: 1 1 260px; min-width: 220px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .models-csv:focus { outline: none; border-color: var(--flame-ink); }
+  .models-routing { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
+  #routing-help { border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface);
+    color: var(--ink); max-width: 600px; padding: 16px 20px; }
+  #routing-help::backdrop { background: rgba(20, 12, 6, .4); }
+  #routing-help h3 { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
+  #routing-help p, #routing-help li { font-size: 12px; line-height: 1.55; color: var(--ink-2); margin: 6px 0; }
+  #routing-help ul { margin: 6px 0; padding-left: 18px; }
+  #routing-help code { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+  #routing-help pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 8px 0; overflow-x: auto;
+    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
   .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
     border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 12px; }
   .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
   .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
     font-weight: 600; }
+
+  /* collapsed model-scope section (#116): the default compress scope is Fable 5
+     only, so the three family rows stay hidden until the user opts in. The
+     <details> wrapper lives in the static shell — NOT inside #frag-models —
+     because the every-2s innerHTML poll would otherwise reset its open state. */
+  .models-collapse { margin: 0 0 18px; }
+  .models-collapse .models { margin: 0 0 10px; }
+  .models-collapse .models:last-child { margin-bottom: 0; }
+  .models-summary { cursor: pointer; color: var(--ink-2); font-size: 12px; font-weight: 600;
+    margin: 0 0 8px; user-select: none; }
+  .models-summary:hover { color: var(--flame-ink); }
+  .models-warning { color: var(--ink-2); background: var(--surface); border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--bad); border-radius: 8px; padding: 8px 12px; font-size: 12px;
+    margin: 0 0 12px; }
 
   /* session hero */
   #current-session { scroll-margin-top: 118px; }
@@ -1787,6 +1864,16 @@ export function renderPage(port: number): string {
   </div>
 </header>
 
+
+<details class="models-collapse">
+  <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
+  <p>Warp starts the agent with the proxy already wired:</p>
+  <pre>pxpipe warp -- claude
+pxpipe warp -- codex
+pxpipe warp -- cursor-agent</pre>
+  <p>Pin instructions from inside a session with <code>@pxpipe pin …</code>; pinned text is relocated to the end of every request.</p>
+</details>
+
 <nav class="page-nav" aria-label="Dashboard sections">
   <a href="#overview">Overview</a>
   <a href="#current-session">Current session</a>
@@ -1794,6 +1881,7 @@ export function renderPage(port: number): string {
   <a href="#usage-limits">Usage &amp; limits</a>
   <a href="#audit-drawer">Audit</a>
 </nav>
+
 
 <div class="settings-shell">
   <details class="settings-panel">

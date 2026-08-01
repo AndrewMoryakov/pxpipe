@@ -11,6 +11,19 @@ import {
   buildCacheablePrefixCountTokensBody,
 } from './measurement.js';
 import type { Usage } from './types.js';
+import {
+  anthropicMessagesToOpenAIResponses,
+  openAIResponsesToAnthropicResponse,
+} from './messages-responses-bridge.js';
+import {
+  anthropicMessagesToOpenAIChat,
+  chatCompletionsUrl,
+  openAIChatToAnthropicResponse,
+} from './messages-chat-bridge.js';
+import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
+import { parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
+import { isGeminiModel } from './gemini-model-profiles.js';
+import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -28,11 +41,32 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
+  cloudflareUpstream?: string;
+  cloudflareApiKey?: string;
+  /** Exact model ids routed to each non-default provider. Unlisted Claude
+   * models retain normal Anthropic routing. */
+  openAIModels?: string[];
+  cloudflareModels?: string[];
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
    *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
+  /** Persist 4xx diagnostics: the gzipped request body plus the upstream error
+   *  body. Off by default because either side may contain prompts or secrets. */
+  captureErrorReqBody?: boolean;
+  /** Abort the upstream request if response headers have not arrived within this
+   *  many ms. Cleared once headers land, so long generations are unaffected.
+   *  0 disables. */
+  upstreamHeadersTimeoutMs?: number;
+  /** Abort the upstream response if no bytes arrive for this many ms. This is the
+   *  stall guard: a wedged connection can otherwise be held open forever. 0 disables. */
+  upstreamIdleTimeoutMs?: number;
+  /** How long an in-flight request may reject an identical retry before the dedupe
+   *  fails open. Prevents one stalled request from permanently 409-ing its retries.
+   *  0 disables dedupe entirely. */
+  duplicateHoldMs?: number;
 }
 
 export interface ProxyEvent {
@@ -40,6 +74,9 @@ export interface ProxyEvent {
   path: string;
   /** Top-level request model when present. Used for telemetry/dashboard labels only. */
   model?: string;
+  /** Provider cost/usage semantics after any internal wire bridge. Unlike
+   * `path`, this describes the upstream that actually billed the request. */
+  accountingProvider?: 'anthropic' | 'openai' | 'google';
   status: number;
   /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
   durationMs: number;
@@ -74,13 +111,132 @@ export interface ProxyEvent {
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Read the top-level `model` field from a /v1/messages body without parsing the full JSON.
- *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
+/** Headers should arrive well inside this; generous enough for slow reasoning starts. */
+const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
+/** No bytes for this long means the connection is wedged, not slow. */
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 120_000;
+/** Past this, an in-flight entry is treated as stale and a retry is let through. */
+const DEFAULT_DUPLICATE_HOLD_MS = 60_000;
+/**
+ * Budget for a count-tokens probe. Both probes fail closed (null keeps the original
+ * body), so expiring one costs that request's savings, never correctness. The Google
+ * pair is awaited before the forward, so this is worst-case added latency; the
+ * Anthropic pair only feeds telemetry.
+ *
+ * Neither provider publishes a latency SLO for count-tokens, and we have no probe
+ * timing of our own, so this is not a measured figure. It is bounded by the one number
+ * we do have: p99 time-to-headers for a full generation on the same route (30s over
+ * 2166 Gemini requests in our telemetry). A probe does strictly less work than
+ * first-token generation, so one that misses that mark is wedged rather than slow.
+ */
+const COUNT_TOKENS_TIMEOUT_MS = 30_000;
+/** Sweep the in-flight map early once it grows past plausible real concurrency. */
+const INFLIGHT_SWEEP_SIZE = 256;
+/** Floor between size-triggered sweeps so genuine high concurrency stays O(1)/request. */
+const INFLIGHT_SWEEP_MIN_INTERVAL_MS = 1_000;
+
+/**
+ * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
+ * the watchdog sees real network activity rather than post-transform output.
+ */
+function withIdleTimeout(
+  res: Response,
+  firstChunkMs: number,
+  ms: number,
+  onIdle: () => void,
+): Response {
+  if (!res.body || ms <= 0) return res;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clear = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  // The watchdog errors its own controller rather than relying on the fetch
+  // implementation to tear the body down when the signal aborts.
+  let ctl: TransformStreamDefaultController<Uint8Array> | undefined;
+  const arm = (budget: number): void => {
+    clear();
+    timer = setTimeout(() => {
+      timer = undefined;
+      onIdle();
+      try {
+        ctl?.error(new Error(`pxpipe: upstream stalled for ${budget}ms`));
+      } catch {
+        /* already errored or closed */
+      }
+    }, budget);
+  };
+  const watched = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      start(controller) {
+        ctl = controller;
+        // Nothing has streamed yet: the model may still be starting up, which is the
+        // same wait the headers budget covers. Real traffic has taken >120s just to
+        // return headers (max 146s over 41k requests), so charging the mid-stream idle
+        // budget here would abort healthy slow starts.
+        arm(firstChunkMs);
+      },
+      transform(chunk, controller) {
+        // Bytes have flowed: from here a long silence means wedged, not slow.
+        arm(ms);
+        controller.enqueue(chunk);
+      },
+      flush() {
+        clear();
+      },
+    }),
+  );
+  return new Response(watched, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
+}
+
+/**
+ * Passthrough that notifies on client disconnect. `cancel` deliberately does not await
+ * the inner cancel: with a wedged upstream that call can hang, which would in turn hang
+ * the caller's `body.cancel()`.
+ */
+function withClientDisconnect(
+  body: ReadableStream<Uint8Array>,
+  onCancel: (reason: unknown) => void,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      onCancel(reason);
+      void reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
+
+/** Cap on bodies buffered only to sniff a model name, on paths pxpipe does not
+ *  transform. Chat requests naming a model are far below this; uploads that blow
+ *  past it stream through unbuffered. */
+const MODEL_SNIFF_MAX_BYTES = 1 << 20;
+
+/** Read the actual top-level `model` field. The body is already buffered for
+ * transformation, so parsing it is both safer and simpler than a prefix regex
+ * (which could mistake `metadata.model` for the routing model). */
 function readModelField(body: Uint8Array): string | null {
   try {
-    const head = new TextDecoder().decode(body.subarray(0, 8192));
-    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
-    return m ? m[1]! : null;
+    const value = JSON.parse(new TextDecoder().decode(body)) as { model?: unknown };
+    return typeof value.model === 'string' && value.model.length <= 200 ? value.model : null;
   } catch {
     return null;
   }
@@ -96,6 +252,27 @@ function readStreamField(body: Uint8Array): boolean {
   }
 }
 
+// Claude Code only admits gateway-discovered ids beginning with "claude" or
+// "anthropic". Prefix provider ids for discovery, then remove that compatibility
+// prefix before PXPIPE_MODELS matching and upstream routing.
+const CLAUDE_GATEWAY_MODEL_PREFIX = 'claude-';
+
+function claudeGatewayModelId(model: string): string {
+  if (model.startsWith('claude-') || model.startsWith('anthropic')) return model;
+  return CLAUDE_GATEWAY_MODEL_PREFIX + model;
+}
+
+function resolveClaudeGatewayModelId(model: string | null): string | undefined {
+  if (!model?.startsWith(CLAUDE_GATEWAY_MODEL_PREFIX)) return undefined;
+  const providerModel = model.slice(CLAUDE_GATEWAY_MODEL_PREFIX.length);
+  return providerModel.includes('/') ? providerModel : undefined;
+}
+
+function routedModelDisplayName(model: string, route: 'openai' | 'cloudflare'): string {
+  if (route === 'cloudflare' && /kimi-k3/i.test(model)) return 'Kimi K3 (Cloudflare)';
+  return `${model} (${route === 'cloudflare' ? 'Cloudflare' : 'OpenAI'})`;
+}
+
 /** Gzip via CompressionStream — available in Node 18+ and Cloudflare Workers. */
 async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
   // Cast: TS doesn't model Response(Uint8Array) even though it works in both runtimes.
@@ -106,14 +283,18 @@ async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(buf);
 }
 
-/** sha256[0..8] hex of a byte buffer. */
-async function sha8Bytes(body: Uint8Array): Promise<string> {
+/** SHA-256 hex of a byte buffer. */
+async function sha256Bytes(body: Uint8Array): Promise<string> {
   // Cast: Web Crypto accepts Uint8Array at runtime despite the BufferSource type.
   const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
   const bytes = new Uint8Array(digest);
   let hex = '';
-  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
   return hex;
+}
+
+async function sha256Text(value: string): Promise<string> {
+  return sha256Bytes(new TextEncoder().encode(value));
 }
 
 /**
@@ -136,7 +317,7 @@ function processSseEvent(
   // Parse `event:` + `data:` lines; continuation data: lines concatenate per SSE spec.
   let event = '';
   let data = '';
-  for (const line of block.split('\n')) {
+  for (const line of block.split(/\r\n|\r|\n/)) {
     if (line.startsWith('event:')) event = line.slice(6).trim();
     else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
   }
@@ -206,6 +387,13 @@ function processSseEvent(
   ) {
     m.toolUseChars += obj.delta.length;
   }
+  // Google AI Studio streaming chunks: usageMetadata object.
+  if (obj.usageMetadata && typeof obj.usageMetadata === 'object') {
+    const gUsage = normalizeUsage(obj.usageMetadata);
+    if (gUsage) state.usage = gUsage;
+  }
+  measureGoogleCandidates(obj, m, state);
+
   measureOpenAIChoices(obj, m);
   // OpenAI chat chunks: the final chunk carries choices[].finish_reason (earlier chunks ship null).
   const choices = obj.choices;
@@ -257,6 +445,33 @@ function processSseEvent(
   }
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function parseJsonObjects(text: string): Record<string, unknown>[] | null {
+  const trimmed = text.trim();
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return parsed.map(objectRecord).filter((item): item is Record<string, unknown> => item !== null);
+    }
+    const item = objectRecord(parsed);
+    return item ? [item] : null;
+  } catch {
+    const match = /"usageMetadata"\s*:\s*(\{[^}]+\})/.exec(trimmed);
+    if (match && match[1]) {
+      try {
+        const usageMetadata: unknown = JSON.parse(match[1]);
+        return [{ usageMetadata }];
+      } catch {}
+    }
+  }
+  return null;
+}
+
 function normalizeUsage(raw: unknown): Usage | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const u = raw as Record<string, unknown>;
@@ -280,6 +495,15 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   // OpenAI field aliases.
   if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
   if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
+
+  // Google AI Studio field aliases.
+  if (typeof u.promptTokenCount === 'number') out.input_tokens = u.promptTokenCount;
+  if (typeof u.candidatesTokenCount === 'number' || typeof u.thoughtsTokenCount === 'number') {
+    out.output_tokens =
+      (typeof u.candidatesTokenCount === 'number' ? u.candidatesTokenCount : 0) +
+      (typeof u.thoughtsTokenCount === 'number' ? u.thoughtsTokenCount : 0);
+  }
+  if (typeof u.cachedContentTokenCount === 'number') out.cached_tokens = u.cachedContentTokenCount;
   // OpenAI prompt-cache hits live in a details sub-object: Responses uses
   // `input_tokens_details.cached_tokens`, Chat uses `prompt_tokens_details`.
   const details =
@@ -304,6 +528,41 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function revertedGoogleInfo(
+  info: TransformInfo,
+  reason: string,
+  baselineProbeStatus: 'ok' | 'failed',
+): TransformInfo {
+  return {
+    ...info,
+    compressed: false,
+    reason,
+    compressedChars: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    imagePixels: undefined,
+    imageTokens: undefined,
+    baselineImagedTokens: undefined,
+    nativeInjectedTokens: undefined,
+    firstImagePng: undefined,
+    firstImageWidth: undefined,
+    firstImageHeight: undefined,
+    imagePngs: undefined,
+    imageDims: undefined,
+    imageSourceText: undefined,
+    imageSourceTexts: undefined,
+    toolResultImgs: undefined,
+    collapsedTurns: undefined,
+    collapsedChars: undefined,
+    collapsedImages: undefined,
+    historyTextChars: undefined,
+    historyReason: undefined,
+    bucketChars: undefined,
+    gateEval: undefined,
+    baselineProbeStatus,
+  };
+}
+
 function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement): void {
   const choices = obj.choices;
   if (!Array.isArray(choices)) return;
@@ -322,6 +581,35 @@ function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement
       }
     }
   }
+}
+
+function measureGoogleCandidates(
+  obj: Record<string, unknown>,
+  m: OutputMeasurement,
+  state?: { stopReason: string | undefined },
+): boolean {
+  if (!Array.isArray(obj.candidates)) return false;
+  for (const rawCandidate of obj.candidates) {
+    const candidate = objectRecord(rawCandidate);
+    if (!candidate) continue;
+    if (state && typeof candidate.finishReason === 'string') state.stopReason = candidate.finishReason;
+    const content = objectRecord(candidate.content);
+    if (!Array.isArray(content?.parts)) continue;
+    for (const rawPart of content.parts) {
+      const part = objectRecord(rawPart);
+      if (!part) continue;
+      if (typeof part.text === 'string') {
+        if (part.thought === true) m.thinkingChars += part.text.length;
+        else m.textChars += part.text.length;
+      }
+      if (part.functionCall !== undefined) {
+        try {
+          m.toolUseChars += JSON.stringify(part.functionCall).length;
+        } catch {}
+      }
+    }
+  }
+  return true;
 }
 
 /** Measure non-streaming messages.content[] — same OutputMeasurement shape as the SSE accumulator. */
@@ -478,13 +766,11 @@ function teeForUsage(
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          // EventSource permits CRLF; normalize before looking for blank lines.
-          buf = buf.replace(/\r\n/g, '\n');
-          // SSE events are terminated by a blank line.
-          let evEnd: number;
-          while ((evEnd = buf.indexOf('\n\n')) >= 0) {
-            const block = buf.slice(0, evEnd);
-            buf = buf.slice(evEnd + 2);
+          // SSE events are terminated by a blank line; support LF, CRLF, and CR.
+          let boundary: RegExpExecArray | null;
+          while ((boundary = /\r\n\r\n|\n\n|\r\r/.exec(buf)) !== null) {
+            const block = buf.slice(0, boundary.index);
+            buf = buf.slice(boundary.index + boundary[0].length);
             processSseEvent(block, m, state);
           }
           // A malformed/headerless non-SSE response must not make the audit
@@ -512,11 +798,24 @@ function teeForUsage(
           buf += decoder.decode(value, { stream: true });
         }
         try {
-          const j = JSON.parse(buf);
+          const objects = parseJsonObjects(buf);
+          if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
+          let usage: Usage | undefined;
+          let recognizedGoogle = false;
+          const measurement: OutputMeasurement = {
+            textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0,
+          };
+          const state: { stopReason: string | undefined } = { stopReason: undefined };
+          for (const object of objects) {
+            const nextUsage = normalizeUsage(object.usage ?? object.usageMetadata);
+            if (nextUsage) usage = nextUsage;
+            recognizedGoogle = measureGoogleCandidates(object, measurement, state) || recognizedGoogle;
+          }
+          const last = objects[objects.length - 1];
           return {
-            usage: normalizeUsage(j?.usage),
-            measurement: measureFromMessageJson(j),
-            stopReason: readStopReasonFromJson(j),
+            usage,
+            measurement: recognizedGoogle ? measurement : measureFromMessageJson(last),
+            stopReason: state.stopReason ?? readStopReasonFromJson(last),
           };
         } catch {
           return { usage: undefined, measurement: undefined, stopReason: undefined };
@@ -564,6 +863,7 @@ const STRIP_REQ_HEADERS = new Set([
   'content-length', // we recompute
   'expect',
   'accept-encoding', // let upstream choose
+  'x-pxpipe-bypass', // pxpipe-only opt-out signal; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -593,14 +893,27 @@ function isProviderPrefixedPath(pathname: string): boolean {
   return PASSTHROUGH_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 }
 
+/** One optional gateway/provider segment, then an optional `/v1`, before the
+ *  wire-shape suffix:
+ *
+ *    /v1/chat/completions
+ *    /openai/v1/chat/completions
+ *    /compat/chat/completions    AI Gateway's OpenAI-compatible route
+ *    /grok/chat/completions
+ *
+ *  Wire shape only: whether the body is OpenAI-shaped enough to parse a model
+ *  out of. Routing stays with isProviderPrefixedPath/isCanonicalOpenAIPath
+ *  above, so a prefixed path still goes to passthroughUpstream. */
+const PROVIDER_SEGMENT = String.raw`(?:\/[a-z0-9][a-z0-9._-]*)?(?:\/v1)?`;
+const OPENAI_CHAT_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/chat\\/completions$`);
+const OPENAI_RESPONSES_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/responses$`);
+
 function isOpenAIChatPath(pathname: string): boolean {
-  return pathname === '/v1/chat/completions' || pathname === '/openai/v1/chat/completions';
+  return OPENAI_CHAT_PATH.test(pathname);
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
-  return pathname === '/v1/responses'
-    || pathname === '/openai/v1/responses'
-    || pathname === '/openai/responses'
+  return OPENAI_RESPONSES_PATH.test(pathname)
     || pathname === '/backend-api/codex/responses';
 }
 
@@ -616,7 +929,14 @@ function isChatGPTCodexPath(pathname: string): boolean {
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
+  // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
+  // `sk-ant-…` bearer is Anthropic by construction (Claude Code subscription
+  // auth sends `authorization: Bearer sk-ant-oat01-…` with no x-api-key).
+  // Without this check that OAuth token would be forwarded to the OpenAI
+  // upstream: a credential leak, and a guaranteed 401.
+  const bearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '');
+  const looksOpenAIAuth =
+    hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key') && !bearerIsAnthropic);
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
@@ -640,10 +960,36 @@ async function countTokensUpstream(
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
+      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const json = (await res.json()) as { input_tokens?: unknown };
     return typeof json.input_tokens === 'number' ? json.input_tokens : null;
+  } catch {
+    return null;
+  }
+}
+
+async function countGoogleTokensUpstream(
+  countTokensUrl: string,
+  body: Uint8Array,
+  headers: Headers,
+  model: string,
+): Promise<number | null> {
+  try {
+    const request = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+    const countBody = JSON.stringify({
+      generateContentRequest: { ...request, model: `models/${model}` },
+    });
+    const res = await fetch(countTokensUrl, {
+      method: 'POST',
+      headers,
+      body: countBody,
+      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const json = await res.json() as { totalTokens?: unknown };
+    return typeof json.totalTokens === 'number' ? json.totalTokens : null;
   } catch {
     return null;
   }
@@ -705,6 +1051,29 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
+  const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
+  const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
+  // Entries are released by their holder on every exit path, but the key space is
+  // unbounded (one per distinct body) and the map outlives every request, so a single
+  // missed release would leak for the daemon's lifetime. An entry past the hold window
+  // is already ignored by the duplicate check below, so expiring it costs nothing and
+  // bounds the map by real in-window concurrency instead of by release correctness.
+  let lastSweptAt = 0;
+  const headersTimeoutMs = config.upstreamHeadersTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
+  const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
+  const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
+  // Explicit precedence: Cloudflare > OpenAI > normal family routing.
+  for (const model of config.openAIModels ?? []) {
+    const id = model.trim();
+    if (id) modelRoutes.set(id, 'openai');
+  }
+  for (const model of config.cloudflareModels ?? []) {
+    const id = model.trim();
+    if (id) modelRoutes.set(id, 'cloudflare');
+  }
+  if ((config.cloudflareModels?.length ?? 0) > 0 && config.cloudflareUpstream === undefined) {
+    throw new Error('cloudflareModels requires a Cloudflare chat upstream');
+  }
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
@@ -725,11 +1094,32 @@ export function createProxy(config: ProxyConfig = {}) {
     const url = new URL(req.url);
     const path = url.pathname + url.search;
 
+    // Reversibly disguise the configured upstream id for Claude Code's model
+    // picker, matching CLIProxyAPI. The id decodes back to the exact provider
+    // model on /v1/messages, so discovery and routing cannot drift apart.
+    if (req.method === 'GET' && url.pathname === '/v1/models' && modelRoutes.size > 0) {
+      const models = [...modelRoutes].map(([model, route]) => ({
+            id: claudeGatewayModelId(model),
+            type: 'model',
+            display_name: routedModelDisplayName(model, route),
+            created_at: '1970-01-01T00:00:00Z',
+          }));
+      return new Response(JSON.stringify({
+        data: models,
+        has_more: false,
+        first_id: models[0]?.id ?? '',
+        last_id: models.at(-1)?.id ?? '',
+      }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
-    let responseContentType: string | undefined;
+let responseContentType: string | undefined;
     let responseContentEncoding: string | undefined;
+    let reqBodySha256: string | undefined;
 
     const fire = (
       status: number,
@@ -745,7 +1135,7 @@ export function createProxy(config: ProxyConfig = {}) {
       // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
       const finalize = async (): Promise<void> => {
         let reqBodyGz: Uint8Array | undefined;
-        if (is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
+        if (config.captureErrorReqBody && is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
           try {
             reqBodyGz = await gzipBytes(reqBodyBytes);
           } catch {
@@ -785,15 +1175,34 @@ export function createProxy(config: ProxyConfig = {}) {
             info.baselineProbeStatus = 'ok';
           }
         }
+        // The Messages compatibility response exposes Anthropic's disjoint
+        // usage buckets to the client. Dashboard accounting still needs the
+        // original Responses semantics: input includes the cached subset.
+        const eventUsage = bridgedGptMessages && usage
+          ? {
+              ...usage,
+              input_tokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
+              cached_tokens: usage.cache_read_input_tokens ?? 0,
+            }
+          : usage;
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
           model: requestModel,
+          // Provider-prefixed OpenCode routes such as `/openai/responses` are
+          // Responses-shaped even though they are not canonical `/v1/*` paths.
+          // Classify by the parsed wire route, otherwise the dashboard ignores
+          // GPT image/baseline telemetry and renders As text / Saved as dashes.
+          accountingProvider: isGoogleRoute
+            ? 'google'
+            : isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages
+              ? 'openai'
+              : 'anthropic',
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
           info,
-          usage,
+          usage: eventUsage,
           error,
           errorBody,
           reqBodySha8,
@@ -808,20 +1217,37 @@ export function createProxy(config: ProxyConfig = {}) {
     };
 
     // Transform only known shapes; everything else passes through.
+    // Explicit per-request opt-out (#111): a subprocess that merely inherited
+    // ANTHROPIC_BASE_URL (e.g. a plugin's internal `claude` probe) can send
+    // `x-pxpipe-bypass: 1` — via Claude Code's ANTHROPIC_CUSTOM_HEADERS — to
+    // have its traffic forwarded byte-for-byte untouched. Routing and auth
+    // still apply; the header itself is stripped before forwarding.
+    const bypassHeader = req.headers.get('x-pxpipe-bypass');
+    const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
     const providerPrefixed = isProviderPrefixedPath(url.pathname);
-    const isMessages = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isMessages = !bypass && req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
+    const isOpenAIChat = !bypass && req.method === 'POST' && isOpenAIChatPath(url.pathname);
+    const isOpenAIResponses = !bypass && req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const googleModel = req.method === 'POST'
+      ? parseGoogleModelFromPath(url.pathname)
+      : null;
+    const isGoogleRoute = googleModel !== null;
+    const isGoogle = isGoogleRoute && !bypass;
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    const upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
+    const upstreamBase = isGoogleRoute || providerPrefixed
+      ? passthroughUpstream
+      : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
-    let requestModel: string | undefined;
+    let requestModel: string | undefined = googleModel ?? undefined;
+    let bridgedGptMessages = false;
+    let bridgedChatMessages = false;
+    let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
 
     // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
     //   baselinePromise          → full-body input_tokens
@@ -832,40 +1258,158 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselineStatusApplies = false;
     let responsesStreaming = false;
 
-    if (isMessages || isOpenAIChat || isOpenAIResponses) {
+    if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
         // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = readModelField(bodyIn);
+const model = googleModel ?? readModelField(bodyIn);
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
+        // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
+        // configuration, not a question. Answer it here: forwarding it would bill
+        // a full prefix to have the model paraphrase a list the proxy already
+        // holds, and the reply would be a guess about state it cannot see.
+        if (isMessages || isOpenAIChat || isOpenAIResponses) {
+          const pinReply = isMessages
+            ? pinCommandResponse(bodyIn)
+            : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
+          if (pinReply) {
+            return new Response(pinReply.body, {
+              status: 200,
+              headers: {
+                'content-type': pinReply.contentType,
+                'cache-control': 'no-cache',
+              },
+            });
+          }
+        }
         // /v1/messages is only a wire schema: Claude Code can target a non-
         // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
         // renderer or Anthropic count_tokens merely because the route is
-        // Messages-shaped. Non-Anthropic Messages requests fail closed to
-        // passthrough until a model-aware Messages→Sol transform exists.
-        const messagesAnthropic = isMessages && isClaudeModel(model);
-        const modelOk = isMessages
-          ? messagesAnthropic && isPxpipeSupportedModel(model)
-          : isPxpipeSupportedGptModel(model);
-        // Unsupported model → a true passthrough: no break-even compression
-        // (a text-only model may not accept injected image blocks at all).
+        // Messages-shaped. Enabled GPT models take the standalone
+        // Messages→Responses bridge; unsupported models still fail closed.
+        // Claude Code model aliases decode back to exact Cloudflare model IDs.
+        const decodedByAlias = [...modelRoutes.keys()]
+          .find((candidate) => claudeGatewayModelId(candidate) === model);
+        const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
+        const routedModel = decodedChatModel ?? model;
+        const modelRoute = routedModel ? modelRoutes.get(routedModel) : undefined;
+        modelRouteForRequest = modelRoute;
+        const forceChat = isMessages && modelRoute === 'cloudflare';
+        const messagesAnthropic = isMessages
+          && modelRoute === undefined && !forceChat && isClaudeModel(model);
+        // Provider routing is explicit. Unlisted Messages models use the
+        // default Anthropic route, regardless of how their id is shaped.
+        bridgedGptMessages =
+          isMessages && !messagesAnthropic && !forceChat
+          && modelRoute === 'openai';
+        // Messages → Chat Completions bridge toward Cloudflare Workers AI.
+        bridgedChatMessages = forceChat;
+        const chatStamp = bridgedChatMessages ? routedModel : undefined;
+        const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
+        const modelOk = isGoogle
+          ? isGeminiModel(model) && isPxpipeSupportedModel(model)
+          : isMessages
+            ? (messagesAnthropic && isPxpipeSupportedModel(model))
+              || bridgedGptMessages
+              || (bridgedChatMessages && isPxpipeSupportedGptModel(effectiveModel))
+            : isPxpipeSupportedGptModel(model);
+        // Compression eligibility and telemetry follow the model that actually
+        // receives the request, not Claude Code's local gateway alias.
+        if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
+          requestModel = effectiveModel;
+        }
         const effectiveOpts = modelOk
           ? transformOpts
           : { ...transformOpts, compress: false };
-        const r = isMessages
-          ? await transformRequest(bodyIn, effectiveOpts)
-          : isOpenAIChat
-            ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
-            : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        const bridgeBody = bridgedGptMessages
+          ? (() => {
+              const bridged = JSON.parse(new TextDecoder().decode(
+                anthropicMessagesToOpenAIResponses(bodyIn),
+              )) as Record<string, unknown>;
+              bridged.model = effectiveModel;
+              return new TextEncoder().encode(JSON.stringify(bridged));
+            })()
+          : bridgedChatMessages
+            ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
+            : bodyIn;
+        let r = isGoogle
+          ? await transformGoogleGenerateContent(bodyIn, model!, effectiveOpts)
+          : isMessages
+            ? bridgedGptMessages
+              ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
+              : bridgedChatMessages
+                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+                : await transformRequest(bodyIn, { ...effectiveOpts, model: effectiveModel ?? undefined })
+            : isOpenAIChat
+              ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
+              : await transformOpenAIResponses(bodyIn, effectiveOpts);
+        if (isGoogle && r.info.compressed) {
+          const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
+          countHeaders.set('content-type', 'application/json');
+          const countUrl = new URL(
+            passthroughUpstream + url.pathname.replace(
+              /:(?:generateContent|streamGenerateContent)$/,
+              ':countTokens',
+            ),
+          );
+          for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
+          countUrl.searchParams.delete('alt');
+          const [baseline, transformed] = await Promise.all([
+            countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
+            countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
+          ]);
+          if (baseline === null || transformed === null) {
+            // The local text estimate is only a coarse fallback across prose,
+            // code, JSON, and Unicode. Fail closed when provider validation is
+            // unavailable rather than risk making the request more expensive.
+            r = {
+              body: bodyIn,
+              info: revertedGoogleInfo(r.info, 'count_tokens_failed', 'failed'),
+            };
+          } else if (transformed >= baseline) {
+            r = {
+              body: bodyIn,
+              info: revertedGoogleInfo(
+                r.info,
+                `not_profitable (${transformed} >= ${baseline} tokens)`,
+                'ok',
+              ),
+            };
+          } else {
+            r.info.baselineTokens = baseline;
+            r.info.baselineProbeStatus = 'ok';
+          }
+        }
         if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
+        r.info.serializedRequestBytes = r.body.byteLength;
         if (r.body.byteLength > 0) {
-          reqBodySha8 = await sha8Bytes(r.body);
+          reqBodySha256 = await sha256Bytes(r.body);
+          reqBodySha8 = reqBodySha256.slice(0, 8);
+        }
+        const requestByteLimit = requestModel
+          ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+          : undefined;
+        if (r.info.compressed && requestByteLimit !== undefined) {
+          if (r.body.byteLength > requestByteLimit) {
+            r.info.sizeLimitOutcome = 'rejected';
+            const message = `pxpipe serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+            fire(413, r.info, message);
+            const error = isMessages
+              ? { type: 'error', error: { type: 'request_too_large', message } }
+              : { error: { type: 'request_too_large', message } };
+            return new Response(JSON.stringify(error), {
+              status: 413,
+              headers: { 'content-type': 'application/json' },
+            });
+          } else {
+            r.info.sizeLimitOutcome = 'within_limit';
+          }
         }
 
         if (isMessages && messagesAnthropic) {
@@ -895,19 +1439,64 @@ export function createProxy(config: ProxyConfig = {}) {
           }
         }
       } catch (e) {
+        if ((bridgedGptMessages || bridgedChatMessages) && (e as Error).name === 'MessagesBridgeInvalidRequest') {
+          fire(400, undefined, `invalid_request: ${(e as Error).message}`);
+          return new Response(JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: (e as Error).message },
+          }), { status: 400, headers: { 'content-type': 'application/json' } });
+        }
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
         return new Response(JSON.stringify({ error: 'pxpipe transform failed' }), {
           status: 502,
           headers: { 'content-type': 'application/json' },
         });
       }
+    } else if (req.method === 'POST') {
+      // The model lives in the body, not the path, so read it here too or the
+      // dashboard row has a blank Model and token columns. Label only: the body
+      // is forwarded byte-for-byte, no transform, no baseline probe, no
+      // accounting change. Never overwrite a model already recovered from the
+      // path — Google routes name it there and carry no body `model`.
+      //
+      // This route also carries uploads and audio, so buffer only what can
+      // plausibly be a JSON request naming a model: declared JSON, declared
+      // length under the cap. Anything else streams and shows a blank Model, as
+      // before. A missing content-length is not evidence of a big body —
+      // chunked clients omit it — so only an explicit over-cap declaration
+      // disqualifies.
+      const declaredType = req.headers.get('content-type') ?? '';
+      const declaredLength = Number(req.headers.get('content-length') ?? NaN);
+      const worthBuffering =
+        declaredType.toLowerCase().includes('json') &&
+        !(Number.isFinite(declaredLength) && declaredLength > MODEL_SNIFF_MAX_BYTES);
+      if (worthBuffering) {
+        const bodyIn = new Uint8Array(await req.arrayBuffer());
+        requestModel ??= readModelField(bodyIn) ?? undefined;
+        bodyOut = bodyIn;
+      } else {
+        bodyOut = req.body; // pass through unchanged, model stays unknown
+      }
     } else {
       bodyOut = req.body; // pass through unchanged
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    if (isOpenAIPath) {
-      if (config.openAIApiKey) outHeaders.set('authorization', `Bearer ${config.openAIApiKey}`);
+    if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
+      outHeaders.delete('x-api-key');
+      // Never forward a Messages client's bearer credential across providers.
+      // A configured upstream key is installed below; otherwise auth stays absent.
+      if (bridgedGptMessages || bridgedChatMessages) outHeaders.delete('authorization');
+      const anthropicHeaders: string[] = [];
+      outHeaders.forEach((_value, name) => {
+        if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
+      });
+      for (const name of anthropicHeaders) outHeaders.delete(name);
+      // The chat bridge uses the Cloudflare token; Responses uses the OpenAI key.
+      const bridgeKey = bridgedChatMessages
+        ? config.cloudflareApiKey
+        : config.openAIApiKey;
+      if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
     }
@@ -917,18 +1506,130 @@ export function createProxy(config: ProxyConfig = {}) {
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
-    const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
-    const upstreamUrl = upstreamBase + outPath;
+    // The chat bridge forwards to the configured Cloudflare upstream at its
+    // /chat/completions endpoint (chatCompletionsUrl normalizes a bare base,
+    // a /v1 base, or a full …/chat/completions URL). Every other route appends
+    // a path to its resolved base.
+    let upstreamUrl: string;
+    if (bridgedChatMessages) {
+      upstreamUrl = chatCompletionsUrl(config.cloudflareUpstream ?? '');
+    } else {
+      const outPath = bridgedGptMessages
+        ? (routes.stripOpenAIV1 ? '/responses' : '/v1/responses')
+        : isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
+      const requestUpstreamBase = bridgedGptMessages ? openAIUpstream : upstreamBase;
+      upstreamUrl = requestUpstreamBase + outPath;
+    }
+    let releaseInFlight = (): void => {};
+    if (reqBodySha256 && duplicateHoldMs > 0) {
+      const headers: [string, string][] = [];
+      outHeaders.forEach((value, name) => { headers.push([name, value]); });
+      headers.sort(([a], [b]) => a.localeCompare(b));
+      const key = await sha256Text(JSON.stringify([
+        req.method,
+        upstreamUrl,
+        headers,
+        reqBodySha256,
+      ]));
+      const now = Date.now();
+      // Time trigger keeps steady state clean; size trigger reclaims promptly if entries
+      // ever strand faster than the window. Both are throttled, so cost stays amortized.
+      const sinceSweep = now - lastSweptAt;
+      if (
+        sinceSweep >= duplicateHoldMs
+        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
+      ) {
+        for (const [k, v] of inFlight) {
+          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
+        }
+        lastSweptAt = now;
+      }
+      const existing = inFlight.get(key);
+      // Fail open once the holder is older than the window: a retry that arrives this
+      // late is the client recovering from a stall, not an accidental double-send.
+      if (existing && now - existing.startedAt < duplicateHoldMs) {
+        const message = 'An identical request is already in progress';
+        fire(409, undefined, 'duplicate_request_in_flight');
+        const error = isMessages
+          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
+          : { error: { type: 'duplicate_request_in_flight', message } };
+        return new Response(JSON.stringify(error), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const lease = Symbol();
+      inFlight.set(key, { lease, startedAt: now });
+      releaseInFlight = () => {
+        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
+      };
+    }
+    // One controller for the whole exchange: headers timeout, stall watchdog and client
+    // disconnect all abort through it, so nothing can hold the socket open indefinitely.
+    const upstreamAbort = new AbortController();
+    let timeoutKind: 'headers' | 'idle' | undefined;
+    let headersTimer: ReturnType<typeof setTimeout> | undefined;
+    // Raced explicitly rather than trusting the fetch implementation to reject on
+    // abort — the headers phase must be bounded even if the signal is ignored.
+    const HEADERS_TIMEOUT = Symbol('headers-timeout');
+    const headersDeadline = new Promise<typeof HEADERS_TIMEOUT>((resolve) => {
+      if (headersTimeoutMs <= 0) return;
+      headersTimer = setTimeout(() => {
+        headersTimer = undefined;
+        timeoutKind = 'headers';
+        upstreamAbort.abort(new Error('pxpipe: upstream headers timeout'));
+        resolve(HEADERS_TIMEOUT);
+      }, headersTimeoutMs);
+    });
+    const clearHeadersTimer = (): void => {
+      if (headersTimer !== undefined) {
+        clearTimeout(headersTimer);
+        headersTimer = undefined;
+      }
+    };
+
     let upstreamRes: Response;
     try {
-      upstreamRes = await fetch(upstreamUrl, {
+      const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
         body: bodyOut,
+        signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body
         ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
       } as RequestInit);
+      const raced =
+        headersTimeoutMs > 0 ? await Promise.race([upstreamFetch, headersDeadline]) : await upstreamFetch;
+      clearHeadersTimer();
+      if (raced === HEADERS_TIMEOUT) {
+        // Abandoned: keep its eventual rejection from surfacing as unhandled.
+        void upstreamFetch.catch(() => undefined);
+        throw new Error('pxpipe: upstream headers timeout');
+      }
+      upstreamRes = raced;
+      // Watch the raw upstream stream, before any bridge re-encodes it.
+      upstreamRes = withIdleTimeout(upstreamRes, headersTimeoutMs, idleTimeoutMs, () => {
+        timeoutKind = 'idle';
+        upstreamAbort.abort(new Error('pxpipe: upstream stalled'));
+      });
+      if (bridgedGptMessages) {
+        upstreamRes = await openAIResponsesToAnthropicResponse(upstreamRes, requestModel ?? '');
+      } else if (bridgedChatMessages) {
+        upstreamRes = await openAIChatToAnthropicResponse(upstreamRes, requestModel ?? '');
+      }
     } catch (e) {
+      clearHeadersTimer();
+      releaseInFlight();
+      if (timeoutKind) {
+        const detail = timeoutKind === 'headers'
+          ? `no response headers within ${headersTimeoutMs}ms`
+          : `no upstream bytes for ${idleTimeoutMs}ms`;
+        fire(504, info, `upstream_timeout: ${detail}`);
+        return new Response(JSON.stringify({ error: `pxpipe upstream timeout (${detail})` }), {
+          status: 504,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       fire(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
@@ -941,12 +1642,22 @@ export function createProxy(config: ProxyConfig = {}) {
     responseContentEncoding = upstreamRes.headers.get('content-encoding') ?? undefined;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
-      teeForUsage(
-        upstreamRes,
-        isOpenAIResponses && responsesStreaming,
-        isOpenAIResponses && !responsesStreaming,
-      );
+let teed: Response;
+    let usagePromise: Promise<Usage | undefined>;
+    let errorBodyPromise: Promise<string | undefined>;
+    let measurementPromise: Promise<OutputMeasurement | undefined>;
+    let stopReasonPromise: Promise<string | undefined>;
+    try {
+      ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
+        teeForUsage(
+          upstreamRes,
+          isOpenAIResponses && responsesStreaming,
+          isOpenAIResponses && !responsesStreaming,
+        ));
+    } catch (e) {
+      releaseInFlight();
+      throw e;
+    }
 
     // Fire event in background once all four resolve (all share the same stream read).
     void Promise.all([
@@ -954,11 +1665,35 @@ export function createProxy(config: ProxyConfig = {}) {
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason),
-    );
+    ]).then(([usage, errorBody, measurement, stopReason]) => {
+      fire(
+        upstreamRes.status,
+        info,
+        undefined,
+        firstByteMs,
+        usage,
+        config.captureErrorReqBody ? errorBody : undefined,
+        measurement,
+        stopReason,
+      );
+    }).finally(() => {
+      clearHeadersTimer();
+      releaseInFlight();
+    });
 
-    return new Response(teed.body, {
+    // Client disconnect: drop the lease immediately and abort upstream, rather than
+    // waiting on scanner promises that a wedged connection would never settle.
+    const clientBody = teed.body
+      ? withClientDisconnect(teed.body, () => {
+          clearHeadersTimer();
+          releaseInFlight();
+          if (!upstreamAbort.signal.aborted) {
+            upstreamAbort.abort(new Error('pxpipe: client disconnected'));
+          }
+        })
+      : null;
+
+    return new Response(clientBody, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
       headers: filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS),

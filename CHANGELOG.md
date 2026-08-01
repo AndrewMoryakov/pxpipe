@@ -7,14 +7,125 @@ behavioral changes, patch = fixes).
 ## Unreleased
 
 ### Changed
+- Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
+  pilot preserved gist and guard checks, read 7/8 exact values, and produced no
+  unsupported inventions; Sol remains off by default.
+- Opt-in Grok 4.5 moves from Spleen 5×8/152 cols to native 14px/84 cols at
+  maxH 512 (best rung on the JB Mono 8–16px blind sweep: 4/8 exact, 48% save).
+  No rung was fully clean; Grok stays opt-in. Gate and vision math still use
+  the measured 1000 tok/MPix rate on the new 764×≤512 geometry.
+
+## 0.10.0 — 2026-07-22
+
+### Added
+- Gemini 3.6 Flash support through Google AI Studio, including static-context,
+  tool-result, and completed-history compression. Gemini joins Fable 5 in the
+  default model set after scoring 100/100 novel arithmetic, 98/98 gist recall,
+  18/18 state tracking, and 14/15 controlled dense-hex reads.
+- Messages-to-OpenAI Responses and Messages-to-Chat Completions bridges, plus
+  exact-model routing to OpenAI and Cloudflare. Routed models appear through
+  reversible Claude-safe discovery aliases and use provider-aware accounting.
+- Completed tool-call rounds can now be compressed on Gemini and OpenAI while
+  open calls, malformed protocol state, and the recent working tail stay native.
+
+### Changed
+- Opt-in `gpt-5.6-sol` now uses genuine 12px JetBrains Mono glyphs in a native
+  8×13 cell at 84 columns, replacing 10px glyphs padded to an effective 9×12
+  cell. The resulting full strip is 680px wide; its raw pilot scored 7/8 exact
+  fields with one confabulation.
+- A genuine 13px/8×14 Sol follow-up regressed to 2/8 aggregate exact fields and
+  was rejected; production remains on the 12px/8×13 profile.
+- Missing atlas glyphs are escaped as `[U+HEX]` instead of silently dropped.
+- Models are instructed not to guess exact identifiers, paths, hashes, versions,
+  or numbers that are visible only in an image and absent from the factsheet.
+- Anthropic profitability and export reports now use the documented 28-pixel
+  patch billing model instead of an area approximation.
+- Dashboard savings compare the same measured requests, account for one-hour
+  cache writes, and exclude current and legacy Google traffic from Claude-priced
+  dollar totals.
+- Dashboard model-scope changes persist in the Node config file across restarts.
+- 4xx request and upstream error-body persistence is opt-in rather than enabled
+  by default; telemetry, config, and debug files use private filesystem modes.
+- Dashboard routes remain loopback-only even when the proxy API binds externally,
+  and browser mutations reject cross-origin requests.
+- Compatibility: removed the pre-1.0 `multiCol` SDK option and Worker setting;
+  rendering is now single-column in every runtime.
+
+### Fixed
+- History-only OpenAI requests now receive the planned synthetic history
+  images instead of rendering them and returning the original request.
+- Gemini preserves full native tool documentation when static tool imaging is
+  not profitable, even if history or tool-result compression still applies.
+- Routed model discovery includes configured OpenAI and Cloudflare models and
+  falls back to normal upstream discovery when no routed models are configured.
+- Claude Code OAuth credentials never cross to the OpenAI upstream, appended
+  system blocks stay live, deferred/native tools pass through safely, and
+  schema stripping preserves `$schema` and draft-07 tuple items.
+- Responses assistant text uses `output_text`, transactional factsheet anchors
+  are retained, and Node stream/error handling no longer leaks listeners or
+  crashes on drain errors.
+- Dashboard model IDs are escaped before entering `hx-vals`.
+- Windows builds no longer fail when invoking pnpm from the build script.
+
+### Rendering
+- The Spleen 5×8 `K` glyph now uses a diagonal-legged bitmap after a Fable 5 A/B
+  reduced H/K errors from 47.2% to 18.7%, with no token-cost or geometry change.
+
+### Known limitations / evidence
+- **Model-level A/B validation (2026-07-19, `claude-fable-5`, direct API):**
+  paired reads of identical seeded fixtures rendered with each atlas
+  (2 arms × 8 pages × 3 reps = 48 reads; base `b754d95` vs this PR `ab063f2`).
+  H/K per-char error 119/252 (47.2%) → 47/252 (18.7%); `K`→`H` confusions
+  42 → 1; paired per-position McNemar exact p = 2.4e-07. No collateral
+  regression: non-H/K error 32.2% → 31.7%, identical-image control pages at
+  run-variance floor. Full write-up in
+  [FINDINGS.md](FINDINGS.md) ("Update (2026-07-19)").
+- Reproduce directly — no fixtures or screenshots needed:
+  `npx tsx eval/glyph-matrix/demo-glyph.mts` prints the `K`/`H` bitmaps before
+  (stock font) and after (shipped atlas) with their Hamming distance.
+- The known `,`/`;` and `.`/`:` pairs remain 1 px apart and are out of scope; the
+  new regression guard enforces d≥2 across letters and digits only.
+- A production-faithful Gemini positional-retrieval sweep used the actual
+  transformer and 6, 18, and 30 history images (within the 32-image cap).
+  Pxpipe/raw row localization was 18/30 versus 17/30, semantic recognition was
+  11/30 versus 13/30, and exact retrieval tied at 3/30. This is directional
+  evidence, not a broad Lost-in-the-Middle win or loss; see
+  `eval/gemini-profile/QUALITY_RESULTS.md`.
+
+## 0.9.0 — 2026-07-14
+
+### Changed
 - `gpt-5.6-sol` is now opt-in rather than silently enabled. Its exact profile
   remains available when selected, and sibling 5.6 variants do not inherit it.
 - Complete per-model render profiles now drive font atlas, cell spacing,
-  geometry, style, history pages, and profitability math. Sol uses a 6×11
-  JetBrains Mono atlas; opt-in Grok uses the measured effective 9×12 arm plus
-  the factsheet.
+  geometry, style, history pages, and profitability math. Sol and opt-in Grok
+  use native 14px JetBrains Mono (9×16); Grok keeps maxH 512 and the factsheet.
 - Dashboard exposes the GPT model row and `?` controls now show accessible
   hover/focus tooltips.
+- Dashboard overall totals now include only currently enabled models. Traffic
+  from disabled models, including passthrough subagents, no longer affects the
+  headline numbers; re-enabling a model restores its retained history.
+
+### Fixed
+- **Env relocation no longer re-surfaces model-identity lines as per-turn
+  guidance.** The relocated `# Environment` block ("You are powered by …",
+  "default to the latest and most capable Claude models") landed in the LAST
+  user message every turn — exactly where the parent model picks subagent
+  models — steering `Agent` calls to fable instead of haiku and *increasing*
+  net cost for affected sessions. Root fix: a
+  diff-based static/volatile split (`splitEnvByVolatility`) learns, per
+  project (`claudeMdSha`), which env entries are byte-stable and promotes
+  them into the imaged slab — identity/catalog lines are stable, so from a
+  project's second session onward they ride the slab in their original
+  system-derived position instead of the per-turn tail. The identity-line
+  regex stays as a second layer for fresh sessions and churned entries.
+  Guarantees preserved: first-ever sightings stay volatile (git state never
+  bakes into a fresh session's image), the slab never re-renders mid-session
+  (the static side is frozen byte-exact; a churned entry re-emits fresh text
+  on the tail, superseding its stale slab copy, and demotes next session),
+  and the no-user-message fallback (env stays in system) is unchanged.
+  Stable entries now also stop paying live-text rates every turn; telemetry
+  reports the split via `envStaticChars` / `envVolatileKeys`.
 
 ### Known limitations / evidence
 - A direct `gpt-5.6-sol` raw-image pilot tested **both** the new JetBrains

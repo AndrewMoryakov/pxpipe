@@ -3,6 +3,19 @@ import { toTrackEvent, JsonLogTracker, noopTracker, type TrackEvent } from '../s
 import type { ProxyEvent } from '../src/core/proxy.js';
 
 describe('toTrackEvent', () => {
+  it('persists bridged accounting semantics and GPT-native overhead', () => {
+    const out = toTrackEvent({
+      method: 'POST', path: '/v1/messages', model: 'gpt-5.6-sol',
+      accountingProvider: 'openai', status: 200, durationMs: 1,
+      info: {
+        compressed: true, origChars: 1, compressedChars: 1, imageCount: 1,
+        imageBytes: 1, staticChars: 1, dynamicChars: 0, dynamicBlockCount: 0,
+        nativeInjectedTokens: 123,
+      },
+    });
+    expect(out.accounting_provider).toBe('openai');
+    expect(out.native_injected_tokens).toBe(123);
+  });
   it('flattens ProxyEvent + TransformInfo + Usage into a single record', () => {
     const ev: ProxyEvent = {
       method: 'POST',
@@ -20,7 +33,6 @@ describe('toTrackEvent', () => {
         dynamicChars: 500,
         dynamicBlockCount: 2,
         systemSha8: 'a1b2c3d4',
-        claudeMdSha8: 'cafebabe',
         firstUserSha8: 'deadbeef',
         unknownStaticTags: ['recent_files'],
         env: {
@@ -56,7 +68,6 @@ describe('toTrackEvent', () => {
     expect(out.dynamic_chars).toBe(500);
     expect(out.dynamic_block_count).toBe(2);
     expect(out.system_sha8).toBe('a1b2c3d4');
-    expect(out.claude_md_sha8).toBe('cafebabe');
     expect(out.first_user_sha8).toBe('deadbeef');
     expect(out.unknown_static_tags).toEqual(['recent_files']);
     expect(out.cwd).toBe('/Users/me/code/pp');

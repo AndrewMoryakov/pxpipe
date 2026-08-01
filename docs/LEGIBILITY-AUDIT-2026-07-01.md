@@ -13,6 +13,11 @@ follow from it.
   ~2.8×4.4 px. We were paying full price for pixels destroyed in transit.
 - **Shipped:** page geometry clamped to **1568×728 = 1.14 MP** (WYSIWYG: billed/actual
   pixel ratio 3.25 → 1.04). No token-cost change per image; 614/614 tests green.
+- **Update (2026-07-04):** the `px/750` figure above is a ~4–5% continuous
+  approximation. Anthropic's current docs bill the exact **28-px patch count**
+  `⌈w/28⌉×⌈h/28⌉` (a 1568×728 page = 56×26 = **1456** tokens, ≈ the px/750 slope
+  measured here). The gate and export now use that exact formula via
+  `src/core/anthropic-vision.ts` (tiers: standard 1568/1568, high-res 2576/4784).
 - Reading exact strings off even **crisp** 5×8 tops out at **63%** (24-token blind
   test). Every miss is one of two classes the glyph-confusability matrix predicts:
   **case-normalization** (camelCase) and **single-glyph substitution** (hex/num).
@@ -96,8 +101,15 @@ converts a coin-flip-per-glyph read into a 100% text quote, at ~5% of source cha
    model-callable "rehydrate this region as text" tool is the real answer for
    **dense** exact-recall (code files, large tables) that no fixed-size sidecar can
    hold. This is the "put a glass over it" mechanism, and it's half-built.
-5. **Optional — glyph surgery** on `H~K` (d=1 defect) and case-contrast for the S/s
-   class. Zero token cost, bounded upside; do it in the same eval harness as (3).
+5. **Done — glyph surgery on `H~K` (d=1 defect).** `gen-atlas.ts` now repaints
+   the stock Spleen `K` (which was `H` minus one crossbar pixel) with a
+   diagonal-legged bitmap; `H~K` is now Hamming 8, and no alphanumeric pair
+   sits below d=2. Regression-guarded in `tests/render.test.ts`. **Validated at
+   model level (2026-07-19):** paired `claude-fable-5` A/B on seeded H/K
+   fixtures — H/K per-char error 47.2% → 18.7%, `K`→`H` confusions 42 → 1,
+   McNemar exact p = 2.4e-07, no non-H/K regression (see FINDINGS.md,
+   "Update (2026-07-19)"). Case-contrast for the S/s class remains open; do it
+   in the same eval harness as (3).
 
 ## Verdict on "is the factsheet the way, or should there be a RAG escape?"
 

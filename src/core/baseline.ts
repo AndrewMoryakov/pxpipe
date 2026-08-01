@@ -13,8 +13,8 @@ export const CACHE_READ_RATE = 0.1;
 
 /**
  * Server-reported cache-create tier split. Anthropic omits it on some older
- * responses; that remainder is deliberately treated as 5m *estimate*, not as
- * proof that the request used the 5m tier. Callers can surface the coverage.
+ * responses; that remainder is deliberately treated as a 5-minute estimate,
+ * not as proof that the request used that tier. Callers can surface coverage.
  */
 export interface CacheCreateBreakdown {
   fiveMinuteTokens?: number;
@@ -28,10 +28,8 @@ export function cacheCreateEffectiveTokens(
   const total = Math.max(0, totalTokens || 0);
   const five = Math.min(total, Math.max(0, breakdown?.fiveMinuteTokens ?? 0));
   const one = Math.min(total - five, Math.max(0, breakdown?.oneHourTokens ?? 0));
-  // Legacy/unreported tier: preserve historical 5m arithmetic while callers
-  // disclose that this portion is an assumption.
-  const unknown = total - five - one;
-  return five * CACHE_CREATE_5M_RATE + one * CACHE_CREATE_1H_RATE + unknown * CACHE_CREATE_5M_RATE;
+  return five * CACHE_CREATE_5M_RATE + one * CACHE_CREATE_1H_RATE
+    + (total - five - one) * CACHE_CREATE_5M_RATE;
 }
 
 export function cacheCreateUnknownTokens(
@@ -42,6 +40,26 @@ export function cacheCreateUnknownTokens(
   const five = Math.min(total, Math.max(0, breakdown?.fiveMinuteTokens ?? 0));
   const one = Math.min(total - five, Math.max(0, breakdown?.oneHourTokens ?? 0));
   return total - five - one;
+}
+
+/** Effective cache-write rate for this request. Older usage payloads do not
+ * expose the tier split; preserve the historical/conservative 5-minute rate
+ * in that case. The text counterfactual uses the same observed tier mix as
+ * the transformed request because pxpipe relocates, rather than invents, the
+ * caller's cache-control markers. */
+function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
+  if (!(cc > 0)) return CACHE_CREATE_RATE;
+  const splitReported = cc5m !== undefined || cc1h !== undefined;
+  if (!splitReported) return CACHE_CREATE_RATE;
+  const fiveMinute = Math.max(0, cc5m ?? 0);
+  const oneHour = Math.max(0, cc1h ?? 0);
+  const splitTotal = fiveMinute + oneHour;
+  if (!(splitTotal > 0)) return CACHE_CREATE_RATE;
+  // The API contract says splitTotal === cc. Normalize malformed/mismatched
+  // payloads to the aggregate so telemetry never invents extra write tokens.
+  return (
+    fiveMinute * CACHE_CREATE_RATE + oneHour * CACHE_CREATE_1H_RATE
+  ) / splitTotal;
 }
 
 /** Anthropic prompt-cache TTL (seconds). Kept for callers that display provider
@@ -74,18 +92,6 @@ export interface BaselineWarmthPrev {
  * When cr proves warmth, a completed same-prefix prior is used only to estimate
  * how much of the text prefix was reused vs grown. If none is available, assume
  * full reuse of this turn's cacheable prefix; this is conservative for savings.
- *
- * @param prev       this session's previous usage-bearing turn, or undefined.
- * @param nowSec     request-start wall-clock seconds, used only to reject prior
- *                   rows that had not completed before this request was sent.
- * @param cacheable  this turn's cacheable-prefix tokens (the full-reuse credit
- *                   when warm only via cr, since cr proves a read but not the split).
- * @param cr         observed cache-read tokens this turn; the only warm/cold signal.
- * @param ttlSec     legacy parameter; no longer decides warm/cold. It only
- *                   bounds whether a prior prefix size is used for reused/grown
- *                   splitting after cr > 0 has already proved warmth.
- * @param prefixSha  stable-prefix fingerprint for the text counterfactual. A
- *                   prior prefix size is reused only when this matches.
  */
 export function deriveBaselineWarmth(
   prev: BaselineWarmthPrev | undefined,
@@ -110,21 +116,6 @@ export function deriveBaselineWarmth(
 
 /**
  * Weighted input cost for the unproxied TEXT counterfactual (see docs/CACHING_AND_SAVINGS.md).
- *
- * Warmth matters: a TEXT prefix is only a cheap cache-read when a warm cache
- * actually existed this turn. The previous warmth-FREE version always priced
- * the cacheable prefix at CACHE_READ_RATE, which fabricated a "free read" on
- * cold/TTL-expiry turns where text would in fact have paid a 1.25× create —
- * that produced a phantom loss vs the imaged path (which DOES pay the create).
- *
- *   cold turn (first turn / >5min since this session's last turn):
- *     text has no warm cache either ⇒ cacheable×CACHE_CREATE_RATE + coldTail×1.0
- *   warm turn (a prior turn cached the prefix within TTL):
- *     text append-caches ⇒ reused×CACHE_READ_RATE + grown×CACHE_CREATE_RATE + coldTail×1.0
- *     where reused = min(prevCacheable, cacheable), grown = cacheable − reused.
- *     This is what TEXT pays regardless of whether pxpipe's image busted its
- *     own cache on a growth turn — so the real growth loss is preserved.
- *
  * Saving = baseline_eff − actual_eff; can be negative (honestly reported, not floored).
  *
  * @param baselineCacheable  tokens up to the last cache_control marker. ≤0 ⇒ credit nothing.
@@ -140,22 +131,43 @@ export function computeBaselineInputEff(
   warm = false,
   prevCacheable = 0,
 ): number {
+  return computeBaselineInputEffWithCacheTier(
+    baseline, baselineCacheable, inputTokens, cc, cr, warm, prevCacheable, 0,
+  );
+}
+
+/** Tier-aware variant for internal telemetry accounting. */
+export function computeBaselineInputEffWithCacheTier(
+  baseline: number,
+  baselineCacheable: number,
+  inputTokens: number,
+  cc: number,
+  cr: number,
+  warm: boolean,
+  prevCacheable: number,
+  cacheCreate1hTokens: number,
+  cacheCreate5mTokens?: number,
+): number {
   if (baseline <= 0) return 0;
   // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
-  if (baselineCacheable <= 0) return computeActualInputEff(inputTokens, cc, cr);
+  if (baselineCacheable <= 0) {
+    return computeActualInputEffWithCacheTier(
+      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens,
+    );
+  }
   const cacheable = Math.min(baselineCacheable, baseline);
   const coldTail = baseline - cacheable;
+  const createRate = cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens);
   if (warm) {
     // Text reads the prefix it already had cached (0.10×) and creates only the
-    // growth since last turn (1.25×). Independent of the image path's cache.
+    // growth since last turn (at the observed write-tier rate).
     const reused = Math.min(Math.max(prevCacheable, 0), cacheable);
     const grown = cacheable - reused;
-    return reused * CACHE_READ_RATE + grown * CACHE_CREATE_RATE + coldTail * 1.0;
+    return reused * CACHE_READ_RATE + grown * createRate + coldTail;
   }
-  // Cold (first turn / TTL expiry): no warm cache for text either, so it
-  // re-creates the whole cacheable prefix at the create rate — same event the
-  // imaged path pays. Removes the phantom "free read" that fabricated a loss.
-  return cacheable * CACHE_CREATE_RATE + coldTail * 1.0;
+  // Cold: no warm cache for text either, so it re-creates the whole cacheable
+  // prefix at the observed create rate — the same event the imaged path pays.
+  return cacheable * createRate + coldTail;
 }
 
 /** Weighted input cost pxpipe actually paid this turn. */
@@ -166,4 +178,17 @@ export function computeActualInputEff(
   cacheCreate?: CacheCreateBreakdown,
 ): number {
   return inputTokens + cacheCreateEffectiveTokens(cc, cacheCreate) + cr * CACHE_READ_RATE;
+}
+
+/** Tier-aware variant for internal telemetry accounting. */
+export function computeActualInputEffWithCacheTier(
+  inputTokens: number,
+  cc: number,
+  cr: number,
+  cacheCreate1hTokens: number,
+  cacheCreate5mTokens?: number,
+): number {
+  return inputTokens
+    + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
+    + cr * CACHE_READ_RATE;
 }

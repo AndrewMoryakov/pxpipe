@@ -14,6 +14,7 @@ export interface TrackEvent {
   path: string;
   /** Top-level request model when present. */
   model?: string;
+  accounting_provider?: 'anthropic' | 'openai' | 'google';
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
@@ -29,10 +30,19 @@ export interface TrackEvent {
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
-  /** GPT only: vision tokens billed for rendered images. */
+  /** Provider-estimated vision tokens billed for rendered images. */
   image_tokens?: number;
-  /** GPT only: o200k text tokens the imaged/stripped content would have cost. */
+  /** Provider-specific text-token estimate for imaged/stripped content. */
   baseline_imaged_tokens?: number;
+  /** Provider-specific estimate of pxpipe-added native text. */
+  native_injected_tokens?: number;
+  /** Chars re-emitted as the pin footer on the last user message.
+   *  These are MOVED, not copied: the source lines are stripped from the
+   *  cacheable prefix and re-sent as plain text at the tail, so they are paid
+   *  at full input price every turn instead of cache-read price once. Not part
+   *  of orig_chars or compressed_chars, so any savings figure that ignores it
+   *  overstates the win by this much per turn. */
+  pin_chars?: number;
   /** TEXT chars in the outgoing body (all text blocks, incl. non-compressed tool_results).
    *  With image_pixels, a regression over cold-miss events solves chars_per_token (α) and pixels_per_token (β). */
   outgoing_text_chars?: number;
@@ -99,7 +109,6 @@ export interface TrackEvent {
 
   // Fingerprints:
   system_sha8?: string;
-  claude_md_sha8?: string;
   first_user_sha8?: string;
 
   // From Anthropic/OpenAI Usage:
@@ -183,6 +192,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     duration_ms: ev.durationMs,
   };
   if (ev.model) out.model = ev.model;
+  if (ev.accountingProvider) out.accounting_provider = ev.accountingProvider;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
@@ -217,8 +227,14 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.baselineImagedTokens !== undefined && info.baselineImagedTokens > 0) {
       out.baseline_imaged_tokens = info.baselineImagedTokens;
     }
+    if (info.nativeInjectedTokens !== undefined && info.nativeInjectedTokens > 0) {
+      out.native_injected_tokens = info.nativeInjectedTokens;
+    }
     if (info.outgoingTextChars !== undefined && info.outgoingTextChars > 0) {
       out.outgoing_text_chars = info.outgoingTextChars;
+    }
+    if (info.pinChars !== undefined && info.pinChars > 0) {
+      out.pin_chars = info.pinChars;
     }
     if (info.responsesComposition) {
       out.responses_composition = info.responsesComposition;
@@ -226,7 +242,6 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.staticChars !== undefined) out.static_chars = info.staticChars;
     if (info.dynamicChars !== undefined) out.dynamic_chars = info.dynamicChars;
     if (info.dynamicBlockCount !== undefined) out.dynamic_block_count = info.dynamicBlockCount;
-    if (info.reminderImgs !== undefined) out.reminder_imgs = info.reminderImgs;
     if (info.toolResultImgs !== undefined) out.tool_result_imgs = info.toolResultImgs;
     if (info.toolDocsChars !== undefined) out.tool_docs_chars = info.toolDocsChars;
     if (info.truncatedToolResults !== undefined && info.truncatedToolResults > 0) {
@@ -276,7 +291,6 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.churningStaticTags && info.churningStaticTags.length > 0)
       out.churning_static_tags = info.churningStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;
-    if (info.claudeMdSha8) out.claude_md_sha8 = info.claudeMdSha8;
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;
     if (info.baselineTokens !== undefined && info.baselineTokens > 0) {
       out.baseline_tokens = info.baselineTokens;

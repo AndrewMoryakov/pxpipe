@@ -23,8 +23,7 @@ function markdownFiles(): string[] {
       } else if (name.name.endsWith('.md')) {
         // eval/ holds huge run logs; only its READMEs are prose worth link-checking.
         if (opts.onlyReadme && name.name !== 'README.md') continue;
-        // Keep the test's logical paths POSIX-style so assertions and link
-        // lookup are stable on Windows as well as Unix.
+        // Forward slashes so assertions and anchorsByFile keys match on Windows.
         out.push(childRel.replace(/\\/g, '/'));
       }
     }

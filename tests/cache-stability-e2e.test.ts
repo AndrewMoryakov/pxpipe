@@ -384,12 +384,11 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     expect(a.length).toBeGreaterThan(0);
     expect(b).toEqual(a);
 
-    // Not dropped: the volatile section re-enters as trailing TEXT on the LAST
-    // user message (per-turn live tail), so the model still sees the current
-    // git state. It must NOT ride in system: system bytes sit BEFORE the slab
-    // anchor in Anthropic's prefix order (tools → system → messages), so any
-    // env change there cold-restarts the entire anchored prefix (48.8% of
-    // telemetry-era cold-create waste).
+    // Not dropped: the section re-enters as plain system TEXT after the anchor,
+    // its original position. pxpipe does not relocate it into the message
+    // stream — doing so surfaced a <system-reminder> block in the conversation
+    // as if the user had written it. Churn on these bytes costs prefix cache
+    // reads; that is accepted rather than rewriting the caller's messages.
     const sysText = (bodyText: string): string => {
       const sys = JSON.parse(bodyText).system;
       return Array.isArray(sys) ? sys.map((s: any) => s?.text ?? '').join('\n') : String(sys ?? '');
@@ -401,20 +400,15 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
         ? m.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
         : String(m.content ?? '');
     };
-    expect(lastUserText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
-    expect(lastUserText(cap1.main[0]!.body)).toContain('Git status:\nclean');
-    // And the section left both the imaged region AND system entirely — nothing
-    // upstream of the anchor may depend on git state. (Byte-equality above is
-    // the load-bearing check; this pins the mechanism.)
-    expect(lastUserText(cap2.main[0]!.body)).toContain('# Environment');
-    expect(sysText(cap2.main[0]!.body)).not.toContain('modified: src/pricing.ts');
-    expect(sysText(cap2.main[0]!.body)).not.toContain('# Environment');
-    // Regression (2026-07): the relocated block must be delimited as injected
-    // context, never blended into user prose — undelimited, it can BECOME the
-    // entire visible message on an empty/short user turn (observed live).
-    expect(lastUserText(cap2.main[0]!.body)).toMatch(
-      /<system-reminder>[\s\S]*relocated by pxpipe[\s\S]*# Environment[\s\S]*<\/system-reminder>/,
-    );
+    expect(sysText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
+    expect(sysText(cap1.main[0]!.body)).toContain('Git status:\nclean');
+    expect(sysText(cap2.main[0]!.body)).toContain('# Environment');
+    // The caller's message stream is never rewritten: no env text, and above
+    // all no synthetic <system-reminder>, is appended to the user's turn.
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('# Environment');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('modified: src/pricing.ts');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('<system-reminder>');
+    expect(lastUserText(cap2.main[0]!.body)).not.toContain('relocated by pxpipe');
   });
 
   it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {
@@ -563,7 +557,7 @@ describe('e2e cache alignment — GPT (OpenAI) through the real proxy', () => {
     const a = gptChatImages(cap1.main[0]!.body);
     const b = gptChatImages(cap2.main[0]!.body);
     expect(a.length).toBeGreaterThan(1); // slab image + ≥1 sealed history page
-    expect(b.length).toBeGreaterThan(a.length); // growth sealed more pages
+    expect(b.length).toBeGreaterThanOrEqual(a.length); // growth never removes sealed pages
     // GPT seals whole sections (leftover stays text) → strict prefix append-only.
     expect(b.slice(0, a.length)).toEqual(a);
   });

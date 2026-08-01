@@ -643,10 +643,18 @@ describe('reflow L0 contract – real corpus', () => {
     let textsChecked = 0;
     let violations: string[] = [];
 
+    // Local error captures can be arbitrarily large. This is a sampled
+    // regression check, so avoid making a developer's retained diagnostics
+    // determine the test runtime.
+    const MAX_FILE_BYTES = 1 * 1024 * 1024;
+    const MAX_TEXT_CHARS = 200_000;
+
     for (const fname of files.slice(0, 50)) {
       let raw: string;
       try {
-        raw = readFileSync(join(dir4xx, fname), 'utf-8');
+        const filePath = join(dir4xx, fname);
+        if (statSync(filePath).size > MAX_FILE_BYTES) continue;
+        raw = readFileSync(filePath, 'utf-8');
       } catch {
         continue;
       }
@@ -670,6 +678,7 @@ describe('reflow L0 contract – real corpus', () => {
       for (const parsed of candidates) {
         for (const text of extractTexts(parsed)) {
           if (textsChecked >= 500) break;
+          if (text.length > MAX_TEXT_CHARS) continue;
           const result = reflow(text);
           if (result === null) {
             if (text.indexOf(NL_SENTINEL) < 0) {
