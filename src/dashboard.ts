@@ -1891,6 +1891,10 @@ export class DashboardState {
       for (const base of [...next]) {
         if (!isModelScopeEnabled(model, [base])) continue;
         next.delete(base);
+        // Turning off the broad shortcut itself must turn its whole group off.
+        // Only a *properly broader* entry is expanded to retain siblings when
+        // the operator turns off one concrete child.
+        if (isModelScopeEnabled(base, [model])) continue;
         for (const candidate of known) {
           // A candidate that also enables `base` is that broad base (or an
           // even broader alias), not a concrete sibling to preserve.

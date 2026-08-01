@@ -340,6 +340,23 @@ describe('serveFragment', () => {
     }
   });
 
+  it('disables the whole group when the broad model shortcut is turned off', () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      process.env.PXPIPE_MODELS = 'gpt-5.6';
+      setAllowedModelBases(null);
+      dash.handleModelsToggle('gpt-5.6', false);
+      expect(getAllowedModelBases()).toEqual([]);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-lun')).toBe(false);
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
   it('invokes the host persistence hook on scope mutations', () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
