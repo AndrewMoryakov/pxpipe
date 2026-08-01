@@ -849,6 +849,24 @@ describe('Gemini savings split', () => {
     expect(stats.usage_bearing_responses).toBe(2);
   });
 
+  it('uses each Claude model\'s configured dollar rate for savings', async () => {
+    setAllowedModelBases(['claude-opus-5']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-opus-5', status: 200, durationMs: 1,
+      usage: { input_tokens: 100, output_tokens: 0 },
+      info: {
+        compressed: true,
+        baselineTokens: 1_000_000,
+        baselineCacheableTokens: 1,
+        baselineProbeStatus: 'ok',
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    // 999,900 effective input tokens saved × Opus $5/M, not the legacy $10/M.
+    expect(stats.saved_usd).toBeCloseTo(4.9995, 4);
+  });
+
   it('keeps since-restart totals after a model is later disabled', async () => {
     setAllowedModelBases(['claude-fable-5']);
     dash.update({

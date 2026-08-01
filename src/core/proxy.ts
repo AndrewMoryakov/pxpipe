@@ -252,6 +252,36 @@ function readStreamField(body: Uint8Array): boolean {
   }
 }
 
+/** Read only a bounded clone of a bypassed JSON request. Bypass must keep the
+ * original body byte-for-byte, but Responses telemetry still needs to know
+ * whether a headerless Codex reply is SSE or JSON. */
+async function readStreamFieldFromClone(req: Request): Promise<boolean> {
+  const reader = req.clone().body?.getReader();
+  if (!reader) return false;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total <= MODEL_SNIFF_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MODEL_SNIFF_MAX_BYTES) return false;
+      chunks.push(value);
+    }
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return readStreamField(body);
+  } catch {
+    return false;
+  } finally {
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
 // Claude Code only admits gateway-discovered ids beginning with "claude" or
 // "anthropic". Prefix provider ids for discovery, then remove that compatibility
 // prefix before PXPIPE_MODELS matching and upstream routing.
@@ -1264,6 +1294,11 @@ let responseContentType: string | undefined;
     let baselineStatusApplies = false;
     let responsesStreaming = false;
 
+    if (bypass && isOpenAIResponsesWire
+      && (req.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
+      responsesStreaming = await readStreamFieldFromClone(req);
+    }
+
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
@@ -1505,7 +1540,10 @@ const model = googleModel ?? readModelField(bodyIn);
       // Codex talks to chatgpt.com with the client's ChatGPT OAuth bearer.
       // OPENAI_API_KEY is for canonical /v1 OpenAI endpoints only; replacing
       // Codex's bearer here makes an otherwise valid signed-in session 401.
-      if (bridgeKey && !isChatGPTCodexPath(url.pathname)) {
+      const isCodexPath = isChatGPTCodexPath(url.pathname);
+      const inboundBearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(outHeaders.get('authorization') ?? '');
+      if (isCodexPath && inboundBearerIsAnthropic) outHeaders.delete('authorization');
+      if (bridgeKey && (!isCodexPath || inboundBearerIsAnthropic)) {
         outHeaders.set('authorization', `Bearer ${bridgeKey}`);
       }
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
@@ -1662,8 +1700,8 @@ let teed: Response;
       ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
         teeForUsage(
           upstreamRes,
-          isOpenAIResponsesWire && (responsesStreaming || isChatGPTCodexPath(url.pathname)),
-          isOpenAIResponsesWire && !responsesStreaming && !isChatGPTCodexPath(url.pathname),
+          isOpenAIResponsesWire && responsesStreaming,
+          isOpenAIResponsesWire && !responsesStreaming,
         ));
     } catch (e) {
       releaseInFlight();

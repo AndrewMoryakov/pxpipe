@@ -1618,7 +1618,10 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      // This is already accumulated per row with the exact model rate (and
+      // any explicit override). Repricing the combined token total at the
+      // historical Fable fallback would overstate Opus/Sonnet savings.
+      saved_usd: round4(totals.pricedMeasuredSavingsUsd),
       measured_anthropic_savings_requests: totals.measuredSavingsRequests,
       measured_claude_saved_input_equivalents:
         Math.round(totals.measuredClaudeSavedInputEquivalents),

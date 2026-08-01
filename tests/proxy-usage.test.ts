@@ -1420,6 +1420,24 @@ describe('proxy usage extraction', () => {
     expect(upstreamAuth).toBe('Bearer chatgpt-oauth-token');
   });
 
+  it('does not forward Anthropic OAuth to the Codex OpenAI upstream', async () => {
+    let upstreamAuth: string | null = null;
+    const restore = mockUpstream((req) => {
+      upstreamAuth = req.headers.get('authorization');
+      return new Response(JSON.stringify({ id: 'resp_codex_auth', output: [] }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const proxy = createProxy({ openAIUpstream: 'https://chatgpt.test', openAIApiKey: 'sk-server' });
+    await (await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST',
+      headers: { authorization: 'Bearer sk-ant-oat01-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+    }))).text();
+    restore();
+    expect(upstreamAuth).toBe('Bearer sk-server');
+  });
+
   it('keeps bypassed Codex Responses on OpenAI accounting and scans headerless SSE', async () => {
     const sse = `data: ${JSON.stringify({
       type: 'response.completed', response: { usage: { input_tokens: 21, output_tokens: 3 } },
@@ -1445,6 +1463,27 @@ describe('proxy usage extraction', () => {
 
     expect(captured?.accountingProvider).toBe('openai');
     expect(captured?.usage).toMatchObject({ input_tokens: 21, output_tokens: 3 });
+  });
+
+  it('scans a bypassed headerless non-stream Codex JSON response', async () => {
+    const restore = mockUpstream(() => {
+      const response = new Response(JSON.stringify({
+        id: 'resp_bypass_json', status: 'completed', usage: { input_tokens: 34, output_tokens: 5 }, output: [],
+      }), { status: 200 });
+      response.headers.delete('content-type');
+      return response;
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({ openAIUpstream: 'https://chatgpt.test', onRequest: (event) => { captured = event; } });
+    await (await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-pxpipe-bypass': '1' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: false }),
+    }))).text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(captured?.usage).toMatchObject({ input_tokens: 34, output_tokens: 5 });
   });
 
   it('marks a Responses refusal instead of overwriting it with a successful stop', async () => {
