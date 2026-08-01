@@ -71,6 +71,10 @@ interface RuntimeConfig {
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
+  /** Explicitly trust a loopback-published reverse proxy (the bundled Docker
+   * compose setup). Never enable this when the published port is reachable
+   * from an untrusted network. */
+  trustDashboardProxy: boolean;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -166,6 +170,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
+    trustDashboardProxy: process.env.PXPIPE_TRUST_DASHBOARD_PROXY === '1',
   };
 }
 
@@ -408,6 +413,18 @@ function isLoopbackHostname(hostname: string): boolean {
   const host = hostname.toLowerCase();
   return host === 'localhost' || host === '[::1]' || host === '::1'
     || (isIP(host) === 4 && host.split('.')[0] === '127');
+}
+
+function isAllowedDashboardClient(
+  address: string | undefined,
+  hostname: string,
+  trustDashboardProxy: boolean,
+): boolean {
+  // Host validation remains mandatory even in trusted-proxy mode. The opt-in
+  // only relaxes the socket-address check for Docker's bridge gateway; compose
+  // publishes the port to 127.0.0.1 only.
+  return isLoopbackHostname(hostname)
+    && (isLoopbackAddress(address) || trustDashboardProxy);
 }
 
 function isDashboardMutation(route: DashboardRoute, method: string): boolean {
@@ -1236,7 +1253,7 @@ async function main(): Promise<void> {
         // handled before the dashboard router. Fail-open: any throw → 200 with
         // an empty report rather than a 500.
         if (url.pathname === '/healthz' || url.pathname === '/api/health.json') {
-          if (!isLoopbackAddress(req.socket.remoteAddress) || !isLoopbackHostname(url.hostname)) {
+          if (!isAllowedDashboardClient(req.socket.remoteAddress, url.hostname, opts.trustDashboardProxy)) {
             await writeWebResponse(new Response('health endpoint is loopback-only', { status: 403 }), res);
             return;
           }
@@ -1258,7 +1275,7 @@ async function main(): Promise<void> {
         }
         const route = dashboardPath(url.pathname);
         if (route) {
-          if (!isLoopbackAddress(req.socket.remoteAddress) || !isLoopbackHostname(url.hostname)) {
+          if (!isAllowedDashboardClient(req.socket.remoteAddress, url.hostname, opts.trustDashboardProxy)) {
             await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
             return;
           }

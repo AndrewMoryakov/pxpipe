@@ -12,6 +12,9 @@ services:
     ports:
       - "127.0.0.1:${PXPIPE_PORT:-47821}:47821"
     environment:
+      # Docker bridge requests are not loopback inside the container. The port
+      # remains published to host loopback only, so dashboard/health stay local.
+      - PXPIPE_TRUST_DASHBOARD_PROXY=1
       - PXPIPE_MODELS
       - PXPIPE_DISABLE
       - PXPIPE_UPSTREAM

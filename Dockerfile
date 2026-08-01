@@ -43,6 +43,6 @@ EXPOSE 47821
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=5s --timeout=2s --start-period=2s --retries=3 \
-  CMD node -e "const s=require('node:net').connect(process.env.PORT,'127.0.0.1');s.setTimeout(1500);s.on('connect',()=>{s.destroy();process.exit(0)});s.on('timeout',()=>process.exit(1));s.on('error',()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["node", "dist/node.js"]

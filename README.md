@@ -79,6 +79,14 @@ pwsh -File scripts/pxpipe-healthcheck.ps1
 The endpoint reports `200` when healthy; a `503` includes a routing diagnosis.
 For how dashboard savings, cache tiers, and Codex rollout records are measured,
 see [the measurement and calibration audit](docs/MEASUREMENT_AUDIT.md).
+
+### Docker Compose
+
+`docker compose up -d` publishes pxpipe only on `127.0.0.1` and makes the
+dashboard plus `/healthz` available at the usual local port. The compose file
+explicitly trusts Docker's bridge proxy for those routes; do not copy that
+setting to a deployment whose published port is reachable from an untrusted
+network.
 ## Offline export (no proxy)
 
 You can render text, files, or diffs to PNG pages without running the proxy or
