@@ -14,7 +14,7 @@ services:
     environment:
       # Docker bridge requests are not loopback inside the container. The port
       # remains published to host loopback only, so dashboard/health stay local.
-      - PXPIPE_TRUST_DASHBOARD_PROXY=1
+      - PXPIPE_TRUSTED_DASHBOARD_PROXY=172.30.250.1
       - PXPIPE_MODELS
       - PXPIPE_DISABLE
       - PXPIPE_UPSTREAM
@@ -33,6 +33,14 @@ services:
       - PXPIPE_DEBUG_CAPTURE_4XX
     volumes:
       - pxpipe-data:/data
+    networks:
+      - pxpipe-local
 
 volumes:
   pxpipe-data:
+
+networks:
+  pxpipe-local:
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24
