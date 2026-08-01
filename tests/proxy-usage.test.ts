@@ -1392,6 +1392,34 @@ describe('proxy usage extraction', () => {
     expect(captured?.stopReason).toBe('stop');
   });
 
+  it('preserves Codex ChatGPT OAuth when OPENAI_API_KEY is configured', async () => {
+    let upstreamAuth: string | null = null;
+    const restore = mockUpstream((req) => {
+      upstreamAuth = req.headers.get('authorization');
+      return new Response(JSON.stringify({ id: 'resp_codex_auth', output: [] }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const proxy = createProxy({
+      openAIUpstream: 'https://chatgpt.test',
+      openAIApiKey: 'sk-openai-server-key',
+      transform: { compress: false },
+    });
+
+    const res = await proxy(new Request('http://localhost/backend-api/codex/responses', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer chatgpt-oauth-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+    }));
+    await res.text();
+    restore();
+
+    expect(upstreamAuth).toBe('Bearer chatgpt-oauth-token');
+  });
+
   it('marks a Responses refusal instead of overwriting it with a successful stop', async () => {
     const sseBody =
       `data: ${JSON.stringify({ type: 'response.refusal.delta', delta: 'cannot comply' })}\n\n` +

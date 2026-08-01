@@ -1496,7 +1496,12 @@ const model = googleModel ?? readModelField(bodyIn);
       const bridgeKey = bridgedChatMessages
         ? config.cloudflareApiKey
         : config.openAIApiKey;
-      if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      // Codex talks to chatgpt.com with the client's ChatGPT OAuth bearer.
+      // OPENAI_API_KEY is for canonical /v1 OpenAI endpoints only; replacing
+      // Codex's bearer here makes an otherwise valid signed-in session 401.
+      if (bridgeKey && !isChatGPTCodexPath(url.pathname)) {
+        outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      }
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
     }
