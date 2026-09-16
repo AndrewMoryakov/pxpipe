@@ -1,24 +1,38 @@
-# pxpipe tunnel keeper: local 47822 -> 185.177.219.147:47821
+# pxpipe tunnel keeper: local $CLIENT_PXPIPE_PORT -> шлюз:$GATEWAY_PXPIPE_PORT
 # Лог ведётся в C:\ProgramData\pxpipe и НЕ зависит от профиля пользователя,
 # поэтому тишина в логе однозначно означает "keeper не работает".
+#
+# ПЕРЕНОСИМОСТЬ: все значения контура берутся из переменных окружения
+# (задаются deploy\windows\apply-contour.ps1 из deploy\contour.env).
+# Дефолты ниже — рабочая конфигурация контура frankfurt-147; задача
+# планировщика запускает скрипт без окружения, поэтому дефолты обязаны
+# быть валидными, а не пустыми.
 $ErrorActionPreference = "Continue"
 
-$LogDir      = "C:\ProgramData\pxpipe"
+function Get-ContourValue($name, $default) {
+    $v = [Environment]::GetEnvironmentVariable($name, 'Machine')
+    if ([string]::IsNullOrWhiteSpace($v)) { $v = [Environment]::GetEnvironmentVariable($name) }
+    if ([string]::IsNullOrWhiteSpace($v)) { return $default }
+    return $v
+}
+
+$LogDir      = Get-ContourValue 'PXPIPE_CLIENT_LOG_DIR' 'C:\ProgramData\pxpipe'
 $Log         = Join-Path $LogDir "pxpipe-tunnel.log"
 $FallbackLog = Join-Path $env:TEMP "pxpipe-tunnel.log"
 $SshExe      = "C:\Windows\System32\OpenSSH\ssh.exe"
-$Remote      = "root@185.177.219.147"
-$LocalPort   = 47822
-$RemotePort  = 47821
+$Remote      = "{0}@{1}" -f (Get-ContourValue 'PXPIPE_GATEWAY_SSH_USER' 'root'),
+                            (Get-ContourValue 'PXPIPE_GATEWAY_SSH_HOST' '185.177.219.147')
+$LocalPort   = [int](Get-ContourValue 'PXPIPE_CLIENT_PXPIPE_PORT'  47822)
+$RemotePort  = [int](Get-ContourValue 'PXPIPE_GATEWAY_PXPIPE_PORT' 47821)
 $ProbeUrl    = "http://127.0.0.1:$LocalPort/"
 
-$HeartbeatSec  = 300    # строка "alive" раз в 5 минут
-$ProbeSec      = 60     # функциональная проверка канала раз в минуту
-$ProbeGraceSec = 20     # дать ssh подняться до первой проверки
-$ProbeFailMax  = 2      # убить keeper после N неудач подряд
-$BackoffMin    = 5
-$BackoffMax    = 60
-$StableSec     = 120    # соединение дольше этого считаем успешным
+$HeartbeatSec  = [int](Get-ContourValue 'PXPIPE_KEEPER_HEARTBEAT_SEC'  300)  # строка "alive" раз в 5 минут
+$ProbeSec      = [int](Get-ContourValue 'PXPIPE_KEEPER_PROBE_SEC'       60)  # функциональная проверка канала раз в минуту
+$ProbeGraceSec = [int](Get-ContourValue 'PXPIPE_KEEPER_PROBE_GRACE_SEC' 20)  # дать ssh подняться до первой проверки
+$ProbeFailMax  = [int](Get-ContourValue 'PXPIPE_KEEPER_PROBE_FAIL_MAX'   2)  # убить keeper после N неудач подряд
+$BackoffMin    = [int](Get-ContourValue 'PXPIPE_KEEPER_BACKOFF_MIN'      5)
+$BackoffMax    = [int](Get-ContourValue 'PXPIPE_KEEPER_BACKOFF_MAX'     60)
+$StableSec     = [int](Get-ContourValue 'PXPIPE_KEEPER_STABLE_SEC'     120)  # соединение дольше этого считаем успешным
 $MaxLogBytes   = 5MB
 
 function Write-Log {

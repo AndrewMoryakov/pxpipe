@@ -1,3 +1,19 @@
+<#
+.SYNOPSIS
+  Держит рабочий ssh-туннель (к pxpipe отношения не имеет — отдельный контур).
+.DESCRIPTION
+  Вынесен в комплект, потому что задача планировщика для него регистрируется
+  теми же правилами анти-сна, что и pxpipe-tunnel. Значения по умолчанию —
+  контур frankfurt-147; переопределяются параметрами.
+#>
+[CmdletBinding()]
+param(
+    [int]   $LocalPort     = 19443,
+    [string]$Destination   = 'TashkentWork',
+    [string]$RemoteEndpoint= '127.0.0.1:8443',
+    [int]   $PollSeconds   = 30
+)
+
 $ErrorActionPreference = 'Stop'
 
 function Test-LocalPort {
@@ -38,9 +54,8 @@ function Start-SshTunnel {
 }
 
 while ($true) {
-    Start-SshTunnel -LocalPort 19443 -Destination 'TashkentWork' `
-        -RemoteEndpoint '127.0.0.1:8443'
+    Start-SshTunnel -LocalPort $LocalPort -Destination $Destination `
+        -RemoteEndpoint $RemoteEndpoint
 
-
-    Start-Sleep -Seconds 30
+    Start-Sleep -Seconds $PollSeconds
 }

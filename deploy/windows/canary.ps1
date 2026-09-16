@@ -1,21 +1,33 @@
-﻿<#
-  pxpipe-canary — следит за здоровьем связки на desktop-bli1uf8 и шлёт в Telegram
+<#
+  pxpipe-canary — следит за здоровьем связки на клиенте контура и шлёт в Telegram
   ТОЛЬКО при смене состояния (OK<->FAIL), не спамит. api.telegram.org отсюда
   недоступен, поэтому отправка идёт через .147 по ssh (путь независим от Clash).
 
   Проверяет РЕАЛЬНЫЕ поломки: туннели, pxpipe через туннель, здоровье Service Mode
-  Clash (ядро под SYSTEM, служба, порт 7897). НЕ проверяет сам TUN/egress —
+  Clash (ядро под SYSTEM, служба, локальный порт прокси). НЕ проверяет сам TUN/egress —
   его выключение это ваш штатный жест, а не авария.
 
   Запускается задачей pxpipe-canary раз в 5 минут.
 #>
 $ErrorActionPreference = 'Stop'
 
-$stateFile = Join-Path $env:USERPROFILE 'bin\canary-state.txt'
-$logFile   = Join-Path $env:USERPROFILE 'bin\canary.log'
-$ssh       = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
-$key       = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
-$server    = 'root@185.177.219.147'
+function Get-ContourValue($name, $default) {
+    $v = [Environment]::GetEnvironmentVariable($name, 'Machine')
+    if ([string]::IsNullOrWhiteSpace($v)) { $v = [Environment]::GetEnvironmentVariable($name) }
+    if ([string]::IsNullOrWhiteSpace($v)) { return $default }
+    return $v
+}
+
+$stateFile  = Join-Path $env:USERPROFILE 'bin\canary-state.txt'
+$logFile    = Join-Path $env:USERPROFILE 'bin\canary.log'
+$ssh        = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+$key        = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
+$server     = "{0}@{1}" -f (Get-ContourValue 'PXPIPE_GATEWAY_SSH_USER' 'root'),
+                           (Get-ContourValue 'PXPIPE_GATEWAY_SSH_HOST' '185.177.219.147')
+$hostLabel  = Get-ContourValue 'PXPIPE_CONTOUR_NAME' $env:COMPUTERNAME
+$pxpipePort = [int](Get-ContourValue 'PXPIPE_CLIENT_PXPIPE_PORT' 47822)
+$workPort   = [int](Get-ContourValue 'PXPIPE_CLIENT_WORK_PORT'   19443)
+$clashPort  = [int](Get-ContourValue 'PXPIPE_CLIENT_CLASH_PORT'   7897)
 
 function Log($m) {
     try { "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m | Add-Content -Path $logFile -Encoding UTF8 } catch {}
@@ -30,19 +42,19 @@ try {
     $problems = New-Object System.Collections.Generic.List[string]
 
     # --- туннели ---
-    foreach ($p in 47822, 19443) {
+    foreach ($p in $pxpipePort, $workPort) {
         if (-not (Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue)) {
             $problems.Add("туннель $p не слушает")
         }
     }
 
-    # --- pxpipe через туннель 47822 (ответ про ключ = транспорт жив) ---
+    # --- pxpipe через туннель (ответ про ключ = транспорт жив) ---
     $savedH = $env:HTTP_PROXY; $savedS = $env:HTTPS_PROXY
     $env:HTTP_PROXY = ''; $env:HTTPS_PROXY = ''
     try {
-        $api = (& curl.exe -s --max-time 10 -X POST -H 'content-type: application/json' -d '{}' 'http://127.0.0.1:47822/v1/messages' 2>$null) -join ' '
+        $api = (& curl.exe -s --max-time 10 -X POST -H 'content-type: application/json' -d '{}' "http://127.0.0.1:$pxpipePort/v1/messages" 2>$null) -join ' '
     } finally { $env:HTTP_PROXY = $savedH; $env:HTTPS_PROXY = $savedS }
-    if ($api -notmatch 'authentication_error|x-api-key') { $problems.Add('pxpipe не отвечает через туннель 47822') }
+    if ($api -notmatch 'authentication_error|x-api-key') { $problems.Add("pxpipe не отвечает через туннель $pxpipePort") }
 
     # --- здоровье Service Mode Clash (не сам TUN) ---
     $core = @(Get-CimInstance Win32_Process -Filter "Name='verge-mihomo.exe'" -ErrorAction SilentlyContinue)
@@ -54,7 +66,7 @@ try {
     }
     $svc = Get-Service clash_verge_service -ErrorAction SilentlyContinue
     if (-not ($svc -and $svc.Status -eq 'Running')) { $problems.Add('Clash: служба clash_verge_service не Running') }
-    if (-not (Get-NetTCPConnection -State Listen -LocalPort 7897 -ErrorAction SilentlyContinue)) { $problems.Add('Clash: порт 7897 не слушает') }
+    if (-not (Get-NetTCPConnection -State Listen -LocalPort $clashPort -ErrorAction SilentlyContinue)) { $problems.Add("Clash: порт $clashPort не слушает") }
 
     $status = if ($problems.Count -eq 0) { 'OK' } else { 'FAIL' }
     $last   = if (Test-Path $stateFile) { (Get-Content $stateFile -Raw).Trim() } else { 'OK' }
@@ -62,9 +74,9 @@ try {
     if ($status -ne $last) {
         $ts = Get-Date -Format 'yyyy-MM-dd HH:mm'
         if ($status -eq 'FAIL') {
-            $text = "&#9888; <b>desktop-bli1uf8</b> — сбой ($ts)`n" + (($problems | ForEach-Object { "• $_" }) -join "`n")
+            $text = "&#9888; <b>$hostLabel</b> — сбой ($ts)`n" + (($problems | ForEach-Object { "• $_" }) -join "`n")
         } else {
-            $text = "&#9989; <b>desktop-bli1uf8</b> — всё восстановлено ($ts)"
+            $text = "&#9989; <b>$hostLabel</b> — всё восстановлено ($ts)"
         }
         $sent = Send-Telegram $text
         Log "переход $last -> $status; проблемы=[$($problems -join '; ')]; доставка=$sent"

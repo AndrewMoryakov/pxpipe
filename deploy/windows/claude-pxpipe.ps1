@@ -2,7 +2,12 @@ param([Parameter(Mandatory)][ValidateSet('On', 'Off')][string]$Mode)
 
 $ErrorActionPreference = 'Stop'
 $settingsPath = "$env:USERPROFILE\.claude\settings.json"
-$proxyUrl = 'http://127.0.0.1:47822'
+
+# Порт контура: PXPIPE_CLIENT_PXPIPE_PORT (machine env, ставится apply-contour.ps1).
+$port = [Environment]::GetEnvironmentVariable('PXPIPE_CLIENT_PXPIPE_PORT', 'Machine')
+if ([string]::IsNullOrWhiteSpace($port)) { $port = 47822 }
+$port = [int]$port
+$proxyUrl = "http://127.0.0.1:$port"
 
 if (-not (Test-Path "$settingsPath.bak-pxpipe")) {
     Copy-Item $settingsPath "$settingsPath.bak-pxpipe"   # pre-pxpipe copy, kept once
@@ -31,10 +36,10 @@ if ($Mode -eq 'On') {
     } catch {
         Write-Host "Не удалось управлять задачей pxpipe-tunnel ($($_.Exception.Message)). Запусти её вручную из Task Scheduler." -ForegroundColor Yellow
     }
-    if (Get-NetTCPConnection -State Listen -LocalPort 47822 -ErrorAction SilentlyContinue) {
-        Write-Host 'Туннель на 127.0.0.1:47822 поднят.' -ForegroundColor Green
+    if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+        Write-Host "Туннель на 127.0.0.1:$port поднят." -ForegroundColor Green
     } else {
-        Write-Host 'ВНИМАНИЕ: туннель на 127.0.0.1:47822 не слушает - Claude Code не сможет подключиться. См. %USERPROFILE%\bin\pxpipe-tunnel.log' -ForegroundColor Red
+        Write-Host "ВНИМАНИЕ: туннель на 127.0.0.1:$port не слушает - Claude Code не сможет подключиться. См. $env:ProgramData\pxpipe\pxpipe-tunnel.log" -ForegroundColor Red
     }
 } else {
     Write-Host 'Claude Code -> напрямую (api.anthropic.com)' -ForegroundColor Cyan
