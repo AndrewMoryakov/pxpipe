@@ -1,0 +1,15 @@
+#!/bin/sh
+# Восстанавливает raw/PREROUTING защиту localhost-сервисов от внешнего доступа.
+#
+# Зачем: docker-proxy публикует порты в 127.0.0.1, но на хостах с определённой
+# конфигурацией маршрутизации пакет с внешнего интерфейса, адресованный в
+# 127.0.0.1, может быть принят. Правило рубит такие пакеты в таблице raw —
+# до conntrack и до DOCKER-цепочек, которые иначе перекрыли бы фильтр.
+#
+# Идемпотентно: -C проверяет наличие, -A добавляет только если правила нет.
+# Запускается юнитом pxpipe-localhost-guard.service при каждой загрузке,
+# потому что netfilter-persistent на таком хосте может отсутствовать.
+for p in @GUARD_PORTS@; do
+  iptables -t raw -C PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport "$p" -j DROP 2>/dev/null \
+    || iptables -t raw -A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport "$p" -j DROP
+done
