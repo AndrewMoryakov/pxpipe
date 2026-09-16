@@ -1,0 +1,13 @@
+# Скрипты клиента запускает Windows PowerShell 5.1 (powershell.exe -File ...)
+# из задач планировщика. 5.1 читает .ps1 без BOM как ANSI: кириллица в
+# комментариях и строках превращается в мусор, и файл перестаёт парситься.
+# Поэтому .ps1 держим в UTF-8 с BOM и с CRLF, и git не должен это трогать.
+*.ps1 text eol=crlf
+
+# contour.env читают ОБА: apply-contour.ps1 и bash bootstrap-gateway.sh.
+# BOM сломал бы bash, поэтому здесь его нет — apply-contour.ps1 читает
+# этот файл с явным -Encoding UTF8.
+*.env text eol=lf
+*.sh text eol=lf
+*.template text eol=lf
+*.service text eol=lf

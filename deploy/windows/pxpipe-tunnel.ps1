@@ -1,4 +1,4 @@
-# pxpipe tunnel keeper: local $CLIENT_PXPIPE_PORT -> шлюз:$GATEWAY_PXPIPE_PORT
+﻿# pxpipe tunnel keeper: local $CLIENT_PXPIPE_PORT -> шлюз:$GATEWAY_PXPIPE_PORT
 # Лог ведётся в C:\ProgramData\pxpipe и НЕ зависит от профиля пользователя,
 # поэтому тишина в логе однозначно означает "keeper не работает".
 #

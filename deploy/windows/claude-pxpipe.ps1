@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][ValidateSet('On', 'Off')][string]$Mode)
+﻿param([Parameter(Mandatory)][ValidateSet('On', 'Off')][string]$Mode)
 
 $ErrorActionPreference = 'Stop'
 $settingsPath = "$env:USERPROFILE\.claude\settings.json"
