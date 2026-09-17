@@ -12,17 +12,30 @@ $proxyUrl = "http://127.0.0.1:$port"
 if (-not (Test-Path "$settingsPath.bak-pxpipe")) {
     Copy-Item $settingsPath "$settingsPath.bak-pxpipe"   # pre-pxpipe copy, kept once
 }
-$settings = Get-Content $settingsPath -Raw | ConvertFrom-Json -AsHashtable
-if (-not $settings.Contains('env')) { $settings['env'] = [ordered]@{} }
-
-if ($Mode -eq 'On') {
-    $settings['env']['ANTHROPIC_BASE_URL'] = $proxyUrl
-} else {
-    $settings['env'].Remove('ANTHROPIC_BASE_URL')
-    if ($settings['env'].Count -eq 0) { $settings.Remove('env') }
+# ВНИМАНИЕ: ниже намеренно не используются -AsHashtable и -Encoding utf8NoBOM —
+# это параметры PowerShell 6+, а задача/инструкция могут запускаться под
+# Windows PowerShell 5.1. Работа идёт через PSObject, запись — через .NET
+# (UTF-8 строго без BOM: Claude Code не читает settings.json с BOM).
+$settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
+if ($null -eq $settings.PSObject.Properties['env']) {
+    $settings | Add-Member -NotePropertyName 'env' -NotePropertyValue ([PSCustomObject]@{})
 }
 
-$settings | ConvertTo-Json -Depth 50 | Set-Content $settingsPath -Encoding utf8NoBOM
+if ($Mode -eq 'On') {
+    if ($null -eq $settings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) {
+        $settings.env | Add-Member -NotePropertyName 'ANTHROPIC_BASE_URL' -NotePropertyValue $proxyUrl
+    } else {
+        $settings.env.ANTHROPIC_BASE_URL = $proxyUrl
+    }
+} else {
+    $settings.env.PSObject.Properties.Remove('ANTHROPIC_BASE_URL')
+    if (@($settings.env.PSObject.Properties).Count -eq 0) {
+        $settings.PSObject.Properties.Remove('env')
+    }
+}
+
+$json = $settings | ConvertTo-Json -Depth 50
+[System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 
 if ($Mode -eq 'On') {
     Write-Host "Claude Code -> pxpipe ($proxyUrl)" -ForegroundColor Green
