@@ -1,150 +1,67 @@
-# pxpipe — развёртывание контура под ключ
+# deploy/ — развёртывание контура pxpipe
 
-Комплект переносит рабочее состояние «claude code / codex ходят через pxpipe»
-на новый набор машин. Всё, что отличает один контур от другого, вынесено в
-один файл — `contour.env`. Скрипты идемпотентны: повторный запуск приводит
-хост к тому же состоянию.
+Комплект переносит рабочее состояние: агенты (Claude Code / Codex) на машинах
+пользователей ходят к api.anthropic.com и chatgpt.com через собственный pxpipe,
+поднятый на VPS. К одному бэкенду подключается сколько угодно клиентов.
 
-## Из чего состоит контур
+## С чего начать
+
+| Задача | Документ |
+|---|---|
+| поднять бэкенд и настроить сеть — **один раз на контур** | **[RUNBOOK.md](RUNBOOK.md)** |
+| подключить машину агента — **столько раз, сколько клиентов** | **[CLIENT.md](CLIENT.md)** |
+
+Оба документа самодостаточны и рассчитаны на исполнение агентом.
+CLIENT.md не требует чтения RUNBOOK.md.
+
+**Источник истины — инструкции, а не скрипты.** Каждый шаг там выполним руками;
+скрипты ниже лишь ускоряют то же самое.
+
+## Топология
 
 ```
-  Windows-клиент            gateway-хост              egress-хост
-  (claude code, codex)      (185.177.219.147)         (81.85.50.83)
-  ─────────────────         ─────────────────         ─────────────
-  ANTHROPIC_BASE_URL   SSH  pxpipe в docker      SSH   tinyproxy
-  127.0.0.1:47822    ─────> 127.0.0.1:47821    ─────>  127.0.0.1:3128
-                            + localhost-guard           │
-  keeper держит туннель     (iptables)                  └─> api.anthropic.com
-  (задача планировщика)                                     chatgpt.com
+агент ──► 127.0.0.1:47822 ──SSH──► gateway 127.0.0.1:47821 ──► pxpipe (docker)
+                                                                     │
+                                       если IP gateway забанен:      │
+                                       172.30.250.1:3128 ◄──SSH── egress-хост
 ```
 
-**egress-хост нужен не всегда.** Он появляется только когда IP gateway
-заблокирован апстримом (Cloudflare отдаёт 403). Если gateway ходит наружу сам —
-`EGRESS_MODE=direct`, и вся правая колонка из схемы исчезает.
+Наружу на gateway открыт только порт 22. pxpipe слушает loopback.
+**Ключей и токенов pxpipe не хранит** — он сквозной, клиент шлёт свои credentials.
 
-Как выбрать — выполнить **на самом gateway**:
+## Файлы
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' --max-time 15 --noproxy '*' \
-     https://api.anthropic.com/v1/messages
-```
+| Файл | Назначение |
+|---|---|
+| `contour.example.env` | описание контура; заполненный пример = рабочий `frankfurt-147` |
+| `bootstrap-gateway.sh` | сервер: клон, `.env`, `docker compose up` |
+| `systemd/tashkent-proxy-tunnel.service.template` | сервер: SSH-туннель до egress-хоста |
+| `systemd/pxpipe-localhost-guard.{service,sh.template}` | сервер: iptables-защита loopback-портов |
+| `verify.sh` | сервер: приёмка |
+| `windows/pxpipe-tunnel.ps1` | клиент: keeper SSH-туннеля |
+| `windows/register-tasks.ps1` | клиент: регистрация задач планировщика |
+| `windows/claude-pxpipe.ps1` | клиент: переключатель `ANTHROPIC_BASE_URL` в settings.json |
+| `windows/start-tashkent-tunnels.ps1` | клиент: смежные рабочие туннели (не pxpipe) |
+| `windows/apply-contour.ps1` | клиент: раскатка `contour.env` в скрипты — **см. оговорку ниже** |
+| `windows/canary.ps1` | периодическая проверка — **в развёртывание не входит** |
+| `verify.ps1` | клиент: приёмка |
 
-`405` (или `401`) → маршрут и TLS живы, ставь `direct`. `403` → заблокирован,
-ставь `upstream-proxy`. 405 — это успех, а не ошибка: «метод не тот».
+## Оговорки
 
-## Порядок развёртывания
+Все `.ps1` — **UTF-8 с BOM**. Планировщик запускает их через Windows PowerShell 5.1,
+который без BOM читает файл как ANSI и падает на кириллице. Закреплено `.gitattributes`.
 
-### 0. Описать контур
-
-```bash
-cp deploy/contour.example.env deploy/contour.env
-$EDITOR deploy/contour.env
-```
-
-`contour.env` не коммитится. Секретов в нём нет — только топология; ключи и
-токены живут в `~/.ssh` и в `/opt/pxpipe/.env` на gateway.
-
-### 1. Gateway
-
-```bash
-scp -r deploy root@NEW_HOST:/tmp/pxpipe-deploy
-ssh root@NEW_HOST 'cd /tmp/pxpipe-deploy && ./bootstrap-gateway.sh contour.env'
-```
-
-Ставит исходники на пин `PXPIPE_REF`, поднимает compose, вешает
-`pxpipe-localhost-guard` и (при `upstream-proxy`) systemd-юнит SSH-туннеля к
-egress-хосту.
-
-### 2. Приёмка серверной половины
-
-```bash
-ssh root@NEW_HOST 'cd /tmp/pxpipe-deploy && ./verify.sh contour.env'
-```
-
-Проверяет цепь, а не наличие конфигов: egress реально отвечает, pxpipe реально
-слушает, guard реально стоит в таблице iptables.
-
-### 3. Windows-клиент
-
-Из-под администратора, **строго в этом порядке**:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy\windows\apply-contour.ps1 -ContourEnv deploy\contour.env -DryRun
-powershell -ExecutionPolicy Bypass -File deploy\windows\apply-contour.ps1 -ContourEnv deploy\contour.env
-powershell -ExecutionPolicy Bypass -File deploy\windows\register-tasks.ps1
-```
-
-`apply-contour.ps1` — единственный писатель контракта. Он раскладывает значения
-`contour.env` в **машинные** (HKLM) переменные `PXPIPE_*`, которые читают
-остальные скрипты. Scope именно Machine, потому что задачи планировщика идут
-под S4U и пользовательское окружение сессии не наследуют.
-
-Сначала всегда `-DryRun`: он не требует прав, не пишет в HKLM и показывает
-`[нет]` для каждого ключа, которого не хватает в файле. Если хоть один `[нет]` —
-останавливайся: без этого шага новый контур молча заработает на **чужих** хостах
-и портах. Ошибки не будет — будет неверное поведение.
-
-> **Перерегистрируй задачи после каждой смены контура.** Запущенные процессы
-> держат старое окружение; `register-tasks.ps1` перечитывает его заново.
-
-### 4. Ворота приёмки
-
-```powershell
-pwsh -File deploy\verify.ps1
-```
-
-Контур развёрнут **только** если получены `CLAUDE_OK` и `CODEX_OK` — то есть
-реальный запрос реальной моделью прошёл через pxpipe. Намеренно не считается
-успехом: «порт слушает», «docker ps healthy», «в конфиге нужный URL».
-
-## Кодировка скриптов — не косметика
-
-`.ps1` здесь лежат в **UTF-8 с BOM**, и это требование, а не стиль.
-
-Задачи планировщика запускают скрипты через `powershell.exe -File`, то есть
-Windows PowerShell 5.1. Без BOM он читает файл как ANSI: кириллица в
-комментариях и строках превращается в мусор, и файл перестаёт **парситься** —
-задача падает до выполнения первой строки. Проверено: `apply-contour.ps1` без
-BOM даёт `ParserError` под 5.1 и работает под pwsh 7, поэтому баг не виден,
-пока не запустишь ровно так, как его запускает планировщик.
-
-`contour.env`, `*.sh` и шаблоны — наоборот, **без BOM**: этот же файл парсит
-bash в `bootstrap-gateway.sh`. `apply-contour.ps1` читает его с явным
-`-Encoding UTF8`. Закреплено в `deploy/.gitattributes`.
-
-## Состав
-
-| Файл | Где исполняется | Что делает |
-|---|---|---|
-| `contour.example.env` | — | шаблон описания контура |
-| `bootstrap-gateway.sh` | gateway (root) | разворачивает gateway с нуля |
-| `verify.sh` | gateway | приёмка серверной половины |
-| `systemd/pxpipe-localhost-guard.*` | gateway | iptables-guard loopback-портов |
-| `systemd/tashkent-proxy-tunnel.service.template` | gateway | SSH-туннель к egress |
-| `windows/apply-contour.ps1` | клиент (admin) | contour.env → машинные `PXPIPE_*` |
-| `windows/register-tasks.ps1` | клиент (admin) | задачи планировщика: keeper, canary, туннели |
-| `windows/pxpipe-tunnel.ps1` | клиент (задача) | keeper SSH-туннеля с backoff |
-| `windows/start-tashkent-tunnels.ps1` | клиент (задача) | рабочие SSH-туннели |
-| `windows/canary.ps1` | клиент (задача) | периодическая проверка живости |
-| `windows/claude-pxpipe.ps1` | клиент | запуск claude code через pxpipe |
-| `verify.ps1` | клиент | ворота приёмки: CLAUDE_OK / CODEX_OK |
+`contour.env` не коммитится. Секретов в нём нет — только топология; ключи живут
+в `~/.ssh`, учётки агентов — на стороне клиента.
 
 ## Что проверено, а что нет
 
-Проверено на контуре `frankfurt-147` (gateway `185.177.219.147`, egress
-`81.85.50.83`):
+**Проверено** на живом контуре `frankfurt-147`: бэкенд, egress через upstream-proxy,
+iptables-guard переживает ребут, keeper ловит реальный обрыв и поднимает туннель за 5 с,
+сквозной запрос агента даёт HTTP 405.
 
-* gateway стоит на пине `PXPIPE_REF`, туннель поднимается сам после
-  перезагрузки, guard переживает reboot;
-* claude code и codex реально ходят через pxpipe — запросы видны в dashboard;
-* все семь `.ps1` парсятся под Windows PowerShell 5.1;
-* `apply-contour.ps1 -DryRun` на `contour.example.env` резолвит все 15
-  переменных контракта без единого `[нет]`.
-
-Не проверено:
-
-* полный `apply-contour.ps1` **без** `-DryRun` на живой машине — на
-  `frankfurt-147` клиент работает на встроенных дефолтах скриптов, машинные
-  `PXPIPE_*` там пусты. Путь проверен только вхолостую;
-* второй контур с нуля не поднимался. Комплект собран из рабочего первого,
-  но «развернулось на другом хосте» — ещё не наблюдалось.
+**Не проверено:**
+- второй контур с нуля никто не поднимал; `apply-contour.ps1` гонялся только `-DryRun`;
+- ветка `EGRESS_MODE=direct` не исполнялась — рабочий контур забанен Cloudflare;
+- канарейка с уведомлениями в Telegram: бот не создан, а сама она генерирует
+  основную массу 401-шума в дашборде (разбор — в CLIENT.md).
