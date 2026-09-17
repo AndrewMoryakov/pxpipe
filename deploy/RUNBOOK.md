@@ -6,6 +6,20 @@ Attaching clients is a separate document: **[CLIENT.md](CLIENT.md)**.
 The scripts under `deploy/` are an optional accelerator. Every step below is
 executable by hand; where a script does exactly the same thing, it is named.
 
+### Where this kit lives
+
+On branch `deploy/gateway-working-20260916` — **not** on the fork's default
+branch. `main` has no `deploy/` directory at all, so a plain `git clone` leaves
+you without these documents. Obtain it with:
+
+```bash
+git clone -b deploy/gateway-working-20260916 \
+    https://github.com/AndrewMoryakov/pxpipe.git
+```
+
+This is separate from the backend clone in step 1.1: that one checks out the
+pinned `PXPIPE_REF`, which is a backend SHA and carries no `deploy/` tree.
+
 ---
 
 ## What we are building

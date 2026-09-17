@@ -7,6 +7,17 @@ everything required is here.
 Target platform is Windows. The scripts in `deploy/windows/` are optional: every step
 is executable by hand.
 
+To get those scripts, clone the branch that carries them — the fork's default branch
+has no `deploy/` directory:
+
+```bash
+git clone -b deploy/gateway-working-20260916 \
+    https://github.com/AndrewMoryakov/pxpipe.git
+```
+
+Copy them out of the clone rather than downloading them individually: they must keep
+their UTF-8 **BOM** (see Step 3), and single-file downloads routinely strip it.
+
 ---
 
 ## What you need up front
