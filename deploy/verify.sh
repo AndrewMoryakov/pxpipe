@@ -77,6 +77,30 @@ else
     fi
 fi
 
+# --- 4b. Апстрим достижим ИМЕННО ЧЕРЕЗ pxpipe --------------------------------
+# Шаг 4 проверяет сеть хоста — он проходит даже тогда, когда сам pxpipe наружу
+# не ходит (у него своя proxy-конфигурация). Поэтому бьём в pxpipe заведомо
+# негодным ключом и требуем ответ ФОРМЫ АПСТРИМА: чужой JSON об отказе в
+# аутентификации доказывает, что запрос долетел и вернулся. Свой
+# "pxpipe upstream unreachable" — не доказывает.
+# Первый запрос после старта контейнера уходит в холодный резолв, поэтому 3 попытки.
+probe_upstream() {                   # $1=ярлык $2=путь $3=заголовок $4=тело $5=признак
+    local body=""
+    for _ in 1 2 3; do
+        body="$(curl -s --max-time 20 --noproxy '*' \
+            -X POST "http://127.0.0.1:${GATEWAY_PXPIPE_PORT}$2" \
+            -H 'content-type: application/json' -H "$3" -d "$4" 2>/dev/null)"
+        case "$body" in *"$5"*) pass "via-pxpipe-$1" "ответ апстрима получен"; return 0;; esac
+        sleep 3
+    done
+    fail "via-pxpipe-$1" "апстрим не ответил через pxpipe: $(printf '%.90s' "${body:-<пусто>}")"
+}
+probe_upstream anthropic /v1/messages 'x-api-key: pxpipe-verify-invalid' \
+    '{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+    'authentication_error'
+probe_upstream codex /backend-api/codex/responses 'authorization: Bearer pxpipe-verify-invalid' \
+    '{}' 'authentication'
+
 # --- 5. Guard стоит в таблице ------------------------------------------------
 missing=""
 for p in $GUARD_PORTS; do
