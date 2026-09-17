@@ -1,0 +1,7 @@
+# Contour env files describe a real deployment: gateway/egress hosts, login
+# users and private-key paths. This repo has a public fork, so only the
+# template is tracked. Keep this file in sync with README.md ("contour.env is
+# not committed") -- that promise is enforced here and nowhere else.
+contour.env
+contour.*.env
+!contour.example.env
