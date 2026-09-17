@@ -56,5 +56,23 @@ if ($Mode -eq 'On') {
     }
 } else {
     Write-Host 'Claude Code -> напрямую (api.anthropic.com)' -ForegroundColor Cyan
+    Write-Host 'Если прямой выход заблокирован (Cloudflare отдаёт 403) - Claude не заработает, верни режим On.' -ForegroundColor Yellow
 }
-Write-Host 'Изменение применится к новым сессиям Claude Code.'
+
+# Окружение читается процессом один раз при старте, поэтому уже открытые сессии
+# продолжат работать по-старому. Без явного предупреждения это выглядит так,
+# будто скрипт не сработал.
+$live = @(Get-Process claude -ErrorAction SilentlyContinue)
+if ($live.Count -eq 0) {
+    Write-Host 'Запущенных сессий Claude Code нет - изменение вступит в силу при следующем запуске.' -ForegroundColor Green
+} else {
+    Write-Host ''
+    Write-Host ("ВНИМАНИЕ: сейчас запущено сессий Claude Code: {0}." -f $live.Count) -ForegroundColor Yellow
+    Write-Host 'На них переключение НЕ подействует - окружение читается один раз при старте.' -ForegroundColor Yellow
+    foreach ($p in ($live | Sort-Object StartTime)) {
+        $started = '?'
+        try { $started = $p.StartTime.ToString('yyyy-MM-dd HH:mm:ss') } catch { }
+        Write-Host ("    PID {0,-7} запущен {1}" -f $p.Id, $started)
+    }
+    Write-Host 'Закрой ВСЕ окна Claude Code и открой заново.' -ForegroundColor Yellow
+}
