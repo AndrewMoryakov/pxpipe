@@ -11,6 +11,12 @@
 set -uo pipefail
 
 CONTOUR="${1:-contour.env}"
+# Запасной путь: контур ищем и рядом со скриптом — иначе запуск из любого
+# другого каталога (или после cd в вызывающем скрипте) падает на пустом месте.
+if [ ! -f "$CONTOUR" ]; then
+    _here="$(cd "$(dirname "$0")" && pwd)"
+    [ -f "$_here/$CONTOUR" ] && CONTOUR="$_here/$CONTOUR"
+fi
 [ -f "$CONTOUR" ] || { echo "нет файла контура: $CONTOUR" >&2; exit 2; }
 # shellcheck disable=SC1090
 set -a; . "$CONTOUR"; set +a

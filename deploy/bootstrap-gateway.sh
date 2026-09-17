@@ -13,6 +13,9 @@ CONTOUR="${1:-contour.env}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 [ -f "$CONTOUR" ] || { echo "нет файла контура: $CONTOUR (см. contour.example.env)" >&2; exit 2; }
+# Приводим к абсолютному пути СРАЗУ: ниже скрипт делает cd в $PXPIPE_DIR, после
+# чего относительное имя контура перестаёт резолвиться (ломало шаг приёмки).
+CONTOUR="$(cd "$(dirname "$CONTOUR")" && pwd)/$(basename "$CONTOUR")"
 # shellcheck disable=SC1090
 set -a; . "$CONTOUR"; set +a
 
