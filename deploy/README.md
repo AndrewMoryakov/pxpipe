@@ -1,67 +1,71 @@
-# deploy/ — развёртывание контура pxpipe
+# deploy/ — pxpipe contour deployment
 
-Комплект переносит рабочее состояние: агенты (Claude Code / Codex) на машинах
-пользователей ходят к api.anthropic.com и chatgpt.com через собственный pxpipe,
-поднятый на VPS. К одному бэкенду подключается сколько угодно клиентов.
+This kit reproduces a working setup: agents (Claude Code / Codex) on user machines
+reach api.anthropic.com and chatgpt.com through a self-hosted pxpipe on a VPS.
+Any number of clients can attach to a single backend.
 
-## С чего начать
+## Start here
 
-| Задача | Документ |
+| Task | Document |
 |---|---|
-| поднять бэкенд и настроить сеть — **один раз на контур** | **[RUNBOOK.md](RUNBOOK.md)** |
-| подключить машину агента — **столько раз, сколько клиентов** | **[CLIENT.md](CLIENT.md)** |
+| bring up the backend and its networking — **once per contour** | **[RUNBOOK.md](RUNBOOK.md)** |
+| attach an agent machine — **once per client** | **[CLIENT.md](CLIENT.md)** |
 
-Оба документа самодостаточны и рассчитаны на исполнение агентом.
-CLIENT.md не требует чтения RUNBOOK.md.
+Both documents are self-contained and written to be executed by an agent.
+CLIENT.md does not require reading RUNBOOK.md.
 
-**Источник истины — инструкции, а не скрипты.** Каждый шаг там выполним руками;
-скрипты ниже лишь ускоряют то же самое.
+**The instructions are the source of truth, not the scripts.** Every step in them is
+executable by hand; the scripts below only accelerate the same work.
 
-## Топология
+## Topology
 
 ```
-агент ──► 127.0.0.1:47822 ──SSH──► gateway 127.0.0.1:47821 ──► pxpipe (docker)
+agent ──► 127.0.0.1:47822 ──SSH──► gateway 127.0.0.1:47821 ──► pxpipe (docker)
                                                                      │
-                                       если IP gateway забанен:      │
-                                       172.30.250.1:3128 ◄──SSH── egress-хост
+                                       if the gateway IP is banned:  │
+                                       172.30.250.1:3128 ◄──SSH── egress host
 ```
 
-Наружу на gateway открыт только порт 22. pxpipe слушает loopback.
-**Ключей и токенов pxpipe не хранит** — он сквозной, клиент шлёт свои credentials.
+Only port 22 is exposed on the gateway; pxpipe listens on loopback.
+**pxpipe stores no keys or tokens** — it is a pass-through and the client sends its own
+credentials.
 
-## Файлы
+## Files
 
-| Файл | Назначение |
+| File | Purpose |
 |---|---|
-| `contour.example.env` | описание контура; заполненный пример = рабочий `frankfurt-147` |
-| `bootstrap-gateway.sh` | сервер: клон, `.env`, `docker compose up` |
-| `systemd/tashkent-proxy-tunnel.service.template` | сервер: SSH-туннель до egress-хоста |
-| `systemd/pxpipe-localhost-guard.{service,sh.template}` | сервер: iptables-защита loopback-портов |
-| `verify.sh` | сервер: приёмка |
-| `windows/pxpipe-tunnel.ps1` | клиент: keeper SSH-туннеля |
-| `windows/register-tasks.ps1` | клиент: регистрация задач планировщика |
-| `windows/claude-pxpipe.ps1` | клиент: переключатель `ANTHROPIC_BASE_URL` в settings.json |
-| `windows/start-tashkent-tunnels.ps1` | клиент: смежные рабочие туннели (не pxpipe) |
-| `windows/apply-contour.ps1` | клиент: раскатка `contour.env` в скрипты — **см. оговорку ниже** |
-| `windows/canary.ps1` | периодическая проверка — **в развёртывание не входит** |
-| `verify.ps1` | клиент: приёмка |
+| `contour.example.env` | contour description; the filled-in example is the live `frankfurt-147` |
+| `bootstrap-gateway.sh` | server: clone, `.env`, `docker compose up` |
+| `systemd/tashkent-proxy-tunnel.service.template` | server: SSH tunnel to the egress host |
+| `systemd/pxpipe-localhost-guard.{service,sh.template}` | server: iptables guard for loopback ports |
+| `verify.sh` | server: acceptance checks |
+| `windows/pxpipe-tunnel.ps1` | client: SSH tunnel keeper |
+| `windows/register-tasks.ps1` | client: scheduled task registration |
+| `windows/claude-pxpipe.ps1` | client: `ANTHROPIC_BASE_URL` toggle in settings.json |
+| `windows/start-tashkent-tunnels.ps1` | client: adjacent work tunnels (not pxpipe) |
+| `windows/apply-contour.ps1` | client: renders `contour.env` into the scripts — **see caveat** |
+| `windows/canary.ps1` | periodic probe — **not part of deployment** |
+| `verify.ps1` | client: acceptance checks |
 
-## Оговорки
+## Caveats
 
-Все `.ps1` — **UTF-8 с BOM**. Планировщик запускает их через Windows PowerShell 5.1,
-который без BOM читает файл как ANSI и падает на кириллице. Закреплено `.gitattributes`.
+All `.ps1` files are **UTF-8 with BOM**. Task Scheduler runs them through Windows
+PowerShell 5.1, which without a BOM reads the file as ANSI and dies on non-ASCII
+characters. Enforced by `.gitattributes`.
 
-`contour.env` не коммитится. Секретов в нём нет — только топология; ключи живут
-в `~/.ssh`, учётки агентов — на стороне клиента.
+`contour.env` is not committed. It holds no secrets — only topology; keys live in
+`~/.ssh` and agent credentials stay on the client.
 
-## Что проверено, а что нет
+## What is verified and what is not
 
-**Проверено** на живом контуре `frankfurt-147`: бэкенд, egress через upstream-proxy,
-iptables-guard переживает ребут, keeper ловит реальный обрыв и поднимает туннель за 5 с,
-сквозной запрос агента даёт HTTP 405.
+**Verified** on the live `frankfurt-147` contour: backend, egress via upstream-proxy,
+the iptables guard surviving a reboot, the keeper catching a real disconnect and
+restoring the tunnel in 5 s, and an end-to-end agent request returning HTTP 405.
 
-**Не проверено:**
-- второй контур с нуля никто не поднимал; `apply-contour.ps1` гонялся только `-DryRun`;
-- ветка `EGRESS_MODE=direct` не исполнялась — рабочий контур забанен Cloudflare;
-- канарейка с уведомлениями в Telegram: бот не создан, а сама она генерирует
-  основную массу 401-шума в дашборде (разбор — в CLIENT.md).
+**Not verified:**
+- nobody has brought up a second contour from scratch; `apply-contour.ps1` has only
+  been run with `-DryRun`;
+- the `EGRESS_MODE=direct` branch has never executed — the working contour is
+  Cloudflare-banned;
+- the Telegram canary: the bot was never created, and the canary itself produces most
+  of the 401 noise in the dashboard (analysis in CLIENT.md).

@@ -1,96 +1,99 @@
-# Подключение клиента (агента) к pxpipe
+# Attaching a Client (Agent) to pxpipe
 
-Инструкция для агента, который подключает **одну машину** к уже работающему бэкенду.
-Выполняется столько раз, сколько клиентов. Читать [RUNBOOK.md](RUNBOOK.md) для этого
-не нужно — здесь всё, что требуется.
+Instructions for an agent attaching **one machine** to an already-running backend.
+Repeat once per client. You do **not** need to read [RUNBOOK.md](RUNBOOK.md) for this —
+everything required is here.
 
-Целевая платформа — Windows. Скрипты в `deploy/windows/` необязательны: каждый шаг
-выполним руками.
+Target platform is Windows. The scripts in `deploy/windows/` are optional: every step
+is executable by hand.
 
 ---
 
-## Что нужно знать заранее
+## What you need up front
 
-| Нужно | Пример |
+| Needed | Example |
 |---|---|
-| хост и пользователь gateway | `185.177.219.147`, `root` |
-| порт pxpipe **на gateway** | `47821` |
-| локальный порт **на этой машине** | `47822` |
-| SSH-ключ этой машины | `~/.ssh/id_ed25519_hopt` |
+| gateway host and user | `185.177.219.147`, `root` |
+| pxpipe port **on the gateway** | `47821` |
+| local port **on this machine** | `47822` |
+| SSH key for this machine | `~/.ssh/id_ed25519_hopt` |
 
 ```
-агент ──► http://127.0.0.1:47822 ──SSH──► gateway 127.0.0.1:47821
+agent ──► http://127.0.0.1:47822 ──SSH──► gateway 127.0.0.1:47821
 ```
 
-> **Не путай 47821 и 47822.** 47821 живёт на сервере, 47822 — здесь. Туннель:
-> `-L 127.0.0.1:47822:127.0.0.1:47821`. Перепутанные местами порты — самый частый
-> способ сломать подключение, причём симптом будет «просто не отвечает».
+> **Do not confuse 47821 and 47822.** 47821 lives on the server, 47822 lives here.
+> The tunnel is `-L 127.0.0.1:47822:127.0.0.1:47821`. Swapping them is the most common
+> way to break the setup, and the symptom is just "nothing responds".
 
-> **На бэкенде ничего регистрировать не надо.** pxpipe не хранит ключей и токенов —
-> он сквозной, клиент шлёт свои credentials. Всё, что нужно на стороне сервера, —
-> публичный ключ в `authorized_keys`.
+> **Nothing needs to be registered on the backend.** pxpipe stores no keys or tokens —
+> it is a pass-through and the client sends its own credentials. The only server-side
+> requirement is a public key in `authorized_keys`.
 
 ---
 
-## Шаг 1. Включить лог планировщика — ДО всего остального
+## Step 1. Enable the Task Scheduler log — before anything else
 
 ```powershell
 wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
 ```
 
-> Этот журнал **по умолчанию выключен**. Без него состояние «задача существует,
-> числится Ready, но ни разу не запускалась» диагностике не поддаётся вообще —
-> в системе просто нет следов. Это предусловие установки, а не приём отладки.
-> На этом в своё время потеряли несколько дней.
+> This log is **disabled by default**. Without it, the state "the task exists, reads as
+> Ready, and has never actually run" is undiagnosable — the system keeps no trace of it
+> at all. This is an installation prerequisite, not a debugging technique. Several days
+> were lost to exactly this.
 
-Проверка: `wevtutil gl Microsoft-Windows-TaskScheduler/Operational | Select-String enabled`
+Check: `wevtutil gl Microsoft-Windows-TaskScheduler/Operational | Select-String enabled`
 → `enabled: true`.
 
 ---
 
-## Шаг 2. Доступ по SSH
+## Step 2. SSH access
 
 ```powershell
-# если ключа нет
+# if no key exists yet
 ssh-keygen -t ed25519 -f $env:USERPROFILE\.ssh\id_ed25519_hopt -N '""'
 ```
 
-Публичную часть — на gateway в `~/.ssh/authorized_keys` нужного пользователя.
+Install the public half into `~/.ssh/authorized_keys` of the target user on the gateway.
 
-**Проверка (обязательна, иначе дальше всё будет молча не работать):**
+**Verification (mandatory — otherwise everything downstream fails silently):**
 ```powershell
 ssh -o BatchMode=yes -o ConnectTimeout=10 -i $env:USERPROFILE\.ssh\id_ed25519_hopt root@185.177.219.147 'echo OK'
-# ОЖИДАЕТСЯ: OK, без единого запроса пароля
+# EXPECT: OK, with no password prompt whatsoever
 ```
-`BatchMode=yes` здесь принципиален: он превращает «спросит пароль» в честную ошибку.
-Задача планировщика ввести пароль не сможет.
+`BatchMode=yes` matters here: it turns "would prompt for a password" into an honest
+error. A scheduled task can never answer a prompt.
 
 ---
 
-## Шаг 3. Туннель под присмотром keeper'а
+## Step 3. The tunnel, supervised by a keeper
 
-Голый `ssh -L` не годится: он молча умирает и не возвращается (см. «Modern Standby» ниже).
-Нужен keeper — цикл, который держит `ssh`, щупает порт и перезапускает с backoff.
+A bare `ssh -L` is not sufficient: it dies silently and never comes back (see
+"Modern Standby" below). What is needed is a keeper — a loop that holds `ssh`, probes
+the port, and restarts with backoff.
 
-Готовый: [`windows/pxpipe-tunnel.ps1`](windows/pxpipe-tunnel.ps1) → положить в `%USERPROFILE%\bin\`.
+Ready-made: [`windows/pxpipe-tunnel.ps1`](windows/pxpipe-tunnel.ps1) → place in
+`%USERPROFILE%\bin\`.
 
-Что он делает:
-- поднимает `ssh -N -L 127.0.0.1:47822:127.0.0.1:47821 root@<gateway>`;
-- раз в 30 с проверяет порт; после 3 неудач подряд — перезапуск;
-- backoff 5 с → 300 с, сброс после 120 с стабильной работы;
-- убивает осиротевший `ssh` от прошлого запуска (иначе тот держит 47822 и новый не встанет);
-- пишет `C:\ProgramData\pxpipe\pxpipe-tunnel.log`.
+What it does:
+- runs `ssh -N -L 127.0.0.1:47822:127.0.0.1:47821 root@<gateway>`;
+- probes the port every 30 s; restarts after 3 consecutive failures;
+- backoff 5 s → 300 s, reset after 120 s of stable operation;
+- kills an orphaned `ssh` left by a previous run (otherwise it squats on 47822 and the
+  new one cannot bind);
+- writes `C:\ProgramData\pxpipe\pxpipe-tunnel.log`.
 
-> **Файл обязан быть в UTF-8 **с BOM**.** Планировщик запускает задачи через
-> **Windows PowerShell 5.1**, а не pwsh 7. PS 5.1 читает UTF-8 без BOM как ANSI и
-> падает с `ParserError` на первой же кириллической букве. Под pwsh 7 тот же файл
-> работает — поэтому баг невидим при ручной проверке.
-> В репозитории закреплено через `.gitattributes`; при копировании руками —
-> следи сам: `Get-Content file.ps1 -AsByteStream -TotalCount 3` → `239 187 191`.
+> **The file must be UTF-8 **with BOM**.** Task Scheduler launches tasks through
+> **Windows PowerShell 5.1**, not pwsh 7. PS 5.1 reads BOM-less UTF-8 as ANSI and dies
+> with `ParserError` on the first non-ASCII character. The same file runs fine under
+> pwsh 7 — which is why the bug is invisible during manual testing.
+> Enforced in the repo via `.gitattributes`; when copying by hand, check it yourself:
+> `Get-Content file.ps1 -AsByteStream -TotalCount 3` → `239 187 191`.
 
 ---
 
-## Шаг 4. Автозапуск
+## Step 4. Autostart
 
 ```powershell
 $act = New-ScheduledTaskAction -Execute 'powershell.exe' `
@@ -112,123 +115,123 @@ Register-ScheduledTask -TaskName 'pxpipe-tunnel' -Action $act -Trigger $trg `
   -Settings $set -LogonType S4U -RunLevel Limited -Force
 ```
 
-Каждый флаг закрывает конкретный наблюдавшийся отказ:
+Every flag closes a specific observed failure:
 
-| Флаг | Без него |
+| Flag | Without it |
 |---|---|
-| `DisallowStartIfOnBatteries = $false` | на ноутбуке задача **не стартует вообще** — это дефолт `true` |
-| `StopIfGoingOnBatteries = $false` | работает, пока не выдернули питание |
-| `ExecutionTimeLimit = PT0S` | планировщик убивает keeper через 3 дня (дефолт 72 ч) |
-| `RunOnlyIfNetworkAvailable = $false` | после сна сеть «ещё не готова» → пропуск запуска |
-| `StartWhenAvailable` | пропущенный из-за сна запуск не догоняется |
-| `AtStartup` **и** `AtLogOn` | покрывают ребут и перелогин; ни один по отдельности не покрывает оба |
-| `S4U` | иначе задаче нужен сохранённый пароль |
+| `DisallowStartIfOnBatteries = $false` | on a laptop the task **never starts at all** — the default is `true` |
+| `StopIfGoingOnBatteries = $false` | works until the power cable is pulled |
+| `ExecutionTimeLimit = PT0S` | the scheduler kills the keeper after 3 days (72 h default) |
+| `RunOnlyIfNetworkAvailable = $false` | after sleep the network is "not ready yet" → run skipped |
+| `StartWhenAvailable` | a run missed due to sleep is never caught up |
+| `AtStartup` **and** `AtLogOn` | cover reboot and re-login; neither alone covers both |
+| `S4U` | otherwise the task requires a stored password |
 
-> **`MultipleInstances = IgnoreNew` — осознанный размен.** Он защищает от
-> наслоения копий keeper'а, но если единственный экземпляр залипнет, новый не
-> запустится и восстановления не будет. Живучесть отдана внутреннему циклу keeper'а,
-> а не планировщику. Если keeper когда-нибудь начнёт зависать — пересматривать
-> надо именно это решение.
+> **`MultipleInstances = IgnoreNew` is a deliberate trade-off.** It prevents keeper
+> copies from stacking, but if the single instance ever wedges, no new one starts and
+> there is no recovery. Liveness is delegated to the keeper's internal loop rather than
+> to the scheduler. If the keeper ever begins to hang, this is the decision to revisit.
 
-Скрипт: `windows/register-tasks.ps1` регистрирует это же и проверяет применённые флаги
-чтением XML задачи (`MultipleInstancesPolicy` иначе читается недостоверно).
+Script: `windows/register-tasks.ps1` registers the same thing and verifies the applied
+flags by reading the task XML (`MultipleInstancesPolicy` cannot be read reliably any
+other way).
 
 ---
 
-## Шаг 5. Направить агента в туннель
+## Step 5. Point the agent at the tunnel
 
-`ANTHROPIC_BASE_URL` **не** ставится глобально. Claude Code берёт его из
+`ANTHROPIC_BASE_URL` is **not** set globally. Claude Code reads it from
 `~/.claude/settings.json`:
 
 ```json
 { "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:47822" } }
 ```
 
-Переключатель: [`windows/claude-pxpipe.ps1`](windows/claude-pxpipe.ps1) — правит этот
-ключ в settings.json (`on` / `off`).
+Toggle: [`windows/claude-pxpipe.ps1`](windows/claude-pxpipe.ps1) flips that key
+(`on` / `off`).
 
-> Значение применяется **при старте** Claude Code. Уже запущенная сессия продолжает
-> ходить по-старому — после переключения нужен рестарт агента.
+> The value is applied **at startup**. A session that is already running keeps using the
+> old route — restart the agent after toggling.
 
-Codex читает `OPENAI_API_BASE` из окружения процесса.
+Codex reads `OPENAI_API_BASE` from the process environment.
 
 ---
 
-## Шаг 6. Приёмка
+## Step 6. Acceptance
 
 ```powershell
-# 1. туннель слушает
+# 1. the tunnel is listening
 Get-NetTCPConnection -State Listen -LocalPort 47822
-# ОЖИДАЕТСЯ: строки для 127.0.0.1 и ::1
+# EXPECT: entries for both 127.0.0.1 and ::1
 
-# 2. сквозной запрос
+# 2. end-to-end request
 try { Invoke-WebRequest 'http://127.0.0.1:47822/v1/messages' -Method GET -TimeoutSec 10 -UseBasicParsing }
 catch { [int]$_.Exception.Response.StatusCode }
-# ОЖИДАЕТСЯ: 405   ← это успех: маршрут живой, «метод не тот»
+# EXPECT: 405   ← this is success: route alive, "wrong method"
 
-# 3. задача жива
+# 3. the task is alive
 Get-ScheduledTask -TaskName 'pxpipe-tunnel' | Get-ScheduledTaskInfo
 ```
 
-`LastTaskResult = 267009` (`0x41301`) — это «выполняется сейчас», норма для keeper'а.
+`LastTaskResult = 267009` (`0x41301`) means "currently running" — normal for a keeper.
 
-**Настоящая приёмка — ребут.** Перезагрузить, подождать ~2 мин, не логинясь проверить
-пункт 1, затем повторить 1–3. Скрипт `verify.ps1` прогоняет то же.
+**Real acceptance is a reboot.** Restart, wait ~2 min, check item 1 *without logging in*,
+then repeat 1–3. The `verify.ps1` script runs the same set.
 
 ---
 
-## Каталог отказов (по симптому)
+## Failure catalogue (by symptom)
 
-### Задача «Ready», `LastRunTime` не меняется, следов нет
-Включи журнал планировщика (шаг 1) — без него причина невидима. Затем смотри
-`DisallowStartIfOnBatteries`: на ноутбуке дефолт `true` тихо блокирует запуск.
+### Task reads "Ready", `LastRunTime` never changes, no trace anywhere
+Enable the Task Scheduler log (Step 1) — without it the cause is invisible. Then check
+`DisallowStartIfOnBatteries`: on a laptop the default `true` silently blocks startup.
 
-### Задача стартует и сразу завершается, `rc` ненулевой
-Открой `.ps1` и проверь BOM (шаг 3). Симптом-обманка: вручную через `pwsh` файл
-запускается нормально, а планировщик использует PS 5.1 и падает на кириллице.
+### Task starts and immediately exits with a non-zero result
+Open the `.ps1` and check for a BOM (Step 3). Deceptive symptom: the file runs fine when
+launched manually via `pwsh`, while the scheduler uses PS 5.1 and dies on non-ASCII text.
 
-### Туннель работал часами, потом пропал и не вернулся
-Modern Standby. Windows усыпляет машину, рвёт TCP и **не восстанавливает** проброс;
-`ssh` при этом может остаться висеть процессом, не обслуживая порт. Это и есть причина
-существования keeper'а. В логе это выглядит так:
+### The tunnel ran for hours, then vanished and never returned
+Modern Standby. Windows suspends the machine, tears down TCP, and does **not** restore
+the forward; `ssh` may even survive as a process while serving nothing. This is the whole
+reason the keeper exists. In the log it looks like this:
 
 ```
-08:01:39 health: проверка не прошла (1/2)
+08:01:39 health: probe failed (1/2)
 08:01:39 ssh: client_loop: send disconnect: Connection reset
 08:01:40 tunnel exited after 3899s, retry in 5s
 08:01:45 starting tunnel
-08:06:50 alive (туннель держится 5 мин)
+08:06:50 alive (tunnel up 5 min)
 ```
 
-Это **нормальная** работа: обрыв пойман и закрыт за 5 секунд. Тревожно, если после
-`tunnel exited` нет `starting tunnel`.
+That is **healthy** behaviour: the break was caught and closed in 5 seconds. The alarming
+case is `tunnel exited` with no following `starting tunnel`.
 
-### Порт 47822 занят, но запросы не проходят
-Осиротевший `ssh` от прошлого keeper'а. `Get-Process ssh` → убить → keeper поднимет
-заново. Штатный keeper это делает сам при старте.
+### Port 47822 is occupied but requests do not go through
+An orphaned `ssh` from a previous keeper. `Get-Process ssh` → kill → the keeper will
+re-establish. A healthy keeper does this itself on startup.
 
-### Агент не видит прокси, хотя туннель поднят
-`ANTHROPIC_BASE_URL` читается при старте. Перезапусти Claude Code. Проверь, что
-правился `~/.claude/settings.json`, а не переменная окружения.
+### The agent ignores the proxy even though the tunnel is up
+`ANTHROPIC_BASE_URL` is read at startup. Restart Claude Code. Confirm you edited
+`~/.claude/settings.json` and not an environment variable.
 
 ---
 
-## Про 401 в дашборде
+## About the 401s in the dashboard
 
-Наблюдалось: 4 из 19 запросов → 401. Разобрано, бэкенд ни при чём.
-**pxpipe не хранит учёток и не может отдать 401 «от себя»** — 401 всегда приходит
-с апстрима. За 48 ч в логе два разных класса:
+Observed: 4 of 19 requests returning 401. Investigated — the backend is not involved.
+**pxpipe stores no credentials and cannot originate a 401**; a 401 always comes from
+upstream. Over 48 h the log contains two distinct classes:
 
-| Класс | Сколько | Что это |
+| Class | Count | What it is |
 |---|---|---|
-| `401 … skip(unsupported_model)` | 118 | **канарейка.** Шлёт `claude-haiku-4-5`, которой нет в `PXPIPE_MODELS` → pxpipe пропускает запрос мимо себя → апстрим отвергает. Шум, ровно раз в 5 минут. |
-| `401 … compressed …` | 13 | **реальные запросы агента** с невалидной учёткой. Совпало с прерванным `/login`. |
+| `401 … skip(unsupported_model)` | 118 | **the canary.** It sends `claude-haiku-4-5`, which is absent from `PXPIPE_MODELS`, so pxpipe passes the request straight through and upstream rejects it. Noise, exactly every 5 minutes. |
+| `401 … compressed …` | 13 | **real agent requests** with invalid credentials. Coincided with an interrupted `/login`. |
 
-Что делать:
-- ровный интервал 5 минут → канарейка, чинить нечего. Либо добавь её модель в
-  `PXPIPE_MODELS`, либо не считай эти строки за инцидент.
-- 401 на больших запросах (`compressed`, десятки тысяч символов) → перелогинить агента.
-- 401 **на всех** запросах подряд → тогда смотри бэкенд и egress.
+What to do:
+- an even 5-minute interval → it is the canary; nothing to fix. Either add its model to
+  `PXPIPE_MODELS` or stop counting those lines as incidents.
+- 401 on large requests (`compressed`, tens of thousands of characters) → re-login the agent.
+- 401 on **every** request → only then look at the backend and egress.
 
-> Канарейка не входит в развёртывание (бот в Telegram не создан) и при этом сама
-> генерирует большую часть 401-шума. Ставить её на новом контуре — не надо.
+> The canary is not part of deployment (the Telegram bot was never created), and it
+> generates the bulk of the 401 noise by itself. Do not install it on a new contour.
