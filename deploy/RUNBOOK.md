@@ -135,7 +135,19 @@ Restart=always
 RestartSec=15
 ```
 
-Two things here are non-obvious and both caused outages:
+**Before enabling the unit, seed `known_hosts`** — otherwise `StrictHostKeyChecking=yes`
+fails the very first start with `Host key verification failed`, and `Restart=always`
+turns that into exactly the restart storm described below:
+
+```bash
+ssh-keyscan -H 81.85.50.83 >> /root/.ssh/known_hosts
+ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+    -i /root/.ssh/id_ed25519_tashkent_tunnel hopt@81.85.50.83 'echo OK'   # must print OK
+```
+
+Only then `systemctl enable --now tashkent-proxy-tunnel.service`.
+
+Two more things here are non-obvious and both caused outages:
 
 > **Bind to the docker bridge address (`172.30.250.1`), never to an overlay/NetBird
 > address.** The overlay address changed on its own and left the tunnel permanently

@@ -88,8 +88,14 @@ What it does:
 > **Windows PowerShell 5.1**, not pwsh 7. PS 5.1 reads BOM-less UTF-8 as ANSI and dies
 > with `ParserError` on the first non-ASCII character. The same file runs fine under
 > pwsh 7 — which is why the bug is invisible during manual testing.
-> Enforced in the repo via `.gitattributes`; when copying by hand, check it yourself:
-> `Get-Content file.ps1 -AsByteStream -TotalCount 3` → `239 187 191`.
+> Enforced in the repo via `.gitattributes`; when copying by hand, check it yourself.
+> Note the check itself is version-dependent — `-AsByteStream` is PowerShell 6+, and
+> under the 5.1 this section is about you need `-Encoding Byte`:
+>
+> ```powershell
+> # works on both:
+> [IO.File]::ReadAllBytes('file.ps1')[0..2]      # EXPECT: 239 187 191
+> ```
 
 ---
 
@@ -173,7 +179,20 @@ catch { [int]$_.Exception.Response.StatusCode }
 Get-ScheduledTask -TaskName 'pxpipe-tunnel' | Get-ScheduledTaskInfo
 ```
 
-`LastTaskResult = 267009` (`0x41301`) means "currently running" — normal for a keeper.
+**On `LastTaskResult`.** Measured on the live client while `State = Running`:
+
+```
+pxpipe-tunnel    State=Running  rc=2147946720 (0x800710E0)
+```
+
+`0x800710E0` is "the operator or administrator has refused the request" — and it is
+**normal here**. It is the direct consequence of `MultipleInstances = IgnoreNew` from
+Step 4: the repetition trigger fires, one instance is already running, the new one is
+refused, and that refusal is what gets recorded. Judge health by `State`, by the port,
+and by the log — **not** by `LastTaskResult`.
+
+(`267009` / `0x41301` = `SCHED_S_TASK_RUNNING` is also a legitimate "still running"
+code, but this configuration does not produce it. Do not go debugging `0x800710E0`.)
 
 **Real acceptance is a reboot.** Restart, wait ~2 min, check item 1 *without logging in*,
 then repeat 1–3. The `verify.ps1` script runs the same set.
@@ -193,18 +212,26 @@ launched manually via `pwsh`, while the scheduler uses PS 5.1 and dies on non-AS
 ### The tunnel ran for hours, then vanished and never returned
 Modern Standby. Windows suspends the machine, tears down TCP, and does **not** restore
 the forward; `ssh` may even survive as a process while serving nothing. This is the whole
-reason the keeper exists. In the log it looks like this:
+reason the keeper exists. In the log it looks like this — **quoted verbatim; the keeper
+currently logs in Russian**, so these are the exact strings to grep for:
 
 ```
-08:01:39 health: probe failed (1/2)
-08:01:39 ssh: client_loop: send disconnect: Connection reset
-08:01:40 tunnel exited after 3899s, retry in 5s
-08:01:45 starting tunnel
-08:06:50 alive (tunnel up 5 min)
+2026-09-17T08:01:39 health: проверка не прошла (1/2)
+2026-09-17T08:01:39 ssh: client_loop: send disconnect: Connection reset
+2026-09-17T08:01:40 tunnel exited after 3899s, retry in 5s
+2026-09-17T08:01:45 starting tunnel
+2026-09-17T08:06:50 alive (туннель держится 5 мин)
 ```
+
+Glossed: *probe failed (1/2)* → connection reset → *tunnel exited after 3899s, retry in
+5s* → *starting tunnel* → *alive (tunnel up 5 min)*.
 
 That is **healthy** behaviour: the break was caught and closed in 5 seconds. The alarming
 case is `tunnel exited` with no following `starting tunnel`.
+
+Other strings the keeper emits in Russian: `cleanup: убираю осиротевший ssh pid …`
+(orphan cleanup, see below), `health: канал восстановился после N неудач` (recovered),
+`health: канал мёртв при живом ssh - перезапускаю` (port dead while ssh alive).
 
 ### Port 47822 is occupied but requests do not go through
 An orphaned `ssh` from a previous keeper. `Get-Process ssh` → kill → the keeper will
