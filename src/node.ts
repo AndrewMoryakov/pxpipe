@@ -32,6 +32,11 @@ import {
   type TrackEvent,
 } from './core/tracker.js';
 import {
+  configureSessionStateStore,
+  flushSessionState,
+  type SessionStateStore,
+} from './core/session-state.js';
+import {
   DashboardState,
   dashboardPath,
   type DashboardRoute,
@@ -58,6 +63,8 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+  /** Where the per-session cache pins survive a restart; undefined = off. */
+  sessionStateFile?: string;
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
@@ -69,6 +76,52 @@ interface RuntimeConfig {
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
 const DEFAULT_EVENTS_FILE = path.join(os.homedir(), '.pxpipe', 'events.jsonl');
+const DEFAULT_SESSION_STATE_FILE = path.join(os.homedir(), '.pxpipe', 'session-state.json');
+
+/** PXPIPE_SESSION_STATE: a path, or 0/off/false/no to disable. */
+function resolveSessionStateFile(): string | undefined {
+  const raw = process.env.PXPIPE_SESSION_STATE?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_SESSION_STATE_FILE;
+  if (/^(0|off|false|no)$/i.test(raw)) return undefined;
+  return raw;
+}
+
+/**
+ * File-backed {@link SessionStateStore}. Same write-then-rename discipline as the
+ * config writer above: a crash mid-write leaves the previous file intact. Mode
+ * 0600 — the file holds session fingerprints (sha8 of the first user turn) and
+ * counters, never prompt text, but it is still per-user state.
+ */
+function fileSessionStateStore(file: string): SessionStateStore {
+  return {
+    load(): string | undefined {
+      try {
+        return fs.readFileSync(file, 'utf8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw err;
+      }
+    },
+    save(text: string): void {
+      const dir = path.dirname(file);
+      const parentExists = fs.existsSync(dir);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (!parentExists) fs.chmodSync(dir, 0o700);
+      const tmp = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(tmp, text, { mode: 0o600 });
+        fs.renameSync(tmp, file);
+      } catch (err) {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* nothing to clean */
+        }
+        throw err;
+      }
+    },
+  };
+}
 
 function normalizeModelsConfig(value: unknown): string | undefined {
   if (Array.isArray(value)) {
@@ -187,6 +240,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
     eventsFile: process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE,
+    sessionStateFile: resolveSessionStateFile(),
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
@@ -273,6 +327,10 @@ Environment:
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
+  PXPIPE_SESSION_STATE    where per-session cache pins (freeze-step floor, cache
+                          liveness) survive a restart; 0/off disables
+                          (default ~/.pxpipe/session-state.json). Without it a
+                          restart drops every live session's floor.
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
   PXPIPE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
@@ -1180,6 +1238,13 @@ async function main(): Promise<void> {
   // rows) showed 5 mode flips ever and losses at 0.8% of wins — all
   // one-time cache-create amortization — so closing the loop would not
   // change decisions. Re-run that reconciliation before wiring one in.
+  if (opts.sessionStateFile) {
+    const restored = configureSessionStateStore(fileSessionStateStore(opts.sessionStateFile));
+    console.log(`[pxpipe] session state: ${restored} session(s) restored from ${opts.sessionStateFile}`);
+  } else {
+    console.log('[pxpipe] session state: persistence off (PXPIPE_SESSION_STATE)');
+  }
+
   const tracker: Tracker = new FileTracker(opts.eventsFile);
 
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the
@@ -1418,6 +1483,8 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     console.log(`[pxpipe] ${sig} — shutting down`);
+    // Pins first: losing a freeze-step floor re-keys a whole prefix.
+    flushSessionState();
     // Flush+close the tracker so we don't drop the last few events on exit.
     if (tracker instanceof FileTracker) tracker.close();
     server.close(() => process.exit(0));
