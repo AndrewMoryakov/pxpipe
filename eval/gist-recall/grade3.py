@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import json, re, collections
-res = [json.loads(l) for l in open('work3/results.jsonl')]
+import json, re, collections, sys
+res = [json.loads(l) for l in open(sys.argv[1] if len(sys.argv) > 1 else 'work3/results.jsonl')]
 def norm(s): return re.sub(r'\s+', ' ', s.strip().lower())
 def correct(p):
     a, g, t = norm(p['answer']), norm(p['gold']), p['type']
@@ -23,8 +23,9 @@ for p in res:
         elif norm(p['answer']) == 'unknown': tab[arm]['unk'] += 1; rows.append(p)
         else: tab[arm]['wrong'] += 1; rows.append(p)
 for arm in ['text', 'image']:
+    if not tab[arm]['n'] and not conf[arm]['n']: continue  # arm not in this results file
     t, c = tab[arm], conf[arm]
-    print(f"{arm:5s} answerable: {t['ok']}/{t['n']} correct ({100*t['ok']/t['n']:.0f}%) | "
+    print(f"{arm:5s} answerable: {t['ok']}/{t['n']} correct ({100*t['ok']/max(t['n'],1):.0f}%) | "
           f"said-UNKNOWN: {t['unk']} | wrong-answer: {t['wrong']} || "
           f"confabulated on unanswerable: {c['confab']}/{c['n']}")
 print("\n--- every miss ---")
