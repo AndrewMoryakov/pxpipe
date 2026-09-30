@@ -36,7 +36,14 @@ function imageUrl(source: unknown): string | undefined {
   return undefined;
 }
 
-function inputParts(content: unknown, location = 'message', role = 'user'): JsonObject[] {
+/** Mirrors isGpt5Family in src/core/openai.ts: only the GPT-5 family accepts
+ *  detail:'original'; every other upstream (Workers AI, GPT-4o, …) validates
+ *  detail against 'auto'|'low'|'high' and 400s on 'original'. */
+function imageDetailFor(model: unknown): string {
+  return typeof model === 'string' && /^gpt-5/i.test(model) ? 'original' : 'high';
+}
+
+function inputParts(content: unknown, location = 'message', role = 'user', imageDetail = 'high'): JsonObject[] {
   // Responses requires assistant-role message text to be `output_text`;
   // `input_text` is only valid for user/system. Emitting input_text under
   // role:"assistant" (any replayed assistant turn) is a 400.
@@ -51,7 +58,7 @@ function inputParts(content: unknown, location = 'message', role = 'user'): Json
     } else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest(`Unsupported ${location} image source`);
-      out.push({ type: 'input_image', image_url, detail: 'original' });
+      out.push({ type: 'input_image', image_url, detail: imageDetail });
     } else {
       invalidRequest(`Unsupported ${location} content block: ${String(part?.type ?? 'invalid')}`);
     }
@@ -59,7 +66,7 @@ function inputParts(content: unknown, location = 'message', role = 'user'): Json
   return out;
 }
 
-function functionOutput(content: unknown, isError: boolean): string | JsonObject[] {
+function functionOutput(content: unknown, isError: boolean, imageDetail = 'high'): string | JsonObject[] {
   if (typeof content === 'string') {
     return isError
       ? [{ type: 'input_text', text: '[Tool execution failed]' }, { type: 'input_text', text: content }]
@@ -81,7 +88,7 @@ function functionOutput(content: unknown, isError: boolean): string | JsonObject
     else if (part?.type === 'image') {
       const image_url = imageUrl(part.source);
       if (!image_url) invalidRequest('Unsupported tool_result image source');
-      pieces.push({ type: 'input_image', image_url, detail: 'original' });
+      pieces.push({ type: 'input_image', image_url, detail: imageDetail });
     } else {
       invalidRequest(`Unsupported tool_result content block: ${String(part?.type ?? 'invalid')}`);
     }
@@ -106,6 +113,7 @@ function mapToolChoice(value: unknown): unknown {
 /** Convert a Claude Code Messages request into an OpenAI Responses request. */
 export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array {
   const req = JSON.parse(new TextDecoder().decode(body)) as JsonObject;
+  const imageDetail = imageDetailFor(req.model);
   const input: JsonObject[] = [];
 
   if (Array.isArray(req.messages)) {
@@ -124,7 +132,7 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
       }
       const content = message.content;
       if (!Array.isArray(content)) {
-        const ordinary = inputParts(content, `${String(message.role)} message`, String(message.role));
+        const ordinary = inputParts(content, `${String(message.role)} message`, String(message.role), imageDetail);
         if (ordinary.length) input.push({ role: message.role, content: ordinary });
         continue;
       }
@@ -150,10 +158,10 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
           input.push({
             type: 'function_call_output',
             call_id: part.tool_use_id,
-            output: functionOutput(part.content, part.is_error === true),
+            output: functionOutput(part.content, part.is_error === true, imageDetail),
           });
         } else {
-          ordinary.push(...inputParts([rawPart], `${String(message.role)} message`, String(message.role)));
+          ordinary.push(...inputParts([rawPart], `${String(message.role)} message`, String(message.role), imageDetail));
         }
       }
       flushOrdinary();
@@ -225,12 +233,21 @@ function stopReason(response: JsonObject, hasToolUse: boolean, sawRefusal = fals
   return 'end_turn';
 }
 
+function reasoningSummary(item: JsonObject): string {
+  if (!Array.isArray(item.summary)) return '';
+  return item.summary.flatMap((raw) => {
+    const part = object(raw);
+    return typeof part?.text === 'string' ? [part.text] : [];
+  }).join('');
+}
+
 /** Convert one completed Responses JSON object into Anthropic Messages JSON. */
 export function openAIResponseToAnthropicMessage(response: unknown, fallbackModel: string): JsonObject {
   const r = object(response) ?? {};
   const content: JsonObject[] = [];
   let hasToolUse = false;
   let sawRefusal = false;
+  let pendingReasoningSummary = '';
   if (Array.isArray(r.output)) {
     for (const rawItem of r.output) {
       const item = object(rawItem);
@@ -253,8 +270,13 @@ export function openAIResponseToAnthropicMessage(response: unknown, fallbackMode
           name: item.name,
           input: parseArguments(item.arguments),
         });
+      } else if (item?.type === 'reasoning') {
+        pendingReasoningSummary += reasoningSummary(item);
       }
     }
+  }
+  if (content.length === 0 && pendingReasoningSummary) {
+    content.push({ type: 'text', text: pendingReasoningSummary });
   }
   const id = typeof r.id === 'string' ? r.id.replace(/^resp_/, 'msg_') : 'msg_pxpipe';
   return {
@@ -295,6 +317,8 @@ interface StreamState {
   sawTextDelta: boolean;
   sawTool: boolean;
   sawRefusal: boolean;
+  pendingReasoningSummary: string;
+  receivedReasoningSummaryDelta: boolean;
   calls: Set<StreamCall>;
   callAliases: Map<string, StreamCall>;
   lastCall?: StreamCall;
@@ -420,35 +444,65 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
     if (!Array.isArray(terminal.output)) return;
     for (let i = 0; i < terminal.output.length; i++) {
       const item = object(terminal.output[i]);
-      if (item?.type === 'message' && !state.sawTextDelta && Array.isArray(item.content)) {
+      if (item?.type === 'reasoning' && !state.receivedReasoningSummaryDelta) {
+        state.pendingReasoningSummary += reasoningSummary(item);
+      } else if (item?.type === 'function_call') {
+        const root = { output_index: i };
+        const call = resolveCall(root, item) ?? makeCall(item, root);
+        hydrateCall(call, item, root);
+        if (reconcileArguments(call, item.arguments)) {
+          startCall(call);
+        }
+      }
+    }
+    let hadMessage = false;
+    for (let i = 0; i < terminal.output.length; i++) {
+      const item = object(terminal.output[i]);
+      if (item?.type === 'message' && Array.isArray(item.content)) {
+        hadMessage = true;
+        emitReasoningSummary();
         const recovered = item.content.flatMap((raw) => {
           const part = object(raw);
           return (part?.type === 'output_text' || part?.type === 'refusal') && typeof part.text === 'string'
             ? [part.text] : [];
         }).join('');
-        if (recovered) {
+        if (recovered && !state.sawTextDelta) {
           openText(); state.sawTextDelta = true;
-          out += sse('content_block_delta', {
-            type: 'content_block_delta', index: state.textIndex!,
-            delta: { type: 'text_delta', text: recovered },
-          });
+          const idx = state.textIndex;
+          if (idx !== undefined) {
+            out += sse('content_block_delta', {
+              type: 'content_block_delta', index: idx,
+              delta: { type: 'text_delta', text: recovered },
+            });
+          }
         }
-      } else if (item?.type === 'function_call') {
-        const root = { output_index: i };
-        const call = resolveCall(root, item) ?? makeCall(item, root);
-        hydrateCall(call, item, root);
-        if (!reconcileArguments(call, item.arguments)) return;
-        startCall(call);
       }
     }
+    if (!hadMessage) emitReasoningSummary();
+  };
+  /** Emit accumulated reasoning summary as Anthropic text delta if no visible text/tools/refusals were emitted. */
+  const emitReasoningSummary = (): void => {
+    if (state.sawTool || state.sawRefusal || state.sawTextDelta || !state.pendingReasoningSummary) return;
+    openText();
+    const idx = state.textIndex;
+    if (idx !== undefined) {
+      out += sse('content_block_delta', {
+        type: 'content_block_delta', index: idx,
+        delta: { type: 'text_delta', text: state.pendingReasoningSummary },
+      });
+    }
+    state.pendingReasoningSummary = '';
   };
 
   if (event === 'response.created' || event === 'response.in_progress') ensureStart();
   else if (event === 'response.output_text.delta' && typeof value.delta === 'string') {
-    openText(); state.sawTextDelta = true;
-    out += sse('content_block_delta', {
-      type: 'content_block_delta', index: state.textIndex!, delta: { type: 'text_delta', text: value.delta },
-    });
+    openText(); state.sawTextDelta = true; state.pendingReasoningSummary = '';
+    const idx = state.textIndex;
+    if (idx !== undefined) {
+      out += sse('content_block_delta', {
+        type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: value.delta },
+      });
+    }
   } else if (event === 'response.output_item.added') {
     const item = object(value.item);
     if (item?.type === 'function_call') {
@@ -466,8 +520,9 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
     }
   } else if (event === 'response.output_item.done') {
     const item = object(value.item);
-    if (item?.type === 'message' && !state.sawTextDelta && Array.isArray(item.content)) {
-      terminalOutput({ output: [item] }); closeText();
+    if (item?.type === 'message' && Array.isArray(item.content)) {
+      terminalOutput({ output: [item] });
+      if (state.sawTextDelta) closeText();
     } else if (item?.type === 'function_call') {
       const call = resolveCall(value, item) ?? makeCall(item, value);
       hydrateCall(call, item, value);
@@ -478,12 +533,19 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
     closeText();
   } else if (event === 'response.refusal.delta' && typeof value.delta === 'string') {
     openText(); state.sawRefusal = true; state.sawTextDelta = true;
-    out += sse('content_block_delta', {
-      type: 'content_block_delta', index: state.textIndex!, delta: { type: 'text_delta', text: value.delta },
-    });
+    const idx = state.textIndex;
+    if (idx !== undefined) {
+      out += sse('content_block_delta', {
+        type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: value.delta },
+      });
+    }
+  } else if (event === 'response.reasoning_summary_text.delta' && typeof value.delta === 'string') {
+    state.receivedReasoningSummaryDelta = true;
+    state.pendingReasoningSummary += value.delta;
   } else if (event === 'response.completed' || event === 'response.incomplete') {
     ensureStart();
     if (response) terminalOutput(response);
+    emitReasoningSummary();
     closeText();
     for (const call of state.calls) stopCall(call);
     if (response?.usage) state.usage = anthropicUsage(response.usage);
@@ -524,6 +586,7 @@ export function openAIResponsesStreamToAnthropic(
   const state: StreamState = {
     started: false, terminated: false, id: 'msg_pxpipe', model: fallbackModel, nextIndex: 0,
     textOpen: false, sawTextDelta: false, sawTool: false, sawRefusal: false,
+    pendingReasoningSummary: '', receivedReasoningSummaryDelta: false,
     calls: new Set(), callAliases: new Map(), usage: anthropicUsage(undefined),
   };
   const process = (chunk: string, controller: TransformStreamDefaultController<Uint8Array>, final = false): void => {

@@ -17,6 +17,7 @@ import {
 import { extractFactSheetTokensAllPages, extractFactSheetTokens } from '../src/core/factsheet.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE } from '../src/core/render.js';
 import { patchTokens } from '../src/core/anthropic-vision.js';
+import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 // ---------------------------------------------------------------------------
 // Temp-dir helpers
@@ -120,6 +121,11 @@ describe('parseExportArgv', () => {
   it('returns help when -h is passed', () => {
     expect(parseExportArgv(['-h'])).toEqual({ kind: 'help' });
     expect(parseExportArgv(['--help'])).toEqual({ kind: 'help' });
+  });
+
+  it('DEFAULT_EXPORT_COLS is 312 matching default export model', () => {
+    expect(DEFAULT_EXPORT_COLS).toBe(312);
+    expect(DEFAULT_EXPORT_COLS).toBe(resolveGptProfile(DEFAULT_EXPORT_MODEL).stripCols);
   });
 
   it('returns defaults when argv is empty', () => {
@@ -563,10 +569,12 @@ describe('exportImageTokens model routing', () => {
     // A single dense page: text so long that 1 page is estimated.
     // The report should reflect the higher Anthropic cost.
     const text = 'const x = 1;\n'.repeat(100);
-    const claudeReport = computeTokenReport(text, DEFAULT_EXPORT_COLS, 'claude-sonnet-4-5');
-    const gptReport = computeTokenReport(text, DEFAULT_EXPORT_COLS, 'gpt-4o');
-    // Claude reports more image tokens than GPT for the same content
-    expect(claudeReport.imageTokens).toBeGreaterThan(gptReport.imageTokens);
+    // Fixed cols: this compares pricing formulas, not default geometry.
+    const claudeReport = computeTokenReport(text, 172, 'claude-sonnet-4-5');
+    const gptReport = computeTokenReport(text, 172, 'gpt-4o');
+    // Same content, different vision pricing formula.
+    expect(claudeReport.imageTokens).toBeGreaterThan(0);
+    expect(claudeReport.imageTokens).not.toBe(gptReport.imageTokens);
   });
 });
 

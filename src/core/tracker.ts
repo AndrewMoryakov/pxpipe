@@ -18,6 +18,8 @@ export interface TrackEvent {
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
+  /** Local render+encode ms. `duration_ms - transform_ms` isolates upstream. */
+  transform_ms?: number;
 
   // From TransformInfo:
   compressed?: boolean;
@@ -27,6 +29,18 @@ export interface TrackEvent {
    *  Compare with image_count: textTokens(n/4) vs imageTokens(n×2500). */
   compressed_chars?: number;
   image_count?: number;
+  /** Images the CLIENT already put on the wire (pasted screenshots, tool-returned
+   *  pictures). They spend from the same provider cap as ours, so this is the
+   *  number that explains an otherwise-surprising image_budget passthrough. */
+  native_images?: number;
+  /** Imaging paths that degraded to text because the wire cap was full. Nonzero
+   *  here plus a fat request means the client's own images crowded us out — the
+   *  request stayed valid, but the token win was skipped. */
+  image_budget_skips?: number;
+  /** Image blocks really on the wire. Present only when it differs from
+   *  image_count + native_images — i.e. when the history collapse absorbed
+   *  messages that already carried images, so we rendered more than we sent. */
+  wire_images?: number;
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
@@ -69,6 +83,16 @@ export interface TrackEvent {
   collapsed_images?: number;
   /** Why history collapse didn't run (or did). Diagnostic. */
   history_reason?: string;
+  /** Messages packed per history image. Rises when the grid is re-cut coarser;
+   *  never falls within a session, because a finer re-cut re-keys every chunk. */
+  history_freeze_step?: number;
+  /** Set when the grid was coarsened purely to fit the image budget — the turn
+   *  paid legibility for a request that would otherwise have been rejected. */
+  history_budget_trimmed?: boolean;
+  /** Set when the session's upstream cache was provably dead and the collapse
+   *  was therefore allowed to repack for density. Pair with cache_read_tokens:
+   *  a repack that lands on a live cache would show as a cache_create spike. */
+  history_pack_fill?: boolean;
   /** Codepoints not in the glyph atlas. A spike means users type glyphs we don't ship — widen ATLAS_PROFILE. */
   dropped_chars?: number;
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
@@ -98,6 +122,19 @@ export interface TrackEvent {
   cache_prefix_sha8?: string;
   /** Approx chars in that pinned prefix (growth vs pure-invalidation split). */
   cache_prefix_bytes?: number;
+  /** Per-layer digests of the same pinned prefix. Whichever one moves between
+   *  two turns of a session IS the cache-bust cause: tools (client loaded a
+   *  deferred tool), system (volatile text inside the pinned span), head
+   *  (collapse boundary / marker placement moved). */
+  cache_prefix_tools_sha8?: string;
+  cache_prefix_system_sha8?: string;
+  cache_prefix_head_sha8?: string;
+  /** The span Anthropic really caches (through the last cache_control marker),
+   *  its size, and the marker's position. Unstable marked digest ⇒ pxpipe-side
+   *  bust; stable digest with cache_read 0 ⇒ look upstream, not at the rewrite. */
+  cache_prefix_marked_sha8?: string;
+  cache_prefix_marked_bytes?: number;
+  cache_prefix_marker_pos?: string;
 
   // From TransformInfo.env:
   cwd?: string;
@@ -194,6 +231,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.model) out.model = ev.model;
   if (ev.accountingProvider) out.accounting_provider = ev.accountingProvider;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
+  if (ev.transformMs !== undefined) out.transform_ms = ev.transformMs;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
@@ -217,6 +255,16 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.compressed_chars = info.compressedChars;
     }
     if (info.imageCount !== undefined) out.image_count = info.imageCount;
+    // Only when nonzero: a wire without client images is the common case and
+    // should not pay a key per event.
+    if ((info.nativeImages ?? 0) > 0) out.native_images = info.nativeImages;
+    if ((info.imageBudgetSkips ?? 0) > 0) out.image_budget_skips = info.imageBudgetSkips;
+    // Emit only when it disagrees with the render counter: equality is the common
+    // case and a per-event key for "nothing to see" is noise.
+    if (info.wireImages !== undefined
+        && info.wireImages !== (info.imageCount ?? 0) + (info.nativeImages ?? 0)) {
+      out.wire_images = info.wireImages;
+    }
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
@@ -262,6 +310,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.historyReason !== undefined) {
       out.history_reason = info.historyReason;
     }
+    if (info.historyFreezeStep !== undefined) out.history_freeze_step = info.historyFreezeStep;
+    if (info.historyBudgetTrimmed) out.history_budget_trimmed = true;
+    if (info.historyPackFill) out.history_pack_fill = true;
     if (info.droppedChars !== undefined && info.droppedChars > 0) {
       out.dropped_chars = info.droppedChars;
     }
@@ -270,7 +321,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.passthroughReasons) {
       const pr = info.passthroughReasons;
-      if ((pr.below_threshold ?? 0) > 0 || (pr.not_profitable ?? 0) > 0) {
+      if (Object.values(pr).some((n) => (n ?? 0) > 0)) {
         out.passthrough_reasons = pr;
       }
     }
@@ -286,6 +337,13 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.cachePrefixSha8) out.cache_prefix_sha8 = info.cachePrefixSha8;
     if (info.cachePrefixBytes !== undefined) out.cache_prefix_bytes = info.cachePrefixBytes;
+    if (info.cachePrefixToolsSha8) out.cache_prefix_tools_sha8 = info.cachePrefixToolsSha8;
+    if (info.cachePrefixSystemSha8) out.cache_prefix_system_sha8 = info.cachePrefixSystemSha8;
+    if (info.cachePrefixHeadSha8) out.cache_prefix_head_sha8 = info.cachePrefixHeadSha8;
+    if (info.cachePrefixMarkedSha8) out.cache_prefix_marked_sha8 = info.cachePrefixMarkedSha8;
+    if (info.cachePrefixMarkedBytes !== undefined)
+      out.cache_prefix_marked_bytes = info.cachePrefixMarkedBytes;
+    if (info.cachePrefixMarkerPos) out.cache_prefix_marker_pos = info.cachePrefixMarkerPos;
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
     if (info.churningStaticTags && info.churningStaticTags.length > 0)

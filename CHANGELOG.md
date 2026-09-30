@@ -6,6 +6,251 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+## 0.14.0 — 2026-09-28
+
+### Added
+- **Session state survives proxy restarts** (#295). The freeze step is a pin:
+  once a session's history is packed at a coarse grid it must never be
+  re-rendered finer, or every history chunk re-keys and the provider bills the
+  whole prefix as `cache_create`. The pin lived only in memory, so each restart
+  let the next collapse pick a finer step. The Node host now saves the
+  freeze-step floor and cache liveness to `~/.pxpipe/session-state.json` (mode
+  0600, written to a temp file and renamed, debounced 250 ms, flushed on
+  shutdown). `PXPIPE_SESSION_STATE=<path>` moves it and `0`/`off` turns it off.
+  Records idle more than 24 h and malformed records are dropped on load. Core
+  stays filesystem-free: hosts attach a store via
+  `configureSessionStateStore()`.
+- **`pxpipe warp` supports agy (Antigravity CLI)** (#271). Warp routes the
+  Cloud Code (`daily-cloudcode-pa.googleapis.com/v1internal:*`) and
+  `generativelanguage.googleapis.com` generate-content endpoints to the proxy.
+
+### Changed
+- **Opus 5.5 is on by default, and every non-Fable Claude model uses the
+  spaced 5×8 profile** (#293). Opus 5.5 misread the bare 5×8 cell that Fable
+  reads cleanly (84/98 gist). Adding 2px of row height fixes it (93/98 gist,
+  0/16 confabulations, 100/100 arithmetic) and still costs about 1.9× less
+  than text. `CLAUDE_SPACED_PROFILE` (312 cols, `cellHBonus: 2`) replaces the
+  14px legible profile, which cost more than sending text and is removed.
+  `claude-opus-5-5` joins the default scope, and `DEFAULT_EXPORT_COLS` goes
+  from 172 to 312 to match. Exact 12-char hex recall stays weak (3/15, same as
+  the dense control), so exact ids still come from the factsheet or a
+  re-fetch.
+- **Gemini is on by default for every version, and opt-out works again.** The
+  built-in scope is now
+  `PXPIPE_MODELS=claude-fable-5,claude-opus-5-5,gemini`; the `gemini`
+  family base matches `gemini-3.6-flash`, `gemini-4`, `gemini-pro`, and future
+  ids through the ordinary prefix rule. The Google gate in the proxy and the
+  dashboard totals previously admitted any measured Gemini model whenever the
+  allowlist was non-empty, which made `PXPIPE_MODELS=claude-fable-5` (and the
+  dashboard chip) unable to turn Gemini off. That bypass is removed; the
+  allowlist is the only gate. Dashboard: one "Gemini (all versions)" chip plus
+  per-version chips for narrowing.
+- `gpt-tokenizer` 3.4 → 4.0 (major), used for o200k token counts on the
+  OpenAI and Google paths (#242).
+
+### Fixed
+- **Concurrent sessions no longer share one cache record.** `first_user_sha8`
+  hashed the first text block of the first user message, which for omp is the
+  same `<system-notice>` device inventory in every session (and for Claude Code
+  the project's CLAUDE.md `<system-reminder>`). Every session in the project
+  collapsed onto one key, so one session's `cache_create`/`cache_read` outcomes
+  and freeze step drove the others' history-grid decisions: pages re-cut and
+  re-keyed the image prefix as `cache_create`. The key now skips blocks that
+  are wholly a `<system-notice>`/`<system-reminder>` envelope and uses the
+  first prompt text before the first assistant turn. Dashboard session groups
+  and the Claude Code transcript map use the same rule; events logged before
+  the fix keep their old keys.
+- **Provider-prefixed paths no longer double `/anthropic`.** With an
+  `ANTHROPIC_UPSTREAM` ending in `/anthropic`, a client path of
+  `/anthropic/v1/messages` was appended as-is:
+
+  ```text
+  Before: …/anthropic/anthropic/v1/messages
+  After:  …/anthropic/v1/messages
+  ```
+
+  Both the main forward and the baseline `count_tokens` probe had this bug.
+  The probe got a 403, so every row logged `baseline_probe_status: "failed"`
+  and the dashboard reported 0% fewer tokens. Both now drop the duplicated
+  segment when the base already ends with it.
+- **`@pxpipe pin` works on the OpenAI and Google paths.** Pins were moved to
+  the tail only for Anthropic requests; OpenAI Chat/Responses and Gemini
+  requests now get the same relocation.
+- **`pxpipe warp -- claude` works on native Windows** (#294). It failed with
+  `spawn /bin/sh ENOENT`: `PATH` was split on `:`, `PATHEXT` was ignored, and
+  `C:\…` paths weren't recognised as paths, so every lookup fell through to a
+  `$SHELL -ic` fallback that defaults to `/bin/sh`. Resolution now handles
+  `PATH`/`PATHEXT` per platform (only `.com`/`.exe`, since `spawn()` can't run
+  `.cmd`/`.bat` without a shell) and skips the shell fallback when the shell
+  itself can't run.
+- **Google upstream selection only trusts known hosts** (#271). The `Host`
+  header is parsed and matched exactly against the Cloud Code hostnames before
+  routing, and trailing-slash stripping no longer uses a regex that could
+  backtrack on long input.
+
+## 0.13.2 — 2026-08-18
+
+### Added
+- `createProviderRouter`: explicit `/providers/<id>/<upstream-path>`
+  multiplexing of several proxy configs behind one listener, exported from
+  core. Provider ids are taken from the URL path only, never from headers or
+  the body. No in-tree callers yet; groundwork for the Codex integration
+  (#223, #224).
+- **Rendered-page cache, now documented.** It landed in #158 and shipped in
+  0.13.0 with no changelog entry, so this backfills it: identical render inputs
+  return the identical pages instead of being re-rasterized, bounded by total
+  retained bytes via `PXPIPE_RENDER_CACHE_BYTES`. Frozen history chunks are
+  byte-identical across turns by design, so a long session was paying full
+  render cost for pages that provably did not change.
+- Live `render_cache` counters on `/proxy-stats`: `entries`, `bytes`,
+  `max_bytes`, `hits`, `misses`, `evictions`, `oversized`. `renderCacheStats()`
+  previously had no consumer outside the test suite. `oversized` counts renders
+  larger than the entire budget, which are never stored — the failure mode a
+  too-small budget produces, and one that otherwise looks identical to a
+  permanently cold cache (#210).
+- `PXPIPE_RENDER_CACHE_BYTES` is now readable on Workers. Bindings are not
+  visible to core at module-init time, so the Worker entrypoint applies the
+  budget per request through the new `setRenderCacheMaxBytes()`.
+
+### Changed
+- **Render cache keys are a domain-separated SHA-256 over length-prefixed
+  inputs instead of the source text verbatim** (#210). The literal key held
+  every rendered prompt in the heap as plaintext for the process lifetime, and
+  sized each entry at roughly twice its source length — so a budget meant to
+  bound retained *pages* spent most of itself on copies of the input. Entry
+  overhead is now a constant 128 bytes. The pages themselves are still rendered
+  images of the source: this removes plaintext retention, not content
+  retention.
+- **The default budget is 8 MiB on Workers, 64 MiB on Node.** Both runtimes
+  previously took 64 MiB, which on a ~128 MiB isolate that also holds the
+  request body, the decoded atlases and the framebuffers is most of the
+  ceiling.
+
+### Fixed
+- `pxpipe warp` pointed `SSL_CERT_FILE`, `CURL_CA_BUNDLE` and
+  `REQUESTS_CA_BUNDLE` at the pxpipe CA alone. Those variables replace the
+  trust store, so every other HTTPS client in the warped session (gcloud,
+  pip, gws) lost the public roots and failed verification. They now get
+  `warp-ca-bundle.pem` = pxpipe CA + system roots; `NODE_EXTRA_CA_CERTS`
+  keeps the CA-only file since Node appends (#245, #247).
+- Gemini history collapse is capped at 32 images (was 72) to prevent
+  vision-side TTFT stalls on long sessions.
+- Claude Code's `cc_automode_session_rules` / `cc_automode_permissions` /
+  `severity` / `category` blocks route into the dynamic tail instead of baking
+  into the static slab image. On newer Claude Code builds they change between
+  turns, which re-rendered every slab page each request and forced a full
+  cache write per turn — the likely mechanism behind the repeated-429 loop in
+  #234 (#236).
+- `truncateForBudget` no longer over-truncates reflowed tool results. The
+  per-segment row charge overstated visual rows ~6× on ↵-joined text (the
+  renderer packs many segments per row), so a result that fit ~280k chars kept
+  ~44k and wasted most of its image budget (#226).
+- The render cache byte counter no longer drifts upward when two concurrent
+  requests render the same content. Both miss (the lookup precedes the await),
+  both store, and the second store previously added its bytes without crediting
+  back the entry it replaced — so the counter climbed until it evicted a cache
+  that was nowhere near its budget.
+- Typecheck survives `@cloudflare/workers-types` 5.20260809.1, which added a
+  global `declare const process: any` that clobbered `@types/node` —
+  `process.exit()` stopped narrowing and `process.env` went untyped. The
+  package left tsconfig `types`; `worker.ts` imports `ExecutionContext` as a
+  module instead (#231).
+
+## 0.13.1 — 2026-08-11
+
+### Fixed
+- Opus collapsed-history pages honor their 172-column profile instead of using
+  the dense 312-column width. Pages are now 1556 px wide rather than 2816 px,
+  avoiding server-side downscaling and the 2000 px many-image rejection (#220).
+
+## 0.13.0 — 2026-08-09
+
+### Added
+- `pxpipe stats [--json] [--file <p>]` — offline summary of the events log with
+  no proxy server running (restores after-the-fact analysis the dashboard only
+  offers while live). Adds a measured-savings headline (`count_tokens` baseline
+  vs real usage over probe-OK rows only); the same fields are exposed on
+  `/api/stats.json` (#172).
+- Per-content-class render geometry for collapsed history: static slab and
+  tool-result pages keep dense geometry; conversation history can use a
+  separate profile (#170).
+- Documented routing to Novita's OpenAI-compatible endpoint via the existing
+  `OPENAI_UPSTREAM` / `OPENAI_MODELS` mechanism (no new code path) (#166).
+
+### Changed
+- Misread-prone Claude models get legible history geometry by default instead
+  of opt-in.
+
+### Fixed
+- The per-turn billing line is forwarded as a real HTTP header on the upstream
+  request instead of being re-emitted into the body. Re-emitting placed
+  volatile text inside the conversation, which leaked into imaged slabs and
+  glued the billing line onto the next user message.
+- Hardened credential and request handling on the proxy path (#167).
+- The eval harness runs on Windows and no longer quotes prices for unknown
+  models (#159).
+- `build.mjs` resolves `tsc` via `typescript/package.json` instead of the
+  removed `./bin/tsc` export, fixing builds on newer TypeScript.
+
+## 0.12.1 — 2026-08-08
+
+### Fixed
+- The churning billing line is moved past the cache markers, so it no longer
+  invalidates the cached prefix on every turn.
+- Image budgeting counts decoded image bytes, not just image count, so many
+  small images can no longer blow past the byte budget (#201).
+- History is collapsed before tool results are imaged, so already-collapsed
+  content is not re-imaged at full size (#198).
+- `total_tokens` is classified as a dynamic block instead of cacheable
+  content (#202).
+- Inbound request bodies are bounded before allocating (#199).
+- OpenAI-route credentials are decided by an explicit policy instead of
+  header sniffing (#200).
+- `restart` only stops the proxy serving this checkout's port, not every
+  pxpipe on the machine (#205).
+
+### Changed
+- Docs state the model default the runtime actually applies (#203).
+
+## 0.12.0 — 2026-08-06
+
+### Fixed
+- The per-turn billing header no longer lands in the cached prefix. It changed
+  on every turn and sat ahead of the stable content, so each turn invalidated
+  the prefix behind it and forced a full re-read. This was the dominant source
+  of cache churn (#180, #161).
+- Tag scanning walks by index instead of backtracking regexes, so a pattern
+  that only matched the first occurrence no longer leaves later tags in the
+  imaged slab (#176).
+- Refusals and empty messages no longer force page breaks in OpenAI history
+  collapse (#178).
+- `keepTail:0` in mixed Responses collapse protected every message instead of
+  none, defeating the collapse entirely (#154).
+- System pins now appear in the Anthropic pin listing.
+- `restart` no longer puts a `case` inside `$( )`, which breaks macOS bash 3.2.
+
+### Added
+- `warp` runs agents through a CONNECT proxy instead of overriding
+  `ANTHROPIC_BASE_URL`, so agents that ignore the env var are still routed
+  (#156).
+- `warp` matches routes on host:port and accepts `--route` (#175).
+- Pin commands are read from the system prompt, and pin instructions are
+  placed where the model actually reads them (#155).
+
+### Changed
+- `claude-opus-5` is no longer in the default model list (#163).
+- `warp` takes the child process down with it on exit.
+
+### Security
+- Added a disclosure policy, a threat model, and a CI audit gate (#164).
+- Pinned trusted supply-chain inputs: actions by immutable SHA, exact Node and
+  npm versions, `--frozen-lockfile --ignore-scripts`, and a release gate that
+  verifies the tag matches `package.json` and descends from the default
+  branch (#169).
+- Bumped postcss to 8.5.24 (GHSA-r28c-9q8g-f849).
+
+## 0.11.0 — 2026-07-25
+
 ### Changed
 - Opt-in `gpt-5.6-sol` now uses native 14px JetBrains Mono at 84 columns. Its paid
   pilot preserved gist and guard checks, read 7/8 exact values, and produced no

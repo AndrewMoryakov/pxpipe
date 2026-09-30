@@ -42,14 +42,13 @@ const PIN_MAX_CHARS = 300;
 /** Total pinned text emitted at the tail. A pin that dilutes itself is not a pin. */
 const PIN_TOTAL_MAX_CHARS = 2000;
 
-/**
- * `@pxpipe pin <text>` / `@pxpipe unpin`, anchored to a whole line so removal is a
- * whole-line delete — deterministic, with no leftover blank-line ambiguity. That
- * determinism is what lets us MOVE pins (strip from source, emit at tail) instead
- * of copying: the rewrite stays a pure function of the message, so the protected
- * prefix remains byte-stable turn to turn, exactly like demoteProtectedHeadText.
- */
-const PIN_CMD_RE = /^@pxpipe[ \t]+(pin|unpin)\b(.*)$/;
+// `@pxpipe pin <text>` / `@pxpipe unpin`, `>pxpipe pin`, `> pxpipe pin`,
+// anchored to a whole line so removal is a whole-line delete - deterministic,
+// with no leftover blank-line ambiguity. That determinism is what lets us MOVE
+// pins (strip from source, emit at tail) instead of copying: the rewrite stays
+// a pure function of the message, so the protected prefix remains byte-stable
+// turn to turn, exactly like demoteProtectedHeadText.
+const PIN_CMD_RE = /^(?:>[ \t]*)?@?pxpipe[ \t]+(pin|unpin)\b(.*)$/;
 
 /**
  * Parse one line as a pin command. Returns null when it isn't one.
@@ -106,9 +105,8 @@ export const PIN_REPLY_MARK = '@pxpipe ';
 /**
  * Which tier a pin lives in. `'file'`, not `'claude.md'`: the same tier holds
  * whatever the harness inlined, which is CLAUDE.md under Claude Code and
- * AGENTS.md under OpenCode. (Codex inlines AGENTS.md too, but it speaks the
- * Responses API, and foldPins has exactly one call site: the Messages path in
- * transform.ts. Pins are still a no-op there.)
+ * AGENTS.md under OpenCode. Provider adapters normalize their wire shape before
+ * calling the same folder, so source and removal semantics stay identical.
  *
  * The tier is named for the origin because the origin is what answers the two
  * questions a user has: why `unpin` refuses, and what to edit instead.
@@ -860,6 +858,131 @@ function normalizeOpenAIRequest(
     messages.push({ role: item.role === 'user' ? 'user' : 'assistant', content: blocks });
   }
   return { messages, system: system.length > 0 ? system : undefined };
+}
+
+type OpenAIPinRequest = {
+  instructions?: unknown;
+  input?: unknown;
+  messages?: unknown;
+};
+
+/** Move OpenAI-wire pin commands to the latest user input, using the same
+ * trailing system-reminder block as the Messages transformer. */
+export function relocateOpenAIPins(req: OpenAIPinRequest): number {
+  const norm = normalizeOpenAIRequest(req);
+  if (!norm) return 0;
+  const pins = foldPins(norm.messages, norm.system);
+  if (pins.length === 0) return 0;
+  const pinText = pinBlockText(pins);
+  if (!pinText) return 0;
+
+  const items = Array.isArray(req.input)
+    ? req.input
+    : Array.isArray(req.messages)
+      ? req.messages
+      : undefined;
+  const stringInput = typeof req.input === 'string';
+  let target: OpenAIItem | undefined;
+  if (items) {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i] as OpenAIItem | undefined;
+      if (item?.role === 'user') {
+        target = item;
+        break;
+      }
+    }
+  }
+  if (!stringInput && !target) return 0;
+
+  if (typeof req.instructions === 'string') {
+    req.instructions = stripLines(req.instructions);
+  }
+  if (items) {
+    for (const raw of items) {
+      const item = raw as OpenAIItem;
+      if (item.role !== 'system' && item.role !== 'developer' && item.role !== 'user') continue;
+      item.content = stripOpenAIContent(item.content);
+    }
+  }
+
+  if (stringInput) {
+    req.input = `${req.input as string}\n\n${pinText}`;
+  } else if (target) {
+    if (typeof target.content === 'string') {
+      target.content = `${target.content}\n\n${pinText}`;
+    } else if (Array.isArray(target.content)) {
+      const type = Array.isArray(req.input) ? 'input_text' : 'text';
+      target.content.push({ type, text: pinText });
+    } else {
+      return 0;
+    }
+  }
+  return pinText.length;
+}
+
+function stripOpenAIContent(content: unknown): unknown {
+  if (typeof content === 'string') return stripLines(content);
+  if (!Array.isArray(content)) return content;
+  return content.map((raw) => {
+    const part = raw as { type?: string; text?: unknown };
+    if (!part || typeof part.text !== 'string') return raw;
+    if (part.type !== undefined && part.type !== 'text'
+      && part.type !== 'input_text' && part.type !== 'output_text') return raw;
+    return { ...part, text: stripLines(part.text) };
+  });
+}
+
+type GooglePinPart = { text?: unknown; [key: string]: unknown };
+type GooglePinContent = { role?: string; parts?: GooglePinPart[]; [key: string]: unknown };
+type GooglePinRequest = {
+  systemInstruction?: { parts?: GooglePinPart[]; [key: string]: unknown };
+  contents?: GooglePinContent[];
+};
+
+/** Gemini-wire equivalent of relocateOpenAIPins. */
+export function relocateGooglePins(req: GooglePinRequest): number {
+  if (!Array.isArray(req.contents)) return 0;
+  const systemText = Array.isArray(req.systemInstruction?.parts)
+    ? req.systemInstruction.parts
+        .map((part) => typeof part?.text === 'string' ? part.text : '')
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  const messages: Message[] = req.contents.map((content) => ({
+    role: content.role === 'user' ? 'user' : 'assistant',
+    content: Array.isArray(content.parts)
+      ? content.parts
+          .filter((part) => typeof part?.text === 'string')
+          .map((part) => ({ type: 'text', text: part.text as string }))
+      : [],
+  }));
+  const pins = foldPins(messages, systemText || undefined);
+  if (pins.length === 0) return 0;
+  const pinText = pinBlockText(pins);
+  if (!pinText) return 0;
+
+  let target: GooglePinContent | undefined;
+  for (let i = req.contents.length - 1; i >= 0; i--) {
+    if (req.contents[i]?.role === 'user') {
+      target = req.contents[i];
+      break;
+    }
+  }
+  if (!target || !Array.isArray(target.parts)) return 0;
+
+  if (Array.isArray(req.systemInstruction?.parts)) {
+    req.systemInstruction.parts = req.systemInstruction.parts.map((part) =>
+      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text) } : part,
+    );
+  }
+  for (const content of req.contents) {
+    if (content.role !== 'user' || !Array.isArray(content.parts)) continue;
+    content.parts = content.parts.map((part) =>
+      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text) } : part,
+    );
+  }
+  target.parts.push({ text: pinText });
+  return pinText.length;
 }
 
 /** `pinCommandResponse` for the OpenAI routes. Codex talks Responses and other

@@ -67,6 +67,14 @@ Same thing without `ANTHROPIC_BASE_URL`, so `/remote-control`, claude.ai
 connectors, and first-party gates keep working. Full instructions in the
 dashboard.
 
+`api.anthropic.com/v1/messages` is routed by default. Agents that reach their
+provider over some other base URL need a rule for it, and a rule that names a
+port matches only that port:
+
+```bash
+pxpipe warp --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821' -- codex
+```
+
 ### Windows launcher and health check
 
 This fork includes `pxpipe-run.cmd` for launching pxpipe on Windows. After it
@@ -144,8 +152,13 @@ without running the proxy.
 - **`claude-opus-5`:** weaker recall than Fable 5 (verbatim **2/15 vs 13/15**), good
   enough otherwise (100/100 arithmetic, 0/16 never-stated), **~4.7×** context before
   `/compact`. Suggested effort: **medium**. Details: [FINDINGS.md](FINDINGS.md).
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,claude-opus-5,gemini-3.6-flash`. Sol, GPT 5.5,
-  and **Grok** are opt-in only (dashboard chips or
+- **`claude-opus-5-5`:** on by default. Uses 5×8 with 2px extra row height
+  (~25% more image tokens than Fable's layout, still ~50%+ live savings).
+  Exact hex recall is weak (3/15); re-fetch exact ids.
+- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,claude-opus-5-5,gemini`. The `gemini`
+  base covers every Gemini id (3.6/3.7/3.8 Flash, Pro, 4, 5, and future
+  versions); to opt Gemini out, drop `gemini` from `PXPIPE_MODELS` or click the
+  chip off. Opus 5, Sol, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
   `PXPIPE_MODELS`). The exact Sol id still matters. Sibling variants such as
   `gpt-5.6-terra` do not
   inherit Sol's allowlist or render profile. `PXPIPE_MODELS=off` disables
@@ -167,10 +180,10 @@ without running the proxy.
   recent/open tool state stays native.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
-- **Grok 4.5 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
-  Off by default (dense hex still 0/15).
-  Enable with
-  `PXPIPE_MODELS=claude-fable-5,grok-4.5` or the dashboard chip.
+- **Grok 4.5 / 4.6 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
+  Off by default (dense hex still 0/15). History uses mixed collapse so Codex
+  assistant messages between tool rounds still image. Enable with
+  `PXPIPE_MODELS=claude-fable-5,grok-4.6` or the dashboard chip.
   [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
 
 </details>
@@ -182,17 +195,25 @@ without running the proxy.
 This matrix shows coverage as well as scores. `—` means the model was not run
 on that test; it does not mean zero. Arithmetic uses novel random-number
 problems. Gist, state, and never-stated probes share one corpus. Never-stated
-is confabulations, so lower is better.
+is confabulations, so lower is better. The **numbers at** column is the render
+geometry the row's scores were measured at; a model's shipped profile can
+differ (Sol and Qwen ship the measured 14px/84 geometry, but their broad-suite
+numbers predate it).
 
-| model | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `claude-fable-5` | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
-| `google/gemini-3.6-flash` | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
-| `claude-opus-5` | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
-| `gpt-5.6-sol` | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | prior 5×8 broad suite; native 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
-| `claude-opus-4-8` | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
-| `grok-4.5` | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
-| `moonshotai/kimi-k3` | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
+| model | numbers at | arithmetic (N=100) | gist (N=98) | state (N=18) | never-stated (N=16) | dense hex (N=15) | profile provenance and receipts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `claude-fable-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
+| `claude-fable-5-1` | Spleen 5×8, 312 cols (Fable 5 profile) | **100/100** | 95/98 | **18/18** | **0/16** | 6/15 | Fable 5 profile, no geometry of its own; 3 gist misses are image-arm negation flags answered UNKNOWN (0 confabs). Same-day Fable 5 control on the identical harness/PNGs reproduced 100/100 arithmetic and 30/30 tier-2 gist, so the gist/hex gap is the model, not the harness (hex control not rerun): [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
+| `google/gemini-3.6-flash`, `3.7-flash` | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | current shipped profile: [quality results](eval/gemini-profile/QUALITY_RESULTS.md) |
+| `claude-opus-5` | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `claude-opus-5-5` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `gpt-5.6-sol` | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
+| `claude-opus-4-8` | Spleen 5×8, 312 cols (historical) | 93/100 | 77/98 | **18/18** | **0/16** | 0/15 | historical profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/needle-haystack/) |
+| `grok-4.5` | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
+| `grok-4.6` high | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](eval/grok-profile/QUALITY_RESULTS.md) |
+| `moonshotai/kimi-k3` | Spleen 5×8, 152 cols (generic default) | 79/100 | 84/98 | 15/18 | 1/16 | 0/15 | generic GPT profile, no measured geometry of its own: [quality results](eval/sol-profile/KIMI_K3_QUALITY_RESULTS.md) |
+| `qwen-3.8` (`@cf/qwen/qwen3.8-27b`) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 72/98 | 11/18 | **0/16** | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 8/8 exact, 0 inventions, 11/15 hex: [pilot & quality](eval/qwen-profile/QUALITY_RESULTS.md) |
+| `glm-5.3-flash` (`@cf/zai-org/glm-5.3-flash`) | Spleen 5×8, 152 cols (default fallback, nothing shipped) | 36/100 | 57/98 | 6/18 | **0/16** | 0/15 | 5×8 is illegible to GLM (0/15 hex); 14px pilot: 10/15 hex, all misses single-glyph confabs, guards 0/16: [pilot & quality](eval/glm-profile/QUALITY_RESULTS.md) |
 
 ### Native-profile cost check
 
@@ -278,6 +299,32 @@ const { body, applied, info } = await transformAnthropicMessages({
 returns the originals of imaged blocks. Pure-JS runtime (Node and
 edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
 `src/core/index.ts`.
+
+<details>
+<summary><strong>Offline stats (no proxy): <code>pxpipe stats</code></strong></summary>
+
+The live dashboard shows savings while the proxy is running. To read the same
+event log **after the fact** — with no server up — summarize it straight from
+disk:
+
+```bash
+pxpipe stats                   # human report from ~/.pxpipe/events.jsonl
+pxpipe stats --json            # same aggregate as machine-readable JSON
+pxpipe stats --file /path/to/events.jsonl
+```
+
+Alongside request counts, compression ratios, latency percentiles, and
+cache-hit rates, the report prints a **measured savings** headline —
+`count_tokens` of the original body versus real usage, over probe-measured rows
+only (unmeasured requests are excluded, never counted as zero). This is a
+**raw-token** figure (cache reads at face value, not cost-weighted), so it is
+deliberately a different quantity from the dashboard's cost-weighted saved %.
+Point it at a non-default log with `--file`, or set `PXPIPE_LOG`.
+
+Exit codes: `0` report printed, `1` events file not found, `2` file present but
+no valid events. `pxpipe stats --help` prints usage.
+
+</details>
 
 ## Development
 
@@ -418,6 +465,7 @@ Third-party projects listed here are not maintained or supported by pxpipe.
 
 - [pxpipe-windows](https://github.com/DivyeshPatro/pxpipe-windows) — Windows support for `pxpipe mitm` (node-forge CA in place of openssl, Task Scheduler autostart).
 - [OmniGlyph](https://github.com/diegosouzapw/OmniGlyph) — A community-maintained project derived from pxpipe and used by [OmniRoute](https://github.com/diegosouzapw/OmniRoute).
+- [pxpipe-go](https://github.com/evan-choi/pxpipe-go) — A Go port of pxpipe's core with a CLI wrapper, standalone proxy, and embeddable library for Anthropic Messages and OpenAI Chat/Responses.
 
 ## License
 

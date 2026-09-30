@@ -19,6 +19,17 @@ function expectPrivateDirectory(dirPath: string): void {
   if (supportsPosixModes) expect(fs.statSync(dirPath).mode & 0o777).toBe(0o700);
 }
 
+// NTFS has no POSIX permission bits: Node reports 0o666 for every file and
+// directory on Windows, and chmodSync() only toggles the read-only flag. The
+// hardening in src/node.ts still runs there — only the assertion is moot, so
+// we check the mode where the platform can actually express it.
+const hasPosixModes = process.platform !== 'win32';
+
+function expectMode(target: string, expected: number): void {
+  if (!hasPosixModes) return;
+  expect(fs.statSync(target).mode & 0o777).toBe(expected);
+}
+
 let child: ChildProcess | undefined;
 let upstream: Server | undefined;
 let dir: string | undefined;

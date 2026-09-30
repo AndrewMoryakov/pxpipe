@@ -11,10 +11,12 @@
  * Config lives in wrangler.toml.
  */
 
+import type { ExecutionContext } from '@cloudflare/workers-types';
 import { createProxy, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
 import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';
 import { setAllowedModelBases } from './core/applicability.js';
+import { setRenderCacheMaxBytes } from './core/render.js';
 
 export interface Env {
   /** Optional single upstream base for every API family. Family-specific env vars override it. */
@@ -37,10 +39,23 @@ export interface Env {
   COLS?: string;
   /** Comma-separated model bases eligible for compression. */
   PXPIPE_MODELS?: string;
+  /** Ceiling on a buffered inbound request body, in bytes. A Worker is publicly
+   *  reachable by default, so this is the setting that keeps one caller from
+   *  choosing the isolate's memory ceiling. Unset uses the core 16 MiB default;
+   *  a non-numeric or non-positive value is ignored rather than obeyed. */
+  PXPIPE_MAX_REQUEST_BYTES?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
   PXPIPE_TRACK?: string;
+  /** Max bytes of rendered pages held in memory, or "0" to disable the cache.
+   *  Unset uses the core edge default (8 MiB), which is deliberately far below
+   *  the Node default: a Worker isolate has ~128 MiB for the request body, the
+   *  decoded atlases, the framebuffers and the compressor as well. Bindings are
+   *  not visible to core at module-init time, so this is applied per request via
+   *  `setRenderCacheMaxBytes`. A negative or non-numeric value is ignored rather
+   *  than obeyed; `0` is a real setting and must not be read as "unset". */
+  PXPIPE_RENDER_CACHE_BYTES?: string;
   /** Shared secret callers must present via the `x-pxpipe-secret` header
    *  whenever an API-key override is configured. Without this gate a
    *  discovered workers.dev URL is an open key-spender: the Worker would
@@ -67,6 +82,24 @@ async function secretsMatch(a: string, b: string): Promise<boolean> {
 const truthy = (v: string | undefined, fallback: boolean): boolean =>
   v == null ? fallback : v === '1' || v.toLowerCase() === 'true';
 
+/** Parse a positive whole number, or undefined for anything else. Used for limits
+ *  where a broken value must not read as "unlimited". */
+const positiveInt = (v: string | undefined): number | undefined => {
+  const raw = v?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+};
+
+/** Same shape as `positiveInt` but admits 0, because for the render cache budget 0 is
+ *  a real instruction ("disable") rather than a broken value to fall back from. */
+const nonNegativeInt = (v: string | undefined): number | undefined => {
+  const raw = v?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 0 ? n : undefined;
+};
+
 export default {
   async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const configuredModels = env.PXPIPE_MODELS?.trim();
@@ -77,6 +110,11 @@ export default {
           ? []
           : configuredModels.split(',').map((model) => model.trim()).filter(Boolean),
     );
+    // Bindings only exist inside `fetch`, so the render cache budget is applied here
+    // rather than at module init the way the Node host does it. Cheap and idempotent:
+    // assigning the same value evicts nothing. Left unset, core keeps its edge default.
+    const renderCacheBytes = nonNegativeInt(env.PXPIPE_RENDER_CACHE_BYTES);
+    if (renderCacheBytes !== undefined) setRenderCacheMaxBytes(renderCacheBytes);
     // ── Caller auth ────────────────────────────────────────────────────
     // If this deployment injects API keys, never serve anonymous callers:
     // workers.dev URLs are discoverable, and without this gate anyone who
@@ -142,6 +180,11 @@ export default {
       cloudflareApiKey: cfToken,
       openAIModels: parseModels(env.OPENAI_MODELS),
       cloudflareModels: parseModels(env.CLOUDFLARE_MODELS),
+      // A Worker cannot exit on bad config the way the Node host does, so an
+      // unparseable value is dropped here and the core default applies.
+      ...(positiveInt(env.PXPIPE_MAX_REQUEST_BYTES) !== undefined
+        ? { maxRequestBytes: positiveInt(env.PXPIPE_MAX_REQUEST_BYTES) }
+        : {}),
       transform,
       onRequest: (e) => {
         // Terse human-readable line (separate from the JSON event below;

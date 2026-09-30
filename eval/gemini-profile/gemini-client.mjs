@@ -1,4 +1,16 @@
-// Dedicated Google AI Studio client for Gemini 3.6 Flash evaluations.
+// Google AI Studio eval client through the local Cloudflare AI Gateway.
+
+function gatewayOrigin() {
+  const base = (process.env.OPENAI_BASE_URL ?? '').replace(/\/$/, '');
+  if (!base) throw new Error('OPENAI_BASE_URL is required (point it at your gateway)');
+  return new URL(base).origin;
+}
+
+export function resultFilename(base, model) {
+  const clean = model.replace(/^google\//, '');
+  if (clean === 'gemini-3.6-flash') return `${base}-results.json`;
+  return `${base}-${clean.replace(/[^a-zA-Z0-9._-]+/g, '_')}-results.json`;
+}
 
 export async function callGeminiRequest({ model = 'gemini-3.6-flash', request, maxOutputTokens = 1000, timeoutMs = 120000 }) {
   const key = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
@@ -7,8 +19,10 @@ export async function callGeminiRequest({ model = 'gemini-3.6-flash', request, m
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
-  const cleanModel = model.replace(/^google\//, '').replace(/^claude-/, '');
-  const url = `http://127.0.0.1:47821/google-ai-studio/v1beta/models/${cleanModel}:generateContent`;
+  const cleanModel = model
+    .replace(/^google\//, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_');
+  const url = `${gatewayOrigin()}/google-ai-studio/v1beta/models/${cleanModel}:generateContent`;
 
   try {
     const response = await fetch(url, {
@@ -36,7 +50,9 @@ export async function callGeminiRequest({ model = 'gemini-3.6-flash', request, m
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${json?.error?.message || raw.slice(0, 160)}`);
     }
-    const text = json.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join('') || '';
+    const candidateParts = json.candidates?.[0]?.content?.parts || [];
+    const nonThoughtText = candidateParts.filter((p) => !p.thought).map((p) => p.text).filter(Boolean).join('');
+    const text = nonThoughtText || candidateParts.map((p) => p.text).filter(Boolean).join('') || '';
     return { text: text.trim(), usage: json.usageMetadata || null, ms: Date.now() - started };
   } finally {
     clearTimeout(timer);

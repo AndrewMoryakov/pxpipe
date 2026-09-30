@@ -3,7 +3,7 @@ import {
   ANTHROPIC_SLAB_COLS as ANTHROPIC_STRIP_COLS,
 } from './render.js';
 import { BASE_HISTORY, BASE_STYLE } from './profile-base.js';
-import type { GptModelProfile } from './gpt-model-profiles.js';
+import type { GptModelProfile, GptRenderStyle } from './gpt-model-profiles.js';
 
 /**
  * Claude rendering + vision-cost profiles.
@@ -27,7 +27,49 @@ export const CLAUDE_PROFILE: GptModelProfile = {
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   visionTier: 'high-res',
   factSheetFormat: 'full',
-  history: BASE_HISTORY,
+  // BASE_HISTORY.maxImages is a page count, and a page is not a fixed amount of
+  // text: at GPT geometry (84 cols x 1954 px) a page holds ~660 chars, at
+  // Anthropic geometry (312 cols x 728 px) it holds ~2750. The shared 32 was
+  // tuned as a latency budget against the former, so on Claude it stopped being
+  // a latency budget and became a coverage limit: live Opus traffic pinned at
+  // 32 images on 70% of requests with collapsed text flatlined at ~97k chars
+  // while untouched history kept growing past 250k.
+  //
+  // Re-derived against the same latency signal on Claude pages (first-byte p50
+  // / p95, n=11k): 32 -> 5.2s/10.9s, 64 -> 8.3s/15.3s, 96 -> 11.4s/18.5s,
+  // 128 -> 12.5s/27.0s. Upstream 502s stay ~0.2% through 96 images and jump to
+  // 2.2-3.9% at 112+. 96 is the last point that is both cheap and clean.
+  //
+  // The same page-count-vs-geometry mismatch applies to the per-image framing.
+  // BASE_HISTORY pairs `framing: 'full'` with `factSheetScope: 'per-segment'`,
+  // which costs a 221-token intro + 25-token outro + a ~158-token fact sheet on
+  // EVERY segment. At GPT's 32-page ceiling that is a rounding error; at 96
+  // Claude pages it measured 425 tokens/image, 25.2k tokens/request, eating 57%
+  // of the gross saving the higher cap unlocked. Compact framing (36 + 8) with a
+  // single combined sheet carries the same attribution wording the transcript
+  // needs and projects 2.8k tokens/request on the same traffic.
+  //
+  // responsesMode: BASE_HISTORY's 'pairs' planner only groups tool rounds that
+  // are INDEX-CONTIGUOUS. Codex emits an assistant message between rounds, so
+  // every round lands in its own run and every run renders its own image. Live
+  // Claude-on-Responses traffic averaged 2,921 chars/image (10% of the 28,080
+  // a page holds) at 2.4 turns/image, against 10,456 (37%) for gpt-5.6-sol on
+  // the same endpoint — the only difference being that GPT already runs
+  // 'mixed'. Replaying a 60-round transcript through both planners isolates it
+  // to the interleaving, not the volume:
+  //   pairs, no interleave  ->  1 segment,   6 images, 27,653 chars/image
+  //   pairs, interleaved    -> 54 segments, 54 images,  3,073 chars/image
+  //   mixed, interleaved    ->  2 segments,  8 images, 21,109 chars/image
+  // 'mixed' treats safe textual messages as groupable instead of as barriers;
+  // every non-message item stays a hard barrier, so protocol order and open
+  // call/output state are preserved exactly as in 'pairs'.
+  history: {
+    ...BASE_HISTORY,
+    maxImages: 96,
+    framing: 'compact',
+    factSheetScope: 'combined',
+    responsesMode: 'mixed',
+  },
   style: { ...BASE_STYLE },
   // No maxSerializedRequestBytes: no Anthropic request-size limit has ever been
   // sourced. The 768 KiB entry that used to sit here was a guess, and live
@@ -40,6 +82,43 @@ export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
   visionTier: 'standard',
   style: { ...BASE_STYLE },
 };
+
+/**
+ * Spaced geometry, DEFAULT for every Claude model except Fable: the same
+ * 312-col spleen-5x8 cell with 2 px of extra row height.
+ *
+ * Opus 5.5 gist recall (eval/gist-recall, 98 answerable, image arm):
+ *
+ *   dense 5x8          84/98   2.31x cheaper than text
+ *   5x8 +2px rows      93/98   1.85x
+ *   jetbrains-mono-14  --      0.54-0.92x (costs MORE than text on this corpus)
+ *
+ * 0/16 confabulations at every geometry. Bare 5x8 glyphs are not the problem
+ * (sparse ids 99.9% per char); misses came from crowded rows. The 14px profile
+ * this replaces was legible but no longer saved tokens, so it was dropped.
+ */
+const CLAUDE_SPACED_STYLE: GptRenderStyle = {
+  ...BASE_STYLE,
+  cellHBonus: 2,
+};
+
+export const CLAUDE_SPACED_PROFILE: GptModelProfile = {
+  ...CLAUDE_PROFILE,
+  style: { ...CLAUDE_SPACED_STYLE },
+  historyStyle: { ...CLAUDE_SPACED_STYLE },
+};
+
+export const CLAUDE_LEGACY_SPACED_PROFILE: GptModelProfile = {
+  ...CLAUDE_LEGACY_PROFILE,
+  style: { ...CLAUDE_SPACED_STYLE },
+  historyStyle: { ...CLAUDE_SPACED_STYLE },
+};
+
+/** Fable is the only Claude family measured accurate at bare dense geometry
+ *  (98/98 gist), so it alone keeps the unspaced 5x8 cell. */
+export function isFableClaude(model: string): boolean {
+  return model.toLowerCase().includes('fable');
+}
 
 /** Every id that must be priced and rendered as Claude. */
 export function isClaudeModel(model: string | null | undefined): boolean {
@@ -70,8 +149,13 @@ export function isPre47Claude(m: string): boolean {
   return major < 4 || (major === 4 && minor < 7);
 }
 
-/** Pick the Claude profile for an id. Only the resolution tier varies: render
- *  geometry is identical across opus/sonnet/haiku/fable. */
+/** Pick the Claude profile for an id. Billing geometry is identical across
+ *  opus/sonnet/haiku/fable; HISTORY geometry is not, because verbatim recall
+ *  at dense geometry is a per-model property (see CLAUDE_SPACED_PROFILE).
+ *  Fable keeps bare dense; every other Claude id gets spaced rows. */
 export function resolveClaudeProfile(m: string): GptModelProfile {
-  return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
+  if (isFableClaude(m)) {
+    return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
+  }
+  return isPre47Claude(m) ? CLAUDE_LEGACY_SPACED_PROFILE : CLAUDE_SPACED_PROFILE;
 }

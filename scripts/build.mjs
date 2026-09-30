@@ -26,7 +26,10 @@ await mkdir(OUT, { recursive: true });
 // with shell:true trips the DEP0190 arg-escaping warning. Resolving the tsc bin
 // and invoking `node <tsc>` sidesteps both — same pattern as the smoke check
 // below, and drops the build's dependency on pnpm being the caller.
-const tscBin = require.resolve('typescript/bin/tsc');
+// TS 7 no longer exports './bin/tsc', so resolve it via the bin field of the
+// (still-exported) package.json instead of a direct subpath require.
+const tsPkgPath = require.resolve('typescript/package.json');
+const tscBin = new URL(require('typescript/package.json').bin.tsc, `file://${tsPkgPath}`).pathname;
 const tsc = spawnSync(process.execPath, [tscBin, '-p', 'tsconfig.json'], {
   stdio: 'inherit',
 });
@@ -42,7 +45,7 @@ await build({
   outfile: 'dist/node.js',
   bundle: true,
   platform: 'node',
-  target: 'node18',
+  target: 'node20',
   format: 'esm',
   sourcemap: true,
   // Inline the package version so `pxpipe --version` is correct for global/npx

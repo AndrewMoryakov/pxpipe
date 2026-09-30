@@ -80,11 +80,11 @@ export interface Usage {
    *  (billed at ~0.1× for the gpt-5 family). Mapped from `input_tokens_details`
    *  / `prompt_tokens_details.cached_tokens`. Anthropic uses cache_read instead. */
   cached_tokens?: number;
-  /** OpenAI prompt-cache writes reported by compatible providers. This is a
-   *  diagnostic subset of `input_tokens`, never an additional token charge. */
+  /** OpenAI-compatible prompt-cache writes — diagnostic subset of `input_tokens`,
+   *  never added to the input total. Anthropic uses cache_creation instead. */
   cache_write_tokens?: number;
-  /** OpenAI reasoning tokens — a subset of output_tokens, exposed separately
-   *  for observability and never added to output_tokens a second time. */
+  /** Reasoning tokens — subset of `output_tokens`. Mapped from
+   *  `output_tokens_details` / `completion_tokens_details.reasoning_tokens`. */
   reasoning_output_tokens?: number;
 }
 

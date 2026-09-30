@@ -33,6 +33,11 @@ import {
   type TrackEvent,
 } from './core/tracker.js';
 import {
+  configureSessionStateStore,
+  flushSessionState,
+  type SessionStateStore,
+} from './core/session-state.js';
+import {
   DashboardState,
   dashboardPath,
   type DashboardRoute,
@@ -49,6 +54,7 @@ import {
   clearPersistedModelScope,
 } from './model-scope-store.js';
 import { setAllowedModelBases } from './core/applicability.js';
+import { runStats } from './stats.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -70,6 +76,8 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+  /** Where the per-session cache pins survive a restart; undefined = off. */
+  sessionStateFile?: string;
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
    *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
@@ -79,9 +87,60 @@ interface RuntimeConfig {
    * bundled Compose loopback port publication) protects a non-loopback bind
    * that injects server-owned upstream credentials. */
   allowNonLoopbackCredentials: boolean;
+  /** Ceiling on a buffered inbound request body. Unset leaves the core default
+   *  (16 MiB). Raise it only if a real client needs more; the default binding is
+   *  loopback, but HOST can expose this process to a network. */
+  maxRequestBytes?: number;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
+const DEFAULT_EVENTS_FILE = path.join(os.homedir(), '.pxpipe', 'events.jsonl');
+const DEFAULT_SESSION_STATE_FILE = path.join(os.homedir(), '.pxpipe', 'session-state.json');
+
+/** PXPIPE_SESSION_STATE: a path, or 0/off/false/no to disable. */
+function resolveSessionStateFile(): string | undefined {
+  const raw = process.env.PXPIPE_SESSION_STATE?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_SESSION_STATE_FILE;
+  if (/^(0|off|false|no)$/i.test(raw)) return undefined;
+  return raw;
+}
+
+/**
+ * File-backed {@link SessionStateStore}. Same write-then-rename discipline as the
+ * config writer above: a crash mid-write leaves the previous file intact. Mode
+ * 0600 — the file holds session fingerprints (sha8 of the first user turn) and
+ * counters, never prompt text, but it is still per-user state.
+ */
+function fileSessionStateStore(file: string): SessionStateStore {
+  return {
+    load(): string | undefined {
+      try {
+        return fs.readFileSync(file, 'utf8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw err;
+      }
+    },
+    save(text: string): void {
+      const dir = path.dirname(file);
+      const parentExists = fs.existsSync(dir);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (!parentExists) fs.chmodSync(dir, 0o700);
+      const tmp = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(tmp, text, { mode: 0o600 });
+        fs.renameSync(tmp, file);
+      } catch (err) {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* nothing to clean */
+        }
+        throw err;
+      }
+    },
+  };
+}
 
 function normalizeModelsConfig(value: unknown): string | undefined {
   if (Array.isArray(value)) {
@@ -168,16 +227,32 @@ function parseCli(argv: string[]): RuntimeConfig {
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL?.trim(),
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
-    eventsFile:
-      process.env.PXPIPE_LOG ??
-      path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
+    eventsFile: process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE,
+    sessionStateFile: resolveSessionStateFile(),
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
     captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
     trustedDashboardProxy: process.env.PXPIPE_TRUSTED_DASHBOARD_PROXY?.trim() || undefined,
     allowNonLoopbackCredentials:
       process.env.PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS === '1',
+    maxRequestBytes: parseMaxRequestBytes(process.env.PXPIPE_MAX_REQUEST_BYTES),
   };
+}
+
+/** A bad limit exits instead of being ignored. The core also refuses to treat a
+ *  broken value as "no limit", but a host that was asked for 8MB and silently ran
+ *  at 16 would be a worse answer than a startup error. */
+function parseMaxRequestBytes(value: string | undefined): number | undefined {
+  const raw = value?.trim();
+  if (raw === undefined || raw === '') return undefined;
+  const bytes = Number(raw);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+    console.error(
+      `[pxpipe] PXPIPE_MAX_REQUEST_BYTES must be a positive whole number of bytes, got: ${value}`,
+    );
+    process.exit(2);
+  }
+  return bytes;
 }
 
 function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
@@ -193,16 +268,25 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
-  pxpipe warp -- CMD    run CMD behind the proxy without a custom base URL, so
+  pxpipe warp [--route PATTERN=TARGET]... -- CMD
+                        run CMD behind the proxy without a custom base URL, so
                         client-side first-party gates (/remote-control,
-                        claude.ai connectors) keep working
+                        claude.ai connectors) keep working.
+                        api.anthropic.com/v1/messages is routed by default;
+                        --route adds rules for agents that talk to another
+                        base URL, e.g.
+                          --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821'
+  pxpipe stats [--json] [--file <p>]
+                        summarize the events log offline (no server needed),
+                        incl. measured savings; defaults to $PXPIPE_LOG
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
 /v1/messages/count_tokens. Dashboard controls can disable compression live.
 
-Stats, sessions, and cleanup tools live in the dashboard at
+Live sessions and cleanup tools live in the dashboard at
   http://127.0.0.1:<port>/  (default port 47821)
+For after-the-fact analysis without the server running, use pxpipe stats.
 
 Flags:
   -h, --help              show this help
@@ -229,7 +313,7 @@ Environment:
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
   PXPIPE_MODELS           comma-separated model bases to image (Claude/Gemini/GPT/Grok);
-                          default claude-fable-5,gemini-3.6-flash (Sol/Opus/GPT-5.5/Grok opt-in);
+                          default claude-fable-5,gemini (every Gemini; Sol/Opus/GPT-5.5/Grok opt-in);
                           off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
@@ -242,8 +326,18 @@ Environment:
                           .1.gz, .2.gz, ...
   PXPIPE_LOG_FSYNC_MS     periodic fsync interval in ms; 0 = fsync only on
                           shutdown (default 0)
+  PXPIPE_SESSION_STATE    where per-session cache pins (freeze-step floor, cache
+                          liveness) survive a restart; 0/off disables
+                          (default ~/.pxpipe/session-state.json). Without it a
+                          restart drops every live session's floor.
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
+                          (default 64 MiB here; 8 MiB on Workers, where the
+                          isolate has ~128 MiB for everything). Frozen history
+                          chunks are byte-identical across turns, so
+                          re-rendering them is wasted CPU; 0 disables the cache.
+                          Live counters at /proxy-stats under render_cache.
   PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
@@ -1154,7 +1248,9 @@ async function runExport(argv: string[]): Promise<void> {
 
   // Write artifacts
   for (const artifact of result.artifacts) {
-    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data);
+    // The bundle contains source and prompt-derived content. mkdtemp creates
+    // its directory owner-only; keep each artifact owner-only as well.
+    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data, { mode: 0o600 });
   }
 
   // Print report
@@ -1176,15 +1272,47 @@ async function main(): Promise<void> {
     await runExport(argv.slice(1));
     return; // server never starts
   }
+  if (argv[0] === 'stats') {
+    // Offline log analysis — reads the events JSONL without a running proxy.
+    // The live dashboard covers the same data while pxpipe is up.
+    const defaultFile = process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE;
+    const { code, out, err } = await runStats(argv.slice(1), defaultFile);
+    if (out) process.stdout.write(out + '\n');
+    if (err) process.stderr.write(err + '\n');
+    process.exit(code); // server never starts
+  }
   // `warp` runs an agent behind a CONNECT proxy and redirects its inference
   // traffic into the pxpipe already running. It starts no proxy of its own, so
   // it exits through its own branch below rather than falling through here.
   let warpCommand: string[] | undefined;
+  const warpRoutes: string[] = [];
   let cliArgv = argv;
   if (argv[0] === 'warp') {
     const sep = argv.indexOf('--');
     warpCommand = sep < 0 ? [] : argv.slice(sep + 1);
-    cliArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    // warp's own flags live before the `--`; parseCli accepts none of them, so
+    // they are consumed here rather than passed through.
+    const warpArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    const rest: string[] = [];
+    for (let i = 0; i < warpArgv.length; i += 1) {
+      const a = warpArgv[i]!;
+      if (a === '--route') {
+        const spec = warpArgv[i + 1];
+        if (spec === undefined) {
+          console.error('[pxpipe] warp: --route needs PATTERN=TARGET');
+          process.exit(2);
+        }
+        warpRoutes.push(spec);
+        i += 1;
+        continue;
+      }
+      if (a.startsWith('--route=')) {
+        warpRoutes.push(a.slice('--route='.length));
+        continue;
+      }
+      rest.push(a);
+    }
+    cliArgv = rest;
   }
   // Stats / sessions / cleanup tools live in the dashboard
   // (see http://127.0.0.1:${port}/).
@@ -1195,7 +1323,7 @@ async function main(): Promise<void> {
   // does the transforming, the tracking and the dashboard. Everything below —
   // tracker, proxy pipeline, listener — belongs to that instance, not to us.
   if (warpCommand) {
-    createWarpRuntime({ port: opts.port }).launch(warpCommand);
+    createWarpRuntime({ port: opts.port, routes: warpRoutes }).launch(warpCommand);
     return;
   }
   // A non-loopback unauthenticated proxy plus a server-owned upstream key lets
@@ -1207,6 +1335,32 @@ async function main(): Promise<void> {
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
     console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
+  }
+  // Subscription bearers expire. A client that froze its bearer at startup — a
+  // container handed CLAUDE_CODE_OAUTH_TOKEN as an env var — cannot renew one,
+  // so its max session length is the token's remaining life. When this is set we
+  // resolve the bearer per request from the file instead, which keeps rotation
+  // on the host with a single writer: N parallel containers refreshing their own
+  // copies would rotate each other's credential out from under them.
+  // Cached on mtime, so it costs a stat per request rather than a read.
+  const authTokenFile = process.env.ANTHROPIC_OAUTH_TOKEN_FILE?.trim() || undefined;
+  let authTokenCache: { mtimeMs: number; token: string } | undefined;
+  const anthropicAuthToken = authTokenFile
+    ? (): string | undefined => {
+        try {
+          const { mtimeMs } = fs.statSync(authTokenFile);
+          if (authTokenCache?.mtimeMs !== mtimeMs) {
+            authTokenCache = { mtimeMs, token: fs.readFileSync(authTokenFile, 'utf8').trim() };
+          }
+          return authTokenCache.token || undefined;
+        } catch {
+          // Mid-rotation the writer may have unlinked it; last good beats none.
+          return authTokenCache?.token;
+        }
+      }
+    : undefined;
+  if (authTokenFile) {
+    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
   }
   // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
@@ -1247,6 +1401,13 @@ async function main(): Promise<void> {
     compress: process.env.PXPIPE_LOG_COMPRESS === '1',
     fsyncMs: Number(process.env.PXPIPE_LOG_FSYNC_MS) || undefined,
   });
+  if (opts.sessionStateFile) {
+    const restored = configureSessionStateStore(fileSessionStateStore(opts.sessionStateFile));
+    console.log(`[pxpipe] session state: ${restored} session(s) restored from ${opts.sessionStateFile}`);
+  } else {
+    console.log('[pxpipe] session state: persistence off (PXPIPE_SESSION_STATE)');
+  }
+
   const tracker: Tracker = new FileTracker(opts.eventsFile);
 
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the
@@ -1286,6 +1447,7 @@ async function main(): Promise<void> {
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
   const config: ProxyConfig = {
+    authToken: anthropicAuthToken,
     provider: opts.provider,
     gatewayBaseUrl: opts.gatewayBaseUrl,
     gatewayHeaders: opts.gatewayHeaders,
@@ -1297,6 +1459,7 @@ async function main(): Promise<void> {
     openAIModels: opts.openAIModels,
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
+    maxRequestBytes: opts.maxRequestBytes,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1358,8 +1521,25 @@ async function main(): Promise<void> {
         e.usage !== undefined
           ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
           : '';
+      // Split the wall clock into the half we control and the half we don't:
+      // `tx` is local render+encode, the remainder is upstream. Without this the
+      // duration alone can't distinguish our CPU from a slow provider.
+      //
+      // `fb` further splits the upstream half: request start → response headers,
+      // so it covers upload + provider queue/processing but NOT generation. With
+      // all three, `fb - tx` isolates how much a large image payload costs to put
+      // on the wire, which is the number that decides whether shrinking IDATs pays.
+      const timingParts = [`${e.durationMs}ms`];
+      if (e.transformMs !== undefined) {
+        timingParts.push(
+          `tx=${e.transformMs}ms`,
+          `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
+        );
+      }
+      if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
+      const timing = timingParts.join(' ');
       console.log(
-        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
+        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
       );
 
       // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;
@@ -1532,6 +1712,8 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     console.log(`[pxpipe] ${sig} — shutting down`);
+    // Pins first: losing a freeze-step floor re-keys a whole prefix.
+    flushSessionState();
     codexUsage.stop();
     // Flush+close the tracker so we don't drop the last few events on exit.
     if (tracker instanceof FileTracker) tracker.close();

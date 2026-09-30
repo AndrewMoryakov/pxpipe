@@ -19,7 +19,7 @@ grows with content until the profile cap, then overflow becomes another page.
 
 | model rule | atlas / effective cell | columns | full width | max height |
 |---|---|---:|---:|---:|
-| Claude / Anthropic | Spleen + Unifont, 5×8 | 312 | 1568 px | 728 px |
+| Claude / Anthropic | JetBrains Mono 14px, native 9×16 | 172 | 1556 px | 728 px |
 | opt-in `gpt-5.6-sol` | JetBrains Mono 14px, native 9×16 | 84 | 764 px | 1954 px |
 | opt-in Grok 4.5 | JetBrains Mono 14px, native 9×16 + IDS + factsheet | 84 | 764 px | 512 px |
 | other OpenAI fallback | Spleen + Unifont, 5×8 | 152 | 768 px | 1932 px |
@@ -40,6 +40,23 @@ the vision encoder without the old 0.555× resample.
 
 OpenAI-shaped profiles use portrait strips. GPT 5.6 Sol uses 84×9+8, a 764px
 strip up to 1954px; Grok uses 84×9+8, a 764px strip up to 512px.
+
+There are two ceilings, not one. The documented provider limit is a count: 100
+images per request, enforced through `imageHeadroom`. The second is weight, and
+it is empirical: past roughly 20MiB of decoded image bytes, production requests
+start failing as 500s, 502s, empty 200s and stalls (#157), and `/compact`
+traverses the same oversized path, so a session cannot compact its way out.
+
+`maxImageBytes` bounds that second budget, defaulting to 18MiB, deliberately
+under the observed cliff rather than at it. The caller's own images are counted
+first and are never removed to make room. Admission is atomic per semantic
+group: the slab, one tool result, and the history collapse are each imaged whole
+or kept as text whole, because a half-imaged group ships pages without the text
+they replaced, and a partially imaged slab re-keys the cache prefix whenever the
+budget arithmetic moves. `imageByteSkips` counts groups refused by weight, kept
+separate from `imageBudgetSkips` because fewer pages and smaller pages are
+different fixes; `imageBytesNearLimit` flags a request that finished inside the
+top 10% of the budget.
 
 ## Font and Unicode
 

@@ -21,9 +21,9 @@
  * sizing and font geometry differ.
  */
 import { type RenderFont } from './render.js';
-import { isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
+import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
-import { BASE_HISTORY, BASE_PRICING, BASE_STYLE } from './profile-base.js';
+import { BASE_HISTORY, BASE_PRICING, BASE_STYLE, NATIVE_14PX_HISTORY } from './profile-base.js';
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -78,6 +78,15 @@ export interface GptHistoryProfile {
   keepRecentPairs: number;
   /** Local o200k floor before history profitability is evaluated. */
   minCollapseTokens: number;
+  /** Chat-completions only: minimum closed turns before history images.
+   *  Undefined keeps the planner default (10). */
+  minCollapsePrefix?: number;
+  /** Chat-completions only: snap the collapse boundary to this many turns.
+   *  Undefined keeps the planner default (10). Native-14px sets 1. */
+  collapseChunk?: number;
+  /** Chat-completions only: freeze imaged chunks on this turn grid.
+   *  Undefined keeps the planner default (10). Native-14px sets 1. */
+  freezeChunk?: number;
   /** Responses items eligible for history images. */
   responsesMode: 'pairs' | 'mixed';
   /** Native text bracketing each history image group. */
@@ -113,6 +122,23 @@ export interface GptModelProfile {
   history: GptHistoryProfile;
   /** Complete model-specific font, cell spacing, color, and marker style. */
   style: GptRenderStyle;
+  /** Optional override of `stripCols` for COLLAPSED HISTORY only, leaving the
+   *  slab and tool-result pages on `stripCols`. Undefined = use `stripCols`,
+   *  i.e. behaviour is unchanged unless a profile opts in.
+   *
+   *  Exists because reading accuracy and rendering cost are not the same axis.
+   *  Geometry is identical across a provider's models because the *billing* is,
+   *  but verbatim recall is not: on one 26-value battery at this profile's
+   *  312-col dense geometry, Fable 5 read 25/26 exactly while Opus 5 read 3/26
+   *  with 10 silent substitutions. A deployment that must re-read exact values
+   *  out of imaged history needs a lower density there — and only there, since
+   *  the static slab holds no such values. */
+  historyStripCols?: number;
+  /** Optional override of `style` for collapsed history only. Same rationale as
+   *  `historyStripCols`; set both together, since a larger font at unchanged
+   *  columns overshoots the provider's no-resize width and is silently
+   *  downscaled, which removes the legibility it was meant to buy. */
+  historyStyle?: GptRenderStyle;
   /** Maximum serialized provider request produced by pxpipe. Undefined leaves
    *  legacy behavior unchanged. Checked in the transform (which falls back to
    *  the original body when imaging would overshoot) and enforced again on the
@@ -138,6 +164,13 @@ export interface GptModelProfile {
    *  text's own token count. Profiles that pin an exact static slab set this;
    *  it is a property of the profile, not of one model id. */
   exactStaticBaseline?: boolean;
+  /** Hard provider cap on TOTAL images in one request (slab + history +
+   *  client-attached). When set, the history-collapse budget becomes dynamic:
+   *  min(configured history cap, this cap − images already in the request), so
+   *  client-attached images consume the same headroom pxpipe's own images do
+   *  and the final request can never overshoot the provider's limit. Set only
+   *  from a documented provider limit (Workers AI 3.8: 32). */
+  providerImageCap?: number;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -180,17 +213,10 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
   minCompressTokens: 500,
   factSheetFormat: 'full',
   history: {
-    ...BASE_HISTORY,
+    ...NATIVE_14PX_HISTORY,
+    // Taller 1954px pages: more chars/image, so Sol can hold a larger budget
+    // without the 512px latency cliff that Grok/Qwen hit.
     maxImages: 64,
-    // The latest user request is protected independently by the Responses
-    // planner. Keep only one additional recent message/pair native so closed,
-    // unreferenced history does not dominate long stateless requests.
-    keepTail: 1,
-    keepRecentPairs: 1,
-    minCollapseTokens: 1000,
-    responsesMode: 'mixed',
-    framing: 'compact',
-    factSheetScope: 'combined',
   },
   style: {
     ...BASE_STYLE,
@@ -211,6 +237,11 @@ const isMiniNanoPatch = (m: string): boolean =>
 
 /** Grok ids pxpipe has a measured profile for. */
 const isGrokModel = (m: string): boolean => /^grok-/.test(m);
+
+/** Qwen 3.8 27B ids — the only Qwen geometry pxpipe has measured. Other Qwen
+ *  variants deliberately do NOT match: the family-id guard below refuses them
+ *  instead of gating an unmeasured model with this profile. */
+const isQwenModel = (m: string): boolean => /qwen3\.8-27b/i.test(m);
 
 /** Shared GPT geometry for the small patch-billed models; only the patch
  *  multiplier and the family list prices differ between the rules below. */
@@ -296,7 +327,37 @@ const BUILTIN_RULES: ProfileRule[] = [
       maxHeightPx: 512,
       minCompressTokens: 500,
       factSheetFormat: 'full',
-      history: { ...BASE_HISTORY, maxImages: 24 },
+      // pairs only groups INDEX-CONTIGUOUS tool rounds. Codex puts an assistant
+      // message between rounds, so every round is its own run and leftover
+      // history stays text — which is why grok-4.6 showed ~0 saved. mixed
+      // groups safe messages with completed pairs.
+      history: { ...NATIVE_14PX_HISTORY },
+      style: {
+        ...BASE_STYLE,
+        font: 'jetbrains-mono-14',
+        aa: true,
+        grid: false,
+        gridCols: 0,
+      },
+    },
+  },
+
+  // Qwen 3.8 27B (Workers AI / open weights). Native 14px / 84 cols / maxH 512 is required
+  // because 5x8 bitmap glyphs are illegible to Qwen vision (0/15 hex vs 11/15 on 14px).
+  // Workers AI hard-rejects requests over 32 images, so providerImageCap makes the
+  // history budget dynamic: 32 minus every image already in the request.
+  {
+    test: isQwenModel,
+    profile: {
+      vision: { regime: 'mpix', tokensPerMegapixel: 1000 },
+      cacheReadRate: 0.25,
+      outputRate: 3,
+      providerImageCap: 32,
+      stripCols: 84,
+      maxHeightPx: 512,
+      minCompressTokens: 500,
+      factSheetFormat: 'full',
+      history: { ...NATIVE_14PX_HISTORY },
       style: {
         ...BASE_STYLE,
         font: 'jetbrains-mono-14',
@@ -314,8 +375,9 @@ const BUILTIN_RULES: ProfileRule[] = [
  * resolves to one of their profiles.
  */
 const FAMILY_ID_GUARDS: ReadonlyArray<{ mentions: RegExp; matches: (m: string) => boolean }> = [
-  { mentions: /gemini/, matches: isGeminiModel },
+  { mentions: /gemini/, matches: hasGeminiMeasuredProfile },
   { mentions: /grok/, matches: isGrokModel },
+  { mentions: /qwen/, matches: isQwenModel },
 ];
 
 /** True when the operator declared this id in PXPIPE_GPT_PROFILES. The guards
@@ -473,10 +535,30 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       keepTail: nonNegativeInt(historyIn?.keepTail, baseHistory.keepTail),
       keepRecentPairs: nonNegativeInt(historyIn?.keepRecentPairs, baseHistory.keepRecentPairs),
       minCollapseTokens: nonNegativeInt(historyIn?.minCollapseTokens, baseHistory.minCollapseTokens),
+      minCollapsePrefix: historyIn?.minCollapsePrefix === undefined
+        ? baseHistory.minCollapsePrefix
+        : nonNegativeInt(historyIn.minCollapsePrefix, baseHistory.minCollapsePrefix ?? 10),
+      collapseChunk: historyIn?.collapseChunk === undefined
+        ? baseHistory.collapseChunk
+        : nonNegativeInt(historyIn.collapseChunk, baseHistory.collapseChunk ?? 10),
+      freezeChunk: historyIn?.freezeChunk === undefined
+        ? baseHistory.freezeChunk
+        : nonNegativeInt(historyIn.freezeChunk, baseHistory.freezeChunk ?? 10),
       responsesMode: responsesMode(historyIn?.responsesMode, baseHistory.responsesMode),
       framing: historyFraming(historyIn?.framing, baseHistory.framing),
       factSheetScope: factSheetScope(historyIn?.factSheetScope, baseHistory.factSheetScope),
     };
+    // History geometry: only materialised when the override actually asks for
+    // it, so a profile that says nothing about history keeps `undefined` and
+    // transform.ts falls through to the dense geometry unchanged.
+    const historyStyleIn = (p as { historyStyle?: GptRenderStyle }).historyStyle;
+    const historyStyle: GptRenderStyle | undefined = historyStyleIn === undefined
+      ? base.historyStyle
+      : { ...style, font: renderFont(historyStyleIn.font, style.font) };
+    const historyStripCols = p.historyStripCols === undefined
+      ? base.historyStripCols
+      : posInt(p.historyStripCols, base.historyStripCols ?? base.stripCols);
+
     out.set(key, {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
@@ -490,6 +572,8 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       factSheetFormat: factSheetFormat(p.factSheetFormat, base.factSheetFormat),
       history,
       style,
+      historyStripCols,
+      historyStyle,
       maxSerializedRequestBytes: p.maxSerializedRequestBytes === undefined
         ? base.maxSerializedRequestBytes
         : posInt(p.maxSerializedRequestBytes, base.maxSerializedRequestBytes ?? 0) || undefined,
@@ -524,7 +608,8 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
   // do not define a different visual reader profile.
   const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
   const ids = candidateIds(m);
-  if (ids.some(isGeminiModel)) return resolveGeminiProfile();
+  const geminiId = ids.find(hasGeminiMeasuredProfile);
+  if (geminiId) return resolveGeminiProfile(geminiId);
   const env = envProfiles();
   if (env.size > 0) {
     let best: GptModelProfile | undefined;

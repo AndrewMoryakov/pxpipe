@@ -257,6 +257,23 @@ export const DEFAULT_CELL_H_BONUS = 0;
 export const CELL_W = ATLAS_CELL_W + DEFAULT_CELL_W_BONUS;
 export const CELL_H = ATLAS_CELL_H + DEFAULT_CELL_H_BONUS;
 
+/** Visual rows per image: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`. Derived
+ *  from the cell geometry above so break-even math auto-tracks it. */
+export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+
+/** Real char capacity of one page AT A GIVEN COLUMN WIDTH.
+ *
+ *  Lives here, next to the geometry it is derived from, because every caller that
+ *  budgets images must price pages at the width it actually renders at. The
+ *  DENSE_CONTENT_CHARS_PER_IMAGE constant is only correct for DENSE_CONTENT_COLS
+ *  (312×90); using it while rendering at, say, COLS=100 overstates capacity 3.1×,
+ *  so an image budget clears a plan that then emits 3× the images — the request
+ *  blows the API's per-request limit and comes back 500. Always pass the cols the
+ *  renderer will actually use. */
+export function maxCharsPerImage(cols: number): number {
+  return Math.min(Math.max(1, cols) * LINES_PER_IMAGE, READABLE_CHARS_PER_IMAGE);
+}
+
 export interface RenderedImage {
   png: Uint8Array;
   width: number;
@@ -342,9 +359,23 @@ const TAB_WIDTH = 4; // standard 4-space tab stops (logs, code, tool output are 
 export function minifyForRender(text: string): string {
   return text
     .split('\n')
-    .map((line) => line.replace(/[ \t]+$/, ''))
+    .map(trimLineEnd)
     .join('\n')
     .replace(/\n{4,}/g, '\n\n\n'); // 4+ \n → 3 \n (max 2 blank lines)
+}
+
+/** Drop trailing spaces and tabs from one line.
+ *  Scanned backwards: /[ \t]+$/ retries from every position in a long run of
+ *  spaces when the line does not end in one, which is quadratic on one very
+ *  long line. */
+function trimLineEnd(line: string): string {
+  let end = line.length;
+  while (end > 0) {
+    const c = line.charCodeAt(end - 1);
+    if (c !== 32 && c !== 9) break;
+    end -= 1;
+  }
+  return end === line.length ? line : line.slice(0, end);
 }
 
 // --- R3 reflow -------------------------------------------------------------
@@ -1048,12 +1079,272 @@ export async function renderTextToPngsReflow(
 }
 
 /** Split text into N PNGs each ≤ MAX_HEIGHT_PX tall, respecting per-image char budget. */
+// --- rendered-page cache ---------------------------------------------------
+
+/**
+ * Rendering is a pure function of (text, cols, maxCharsPerImage, style, maxHeightPx,
+ * slotText): the atlases are decoded once at module init and never mutated, and no
+ * module-level state feeds the output. So identical inputs can safely return the
+ * identical pages instead of being re-rasterized.
+ *
+ * This is worth a cache because the proxy deliberately re-renders the same bytes every
+ * turn: history chunks are frozen so they stay byte-identical for the upstream prompt
+ * cache (see the cache-stability note in history.ts), which means a long session pays
+ * full render cost for pages that provably did not change. Measured on a real session,
+ * ~134 images cost ~10s of single-threaded CPU per request while the payload hash held
+ * constant across consecutive turns.
+ *
+ * Bounded by total retained bytes. Eviction is LRU via Map's insertion order:
+ * re-inserting on hit moves an entry to the newest position.
+ */
+
+/** 64 MiB holds several turns of a heavy session on a host with real RAM. */
+const RENDER_CACHE_DEFAULT_BYTES_NODE = 64 * 1024 * 1024;
+/** A Workers isolate gets ~128 MiB for everything — the request body, the decoded
+ *  atlases, the framebuffers, and whatever the compressor is holding. Half of that
+ *  spent on retained pages is how an isolate gets killed mid-request, so the edge
+ *  default is an order of magnitude lower and operators opt back up. */
+const RENDER_CACHE_DEFAULT_BYTES_WORKERS = 8 * 1024 * 1024;
+
+/** `typeof process` cannot answer this: `nodejs_compat_v2` defines `process` on
+ *  Workers too. `navigator.userAgent` is the documented probe.
+ *
+ *  Read off `globalThis` through a local shape rather than the ambient `navigator`
+ *  global: this project compiles `@cloudflare/workers-types` and `@types/node`
+ *  together, and `navigator` is absent from Node before 21 while `engines` allows
+ *  20.19. Optional chaining answers "not Workers" for every one of those cases. */
+function isWorkersRuntime(): boolean {
+  const nav = (globalThis as { navigator?: { userAgent?: string } }).navigator;
+  return nav?.userAgent === 'Cloudflare-Workers';
+}
+
+/** Mutable rather than a const: Worker configuration arrives as per-request bindings,
+ *  not as `process.env` at module init, so `src/worker.ts` has to be able to set this
+ *  after the module has already loaded. Node still resolves it once, below. */
+let renderCacheMaxBytesValue = (() => {
+  // Edge-safe: `process` is undefined off-Node.
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_RENDER_CACHE_BYTES : undefined;
+  const parsed = raw !== undefined && raw.trim() !== '' ? Number(raw) : NaN;
+  // 0 disables the cache outright; negative/garbage falls back to the default.
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+  return isWorkersRuntime() ? RENDER_CACHE_DEFAULT_BYTES_WORKERS : RENDER_CACHE_DEFAULT_BYTES_NODE;
+})();
+
+interface RenderCacheEntry {
+  readonly images: readonly RenderedImage[];
+  readonly bytes: number;
+}
+
+const renderCache = new Map<string, RenderCacheEntry>();
+let renderCacheBytes = 0;
+let renderCacheHits = 0;
+let renderCacheMisses = 0;
+let renderCacheEvictions = 0;
+let renderCacheOversized = 0;
+
+/** Observability for the dashboard/tests. `bytes` counts retained PNG payloads plus
+ *  the fixed-width keys.
+ *
+ *  `evictions` and `oversized` answer different questions and a single "the cache is
+ *  not helping" number would conflate them: evictions mean the working set outgrew the
+ *  budget (raise it, or accept the churn), while `oversized` means a single render was
+ *  bigger than the entire budget and was therefore never stored at all — the failure a
+ *  too-small edge budget produces, where hit rate stays at zero no matter how stable
+ *  the input is. */
+export function renderCacheStats(): {
+  entries: number;
+  bytes: number;
+  hits: number;
+  misses: number;
+  evictions: number;
+  oversized: number;
+} {
+  return {
+    entries: renderCache.size,
+    bytes: renderCacheBytes,
+    hits: renderCacheHits,
+    misses: renderCacheMisses,
+    evictions: renderCacheEvictions,
+    oversized: renderCacheOversized,
+  };
+}
+
+/** Current byte budget. Exposed so the dashboard can report utilisation rather than a
+ *  bare byte count the operator has no denominator for. */
+export function renderCacheMaxBytes(): number {
+  return renderCacheMaxBytesValue;
+}
+
+/**
+ * Set the byte budget at runtime and evict down to it immediately.
+ *
+ * Exists for the Worker entrypoint, which cannot use the module-init `process.env`
+ * read: bindings are handed to `fetch(req, env, ctx)`, long after this module
+ * evaluated. Node keeps using the env read.
+ *
+ * `0` disables the cache and drops everything already held. Negative or non-finite
+ * input is ignored rather than obeyed — a broken value must not read as "unbounded".
+ */
+export function setRenderCacheMaxBytes(maxBytes: number): void {
+  if (!Number.isFinite(maxBytes) || maxBytes < 0) return;
+  renderCacheMaxBytesValue = Math.floor(maxBytes);
+  if (renderCacheMaxBytesValue === 0) {
+    // Not clearRenderCache(): shrinking the budget is not a reason to throw away the
+    // hit/miss history an operator is reading.
+    renderCache.clear();
+    renderCacheBytes = 0;
+    return;
+  }
+  evictToBudget();
+}
+
+/** Evict oldest-first until back within budget, optionally pinning one key that must
+ *  survive. Map iteration is insertion order, which the hit path keeps LRU-ordered. */
+function evictToBudget(pinnedKey?: string): void {
+  for (const [k, v] of renderCache) {
+    if (renderCacheBytes <= renderCacheMaxBytesValue) break;
+    if (k === pinnedKey) continue;
+    renderCache.delete(k);
+    renderCacheBytes -= v.bytes;
+    renderCacheEvictions++;
+  }
+}
+
+/** Drop every entry. Tests use this to isolate hit/miss accounting. */
+export function clearRenderCache(): void {
+  renderCache.clear();
+  renderCacheBytes = 0;
+  renderCacheHits = 0;
+  renderCacheMisses = 0;
+  renderCacheEvictions = 0;
+  renderCacheOversized = 0;
+}
+
+/** Stable serialization of RenderStyle. Every field is a primitive (see the interface),
+ *  so String() is unambiguous; sorting keys removes any dependence on literal order.
+ *  Undefined values are skipped so `{}` and `{aa: undefined}` share one entry. */
+function styleCacheKey(style: RenderStyle): string {
+  const src = style as Record<string, unknown>;
+  let out = '';
+  for (const k of Object.keys(src).sort()) {
+    const v = src[k];
+    if (v !== undefined) out += `${k}=${String(v)};`;
+  }
+  return out;
+}
+
+/** Copy the array and each entry's mutable `droppedCodepoints` map so a caller cannot
+ *  mutate cached state. The PNG bytes are shared deliberately — copying multi-MB
+ *  payloads on every hit would defeat the point; callers only base64-encode them. */
+function cloneForCaller(images: readonly RenderedImage[]): RenderedImage[] {
+  return images.map((img) => ({ ...img, droppedCodepoints: new Map(img.droppedCodepoints) }));
+}
+
+/** Domain separator. Keeps these digests from ever being equal to a digest this
+ *  codebase computes over the same bytes for another purpose (`sha8` over the slab,
+ *  `sha256Text` in proxy.ts), and gives the encoding a version to bump if the input
+ *  tuple ever grows a field. */
+const RENDER_CACHE_KEY_DOMAIN = 'pxpipe/render-cache/v1\n';
+
+const renderCacheKeyEncoder = new TextEncoder();
+
+/**
+ * Cache key: a SHA-256 over a canonical encoding of everything the renderer reads.
+ *
+ * #158 keyed on the source text verbatim, arguing that a digest collision would serve
+ * the WRONG image and that a literal key is collision-free by construction. The
+ * literal key is also a guarantee of the opposite kind: every prompt rendered this
+ * process stays in the heap as a plaintext string until evicted, and — the part that
+ * bites operationally — entry size scales with source length, so a budget meant to
+ * bound retained *pages* spends most of itself on copies of the input (#210).
+ *
+ * A full 256-bit digest, not the 32-bit `sha8` used for telemetry elsewhere. At the
+ * entry counts a byte budget permits, collision odds sit far below the failure modes
+ * the pipeline already lives with, and #210 states the trade explicitly: a
+ * cryptographic collision is the smaller risk against guaranteed prompt retention.
+ *
+ * Every free-form field is length-prefixed, so no regrouping of the same characters
+ * can produce one encoding — ("a b", "c") and ("a", "b c") stay distinct, which is the
+ * ambiguity #158's `slotLen` prefix guarded against. `-1` marks an absent `slotText`
+ * and must stay distinct from empty, because renderTextToPngsUncached branches on
+ * `slotText !== undefined` rather than on its length.
+ */
+async function renderCacheKey(
+  text: string,
+  cols: number,
+  maxCharsPerImage: number,
+  maxHeightPx: number,
+  style: RenderStyle,
+  slotText: string | undefined,
+): Promise<string> {
+  const styleKey = styleCacheKey(style);
+  const slotLen = slotText === undefined ? -1 : slotText.length;
+  const canonical =
+    RENDER_CACHE_KEY_DOMAIN +
+    `${cols}|${maxCharsPerImage}|${maxHeightPx}|` +
+    `${styleKey.length}|${styleKey}|` +
+    `${slotLen}|${slotText ?? ''}|` +
+    `${text.length}|${text}`;
+  const digest = await crypto.subtle.digest('SHA-256', renderCacheKeyEncoder.encode(canonical));
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
 export async function renderTextToPngsWithCharLimit(
   text: string,
   cols: number = DEFAULT_COLS,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   style: RenderStyle = {},
   maxHeightPx: number = MAX_HEIGHT_PX,
+  slotText?: string,
+): Promise<RenderedImage[]> {
+  if (renderCacheMaxBytesValue === 0) {
+    return renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+  }
+  const key = await renderCacheKey(text, cols, maxCharsPerImage, maxHeightPx, style, slotText);
+  const hit = renderCache.get(key);
+  if (hit !== undefined) {
+    renderCacheHits++;
+    renderCache.delete(key); // re-insert to refresh LRU position
+    renderCache.set(key, hit);
+    return cloneForCaller(hit.images);
+  }
+  renderCacheMisses++;
+
+  const images = await renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+
+  // Key strings are UTF-16 in memory; 2 bytes/unit is the honest estimate. The digest
+  // is fixed-width, so this term is now a constant per entry rather than a second copy
+  // of the input — the budget bounds retained pages, which is what it claims to bound.
+  let bytes = key.length * 2;
+  for (const img of images) bytes += img.png.byteLength;
+  // A single render larger than the whole budget is not cacheable — storing it would
+  // evict everything and then itself. Serve it and move on.
+  if (bytes <= renderCacheMaxBytesValue) {
+    // Two concurrent requests can render the same slab: both miss (the lookup
+    // happens before the await), both render, both land here. Without crediting
+    // back the entry being replaced, the second store adds its bytes while the
+    // Map still holds one entry, and the counter drifts upward permanently —
+    // eventually evicting a cache that is nowhere near its budget.
+    const replaced = renderCache.get(key);
+    if (replaced !== undefined) renderCacheBytes -= replaced.bytes;
+    renderCache.set(key, { images, bytes });
+    renderCacheBytes += bytes;
+    evictToBudget(key); // never evict the entry just stored
+  } else {
+    renderCacheOversized++;
+  }
+  return cloneForCaller(images);
+}
+
+async function renderTextToPngsUncached(
+  text: string,
+  cols: number,
+  maxCharsPerImage: number,
+  style: RenderStyle,
+  maxHeightPx: number,
   slotText?: string,
 ): Promise<RenderedImage[]> {
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));

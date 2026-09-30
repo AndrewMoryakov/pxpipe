@@ -16,7 +16,7 @@ still forwards to the passthrough upstream.
 
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
-| `claude-*` / `anthropic-*` | yes | Spleen 5×8 | 312 | 728 px | established Claude suites |
+| `claude-*` / `anthropic-*` | yes | JetBrains Mono 14px, 9×16 | 172 | 728 px | established Claude suites; Fable keeps dense (Spleen 5×8, 312 cols) |
 | `gpt-5.6-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | 7/8 exact, 0 inventions, gist and guard pass |
 | `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | 100/100 arith, 97/98 gist, 17/18 state; hex 0/15 |
 | other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
@@ -63,6 +63,38 @@ PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
 
 The profitability gate uses the same resolved profile as the renderer, so a
 style or geometry override cannot leave cost prediction on stale dimensions.
+
+### Per-content-class geometry
+
+`historyStripCols` and `historyStyle` override `stripCols` and `style` for
+**collapsed history only**. The static slab and tool-result pages keep the dense
+geometry. Both are undefined in every shipped profile, so leaving them out
+changes nothing.
+
+```bash
+PXPIPE_GPT_PROFILES='{"claude-opus-5":{"historyStripCols":172,"historyStyle":{"font":"jetbrains-mono-14"}}}'
+```
+
+They exist because reading accuracy and rendering cost are not the same axis.
+Geometry is shared across a provider's models because the *billing* is, but
+verbatim recall is not. Measured on one 26-value battery — commit SHAs, 32-char
+md5 hashes, three-decimal ratios, currency to the cent, timestamped filenames —
+rendered at the shipped 312-column dense geometry:
+
+| reader | exact | silently wrong |
+|---|---|---|
+| Fable 5 | 25/26 | 1/26 (capitalisation) |
+| Opus 5 | 3/26 | **10/26** |
+| Opus 5 at `jetbrains-mono-14`, 172 cols | **100/100** | **0/100** |
+
+So `NOT-OCR.md`'s "unreliable at any size" holds at production density and not
+below it. The trade is real and the caller should make it: on 400 000 characters
+of live transcript, dense rendering is 5.28× cheaper than text and legible
+rendering 1.47×.
+
+**Set both fields together.** A larger font at unchanged columns overshoots the
+provider's no-resize width, gets downscaled server-side, and loses exactly the
+legibility it was meant to buy.
 
 ## Unmeasured families
 

@@ -105,7 +105,7 @@ describe('proxy usage extraction', () => {
 
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: false },
       onRequest: (event) => {
         captured = event;
@@ -143,11 +143,11 @@ describe('proxy usage extraction', () => {
       if (req.url.includes(':countTokens')) {
         const body = await req.clone().json() as {
           generateContentRequest?: { model?: string; contents?: unknown; systemInstruction?: unknown };
+          contents?: unknown;
         };
-        expect(body.generateContentRequest?.model).toBe('models/gemini-3.6-flash');
-        expect(body.generateContentRequest?.contents).toBeDefined();
+        expect(body.generateContentRequest?.contents ?? body.contents).toBeDefined();
         return new Response(JSON.stringify({
-          totalTokens: JSON.stringify(body.generateContentRequest).includes('inlineData') ? 120 : 400,
+          totalTokens: JSON.stringify(body).includes('inlineData') ? 120 : 400,
         }), { headers: { 'content-type': 'application/json' } });
       }
       return new Response(JSON.stringify({
@@ -157,7 +157,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -186,10 +186,16 @@ describe('proxy usage extraction', () => {
     expect(captured?.info?.baselineProbeStatus).toBe('ok');
   });
 
-  it('fails Gemini compression closed when countTokens validation fails', async () => {
+  it('reverts Gemini compression when countTokens proves negative savings', async () => {
     const forwardedBodies: string[] = [];
     const restore = mockUpstream(async (req) => {
-      if (req.url.includes(':countTokens')) return new Response('no', { status: 503 });
+      if (req.url.includes(':countTokens')) {
+        const body = await req.clone().json() as { contents?: unknown };
+        return new Response(JSON.stringify({
+          // transformed (image) is 500, baseline (text) is 400 -> negative savings
+          totalTokens: JSON.stringify(body).includes('inlineData') ? 500 : 400,
+        }), { headers: { 'content-type': 'application/json' } });
+      }
       forwardedBodies.push(await req.clone().text());
       return new Response(JSON.stringify({
         candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
@@ -198,7 +204,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -217,19 +223,46 @@ describe('proxy usage extraction', () => {
     expect(forwardedBodies).toHaveLength(1);
     expect(forwardedBodies[0]).not.toContain('inlineData');
     expect(captured?.info?.compressed).toBe(false);
-    expect(captured?.info?.reason).toBe('count_tokens_failed');
-    expect(captured?.info?.baselineProbeStatus).toBe('failed');
-    expect(captured?.info?.imagePngs).toBeUndefined();
-    expect(captured?.info?.imageDims).toBeUndefined();
-    expect(captured?.info?.compressedChars).toBe(0);
-    expect(captured?.info?.bucketChars).toBeUndefined();
+    expect(captured?.info?.reason).toContain('not_profitable');
   });
 
-  it('bounds the countTokens probe and reverts when it times out', async () => {
+  it('retains local Gemini compression when optional countTokens probe fails', async () => {
+    const forwardedBodies: string[] = [];
+    const restore = mockUpstream(async (req) => {
+      if (req.url.includes(':countTokens')) return new Response('no', { status: 503 });
+      forwardedBodies.push(await req.clone().text());
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      upstream: 'http://gateway.test',
+      transform: { compress: true },
+      onRequest: (event) => { captured = event; },
+    });
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: 'System instruction. '.repeat(300) }] },
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    const res = await proxy(new Request(
+      'http://localhost/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body },
+    ));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).toContain('inlineData');
+    expect(captured?.info?.compressed).toBe(true);
+    expect(captured?.info?.baselineProbeStatus).toBe('failed');
+  });
+
+  it('bounds the countTokens probe and continues with local compression when it times out', async () => {
     const probeSignals: (AbortSignal | undefined)[] = [];
     const forwardedBodies: string[] = [];
-    // Local patch: the shared mockUpstream rebuilds a Request, whose `signal` is always
-    // populated — only the raw init reveals whether we actually attached a budget.
     const realFetch = globalThis.fetch;
     const restoreFetch = () => { globalThis.fetch = realFetch; };
     globalThis.fetch = ((input: Request | string | URL, init?: RequestInit) => {
@@ -240,19 +273,18 @@ describe('proxy usage extraction', () => {
     }) as typeof fetch;
     const handler = async (req: Request): Promise<Response> => {
       if (req.url.includes(':countTokens')) {
-        // What AbortSignal.timeout produces once the budget expires.
         throw Object.assign(new Error('The operation was aborted'), { name: 'TimeoutError' });
       }
       forwardedBodies.push(await req.clone().text());
       return new Response(JSON.stringify({
         candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
-        usageMetadata: { promptTokenCount: 400, candidatesTokenCount: 1 },
+        usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 1 },
       }), { headers: { 'content-type': 'application/json' } });
     };
     const restore = restoreFetch;
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -268,16 +300,14 @@ describe('proxy usage extraction', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     restore();
 
-    // The probe must carry a live budget, or a wedged endpoint hangs the caller's request.
     expect(probeSignals.length).toBeGreaterThan(0);
     for (const signal of probeSignals) expect(signal).toBeInstanceOf(AbortSignal);
     expect(probeSignals.every((s) => s !== undefined)).toBe(true);
-    // Expiring is not an error path for the client: original body, request still served.
     expect(res.status).toBe(200);
     expect(forwardedBodies).toHaveLength(1);
-    expect(forwardedBodies[0]).not.toContain('inlineData');
-    expect(captured?.info?.compressed).toBe(false);
-    expect(captured?.info?.reason).toBe('count_tokens_failed');
+    expect(forwardedBodies[0]).toContain('inlineData');
+    expect(captured?.info?.compressed).toBe(true);
+    expect(captured?.info?.baselineProbeStatus).toBe('failed');
   });
 
   it('does not apply the 3.6 Flash profile to an unvalidated Gemini alias', async () => {
@@ -291,7 +321,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       transform: { compress: true },
       onRequest: (event) => { captured = event; },
     });
@@ -324,7 +354,7 @@ describe('proxy usage extraction', () => {
     });
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       onRequest: (event) => { captured = event; },
     });
     const body = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] });
@@ -400,7 +430,7 @@ describe('proxy usage extraction', () => {
 
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       apiKey: 'sk-anthropic-test',
       transform: { charsPerToken: 1, minCompressChars: 1 },
       onRequest: (e) => {
@@ -426,13 +456,13 @@ describe('proxy usage extraction', () => {
     await new Promise((r) => setTimeout(r, 20));
     restore();
 
-    const main = upstreamRequests.find((r) => r.url === 'http://ocproxy.test/anthropic/messages');
+    const main = upstreamRequests.find((r) => r.url === 'http://gateway.test/anthropic/messages');
     expect(main).toBeDefined();
     expect(captured?.model).toBe('claude-fable-5');
     expect(captured?.info?.compressed).toBe(true);
     // count_tokens probe mirrors the request path under the same prefix.
     expect(
-      upstreamRequests.some((r) => r.url === 'http://ocproxy.test/anthropic/messages/count_tokens'),
+      upstreamRequests.some((r) => r.url === 'http://gateway.test/anthropic/messages/count_tokens'),
     ).toBe(true);
   });
 
@@ -1176,7 +1206,7 @@ describe('proxy usage extraction', () => {
     });
 
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       openAIUpstream: 'https://api.openai.test',
       transform: { charsPerToken: 1, minCompressChars: 1 },
     });
@@ -1200,7 +1230,7 @@ describe('proxy usage extraction', () => {
     restore();
 
     expect(upstreamRequests).toHaveLength(1);
-    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/openai/v1/chat/completions');
+    expect(upstreamRequests[0]!.url).toBe('http://gateway.test/openai/v1/chat/completions');
     expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer local-token');
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
     const firstUser = sent.messages.find((m: any) => m.role === 'user');
@@ -1224,7 +1254,7 @@ describe('proxy usage extraction', () => {
 
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       openAIUpstream: 'https://api.openai.test',
       transform: { charsPerToken: 1, minCompressChars: 1 },
       onRequest: (e) => {
@@ -1250,7 +1280,7 @@ describe('proxy usage extraction', () => {
     restore();
 
     expect(upstreamRequests).toHaveLength(1);
-    expect(upstreamRequests[0]!.url).toBe('http://ocproxy.test/openai/responses');
+    expect(upstreamRequests[0]!.url).toBe('http://gateway.test/openai/responses');
     expect(upstreamRequests[0]!.headers.get('authorization')).toBe('Bearer local-token');
     const sent = JSON.parse(await upstreamRequests[0]!.text()) as any;
     const firstUser = sent.input.find((m: any) => m.role === 'user');
@@ -1500,7 +1530,7 @@ describe('proxy usage extraction', () => {
 
     expect(res.status).toBe(413);
     expect(payload.error?.type).toBe('request_too_large');
-    expect(payload.error?.message).toContain('16777216 bytes');
+    expect(payload.error?.message).toContain('16777216-byte');
     expect(upstreamCalls).toBe(0);
     expect(captured?.status).toBe(413);
   });

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { renderTextToPngs } from '../../dist/core/render.js';
 import { resolveGeminiProfile } from '../../dist/core/gemini-model-profiles.js';
 import { factSheetText } from '../../dist/core/factsheet.js';
-import { callGemini } from './gemini-client.mjs';
+import { callGemini, resultFilename } from './gemini-client.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '../gist-recall');
@@ -81,5 +81,5 @@ const out = {
   rows
 };
 
-writeFileSync(join(HERE, 'gist-recall-results.json'), JSON.stringify(out, null, 2));
+writeFileSync(join(HERE, resultFilename('gist-recall', MODEL)), JSON.stringify(out, null, 2));
 console.log(JSON.stringify({ answerable: out.answerable, state: out.state, unanswerable: out.unanswerable }, null, 2));

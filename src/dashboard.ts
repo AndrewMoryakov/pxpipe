@@ -29,6 +29,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as readline from 'node:readline';
 import * as crypto from 'node:crypto';
 import type { ProxyEvent } from './core/proxy.js';
@@ -46,6 +47,7 @@ import {
   computeOpenAIBaselineRawTokens,
   openAIOutputRate,
 } from './core/openai-savings.js';
+import { renderCacheMaxBytes, renderCacheStats } from './core/render.js';
 import {
   aggregateSessions,
   claudeCodeMap,
@@ -1047,6 +1049,9 @@ export class DashboardState {
         warm: warmForRow,
         output: out,
         imageCount: info.imageCount ?? 0,
+        nativeImages: info.nativeImages,
+        wireImages: info.wireImages,
+        imageBudgetSkips: info.imageBudgetSkips,
         baselineImagedTokens: info.baselineImagedTokens,
         buckets: { ...(info.bucketChars ?? {}) },
         imageIds: [...imgIds],
@@ -1433,6 +1438,9 @@ export class DashboardState {
           warm: warmForRow,
           output: out,
           imageCount,
+          nativeImages: (t as { native_images?: number }).native_images,
+          wireImages: (t as { wire_images?: number }).wire_images,
+          imageBudgetSkips: (t as { image_budget_skips?: number }).image_budget_skips,
           baselineImagedTokens: (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens,
           buckets: { ...((t as { bucket_chars?: Record<string, number> }).bucket_chars ?? {}) },
           imageIds: [], // PNG ring is in-memory; not restorable across restart
@@ -1704,6 +1712,16 @@ export class DashboardState {
       codex_actual_usage: this.codexUsageFn(),
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
+      // Rendered-page cache — a live process gauge, not a fold over the event
+      // ring, so it is the one number here that survives no traffic at all.
+      // `max_bytes` ships alongside `bytes` because utilisation is the actionable
+      // reading: a hit rate near zero means something different when the budget is
+      // full (working set too big) than when `oversized` is climbing (a single
+      // render exceeds the whole budget and is never stored).
+      render_cache: {
+        ...renderCacheStats(),
+        max_bytes: renderCacheMaxBytes(),
+      },
     };
     return new Response(JSON.stringify(payload, null, 2), {
       headers: { 'content-type': 'application/json' },
@@ -1766,7 +1784,7 @@ export class DashboardState {
   }
 
   serveHtml(port: number): Response {
-    return htmlResponse(renderPage(port));
+    return htmlResponse(renderPage(port, dashboardHostLabel()));
   }
 
   /** GET /fragments/<name> — server-rendered htmx fragments. Each one reuses
@@ -2025,6 +2043,22 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
     return { kind: 'fragment', name: pathname.slice('/fragments/'.length) };
   }
   return null;
+}
+
+/** Name of the machine serving this dashboard, shown in the title and topbar.
+ *  PXPIPE_DASH_LABEL overrides it for hosts whose system hostname says nothing
+ *  useful (containers, "localhost"); an explicitly empty label opts out and
+ *  renders the unlabelled page. */
+export function dashboardHostLabel(): string {
+  const override = process.env.PXPIPE_DASH_LABEL;
+  if (override !== undefined) return override.trim();
+  try {
+    const h = os.hostname().trim();
+    // Keep it short: FQDNs push the chip past the wordmark for no added meaning.
+    return h.split('.')[0] || '';
+  } catch {
+    return '';
+  }
 }
 
 function htmlResponse(body: string): Response {

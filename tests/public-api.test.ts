@@ -29,20 +29,23 @@ afterEach(() => {
 });
 
 describe('public library API', () => {
-  it('recognizes the default scope (Fable 5 + Opus 5 + Gemini 3.6 Flash); legacy Opus is OFF by default', () => {
+  it('recognizes the default scope (Fable 5 + Gemini 3.6 Flash + Gemini 3.7 Flash); Opus is OFF by default', () => {
     expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
     expect(isPxpipeSupportedModel('claude-fable-5-high')).toBe(true);
     expect(isPxpipeSupportedModel('google/gemini-3.6-flash')).toBe(true);
+    expect(isPxpipeSupportedModel('google/gemini-3.7-flash')).toBe(true);
     expect(isPxpipeSupportedModel('gemini-3.6-flash-preview')).toBe(false);
+    expect(isPxpipeSupportedModel('gemini-3.7-flash-preview')).toBe(false);
     // Any prefix depth is stripped to the last segment, because real gateway
     // ids nest more than one level (`workers-ai/@cf/moonshotai/kimi-k3`). The
     // vendor segments pick an upstream, not a geometry, so they do not gate
     // scope — an unrecognized prefix in front of a known id still matches.
     expect(isPxpipeSupportedModel('untrusted/google/gemini-3.6-flash')).toBe(true);
-    // Opus 5 IS in the default scope (applicability.ts :: DEFAULT_MODEL_BASES), so it
-    // ships compressed with no opt-in. Its dense-hex score is still unmeasured
-    // (README "—") — the same axis that excluded Opus 4.8 at 0/15.
-    expect(isPxpipeSupportedModel('claude-opus-5')).toBe(true);
+    expect(isPxpipeSupportedModel('untrusted/google/gemini-3.7-flash')).toBe(true);
+    // Opus 5 is OPT-IN, not in the default scope: it reads imaged context at
+    // 2/15 exact recall vs Fable's 13/15, so compressing it by default hands
+    // the operator's main driver a silent-misread failure mode.
+    expect(isPxpipeSupportedModel('claude-opus-5')).toBe(false);
     // Opus 4.8 is OPT-IN, not in the default scope — same pipeline/render as
     // Fable, but it reads imaged content at a tax (FINDINGS.md 2026-06-16), so
     // the default doesn't silently compress the operator's main driver. Enable
@@ -60,7 +63,7 @@ describe('public library API', () => {
   it('strips bracketed variant tags like [1m] before matching', () => {
     expect(isPxpipeSupportedModel('claude-fable-5[1m]')).toBe(true);
     expect(isPxpipeSupportedModel('claude-fable-5-high[1m]')).toBe(true);
-    expect(isPxpipeSupportedModel('claude-opus-5[1m]')).toBe(true);    // in default scope, tag stripped
+    expect(isPxpipeSupportedModel('claude-opus-5[1m]')).toBe(false);   // Opus 5 opt-in, off by default
     expect(isPxpipeSupportedModel('claude-opus-4-8[1m]')).toBe(false); // legacy Opus opt-in, off by default
     // a non-scoped base is still rejected even with a variant tag
     expect(isPxpipeSupportedModel('claude-opus-4-7[1m]')).toBe(false);
@@ -92,7 +95,7 @@ describe('public library API', () => {
       // empty list = compress nothing
       setAllowedModelBases([]);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(false);
-      // null clears the override → back to the default scope (Fable 5 + Opus 5 + Gemini)
+      // null clears the override → back to the default scope (Fable 5 + Gemini)
       setAllowedModelBases(null);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
       expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
@@ -130,14 +133,17 @@ describe('public library API', () => {
     try {
       delete process.env.PXPIPE_MODELS;
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4.6')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'gemini-3.6-flash']);
+      expect(getAllowedModelBases()).not.toContain('grok-4.6');
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5-5', 'gemini']);
 
-      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
-      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);
-      expect(isPxpipeSupportedGptModel('grok-4.5-fast')).toBe(true); // -suffix alias
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.6';
+      expect(isPxpipeSupportedGptModel('grok-4.6')).toBe(true);
+      expect(isPxpipeSupportedGptModel('grok-4.6-fast')).toBe(true); // -suffix alias
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
       expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
     } finally {
       if (prev === undefined) delete process.env.PXPIPE_MODELS;

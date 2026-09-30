@@ -13,17 +13,23 @@ import * as os from 'node:os';
 import {
   DashboardState,
   dashboardPath,
+  dashboardHostLabel,
   officialInputUsdPerMtokForModel,
 } from '../src/dashboard.js';
 import {
   getAllowedModelBases,
   isPxpipeSupportedGptModel,
+  isPxpipeSupportedModel,
   setAllowedModelBases,
 } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
-import { renderHeaderFragment, renderPage } from '../src/dashboard/fragments.js';
+import {
+  renderHeaderFragment,
+  renderPage,
+  renderStatsTableFragment,
+} from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -282,12 +288,20 @@ describe('serveFragment', () => {
       const off = await (await dash.serveFragment('models', url, 1234)).text();
       expect(off).toContain('Image OpenAI Responses models');
       expect(off).not.toContain('<div class="models" style="display:none">');
-
+      // PXPIPE_MODELS textbox mirrors the live scope as CSV.
+      expect(off).toContain('name="list"');
+      expect(off).toContain('value="claude-fable-5,claude-opus-5-5,gemini"');
       expect(off).toContain('>GPT 5.6</button>');
       expect(off).toContain('GPT 5.6 Terra</button>');
-
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
+      // Family chip is lit by default and, as the proxy matches scope by prefix,
+      // also lights the per-version chips it covers. 3.6/3.7 Flash are validated
+      // readers; 3.8 Flash is covered but unvalidated, so it carries the ⚠ mark.
+      expect(off).toContain('Gemini (all versions) ✓</button>');
+      expect(off).toContain('Gemini 3.6 Flash ✓</button>');
+      expect(off).toContain('Gemini 3.8 Flash ✓ ⚠</button>');
+      // Terra and Sol remain available and ordered before GPT 5.5.
       expect(off.indexOf('GPT 5.6 Terra')).toBeLessThan(off.indexOf('GPT 5.6 Sol'));
       expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
       expect(getAllowedModelBases()).toContain('claude-fable-5');
@@ -306,7 +320,14 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('gpt-5.6-terra');
       expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
       // Chip flips are reflected back into the textbox CSV.
-      expect(onBoth).toContain('value="claude-fable-5,claude-opus-5,gemini-3.6-flash,gpt-5.6-terra,gpt-5.6-sol,gpt-5.5"');
+      expect(onBoth).toContain('value="claude-fable-5,claude-opus-5-5,gemini,gpt-5.6-terra,gpt-5.6-sol,gpt-5.5"');
+      // Opting the Gemini family off is a real opt-out: the chip unlights and
+      // the base leaves the scope.
+      dash.handleModelsToggle('gemini', false);
+      const geminiOff = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(geminiOff).toContain('Gemini (all versions)</button>');
+      expect(getAllowedModelBases()).not.toContain('gemini');
+      expect(isPxpipeSupportedModel('gemini-4')).toBe(false);
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -385,7 +406,7 @@ describe('serveFragment', () => {
       });
 
       persisting.handleModelsToggle('gpt-5.6-sol', true);
-      expect(saved.at(-1)).toEqual(['claude-fable-5', 'claude-opus-5', 'gemini-3.6-flash', 'gpt-5.6-sol']);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'claude-opus-5-5', 'gemini', 'gpt-5.6-sol']);
       persisting.handleModelsSet('claude-fable-5');
       expect(saved.at(-1)).toEqual(['claude-fable-5']);
       // Empty scope persists too (round-trips as 'off' on load).
@@ -502,6 +523,43 @@ describe('serveFragment', () => {
   it('404s unknown fragments', async () => {
     const res = await dash.serveFragment('nope', url, 1);
     expect(res.status).toBe(404);
+  });
+});
+
+describe('dashboard host label', () => {
+  it('names the host in the title and topbar so two hosts are distinguishable', () => {
+    const html = renderPage(47821, 'ber-dev-lm-ai');
+    expect(html).toContain('<title>ber-dev-lm-ai · pxpipe dashboard</title>');
+    expect(html).toContain('class="hostchip"');
+    expect(html).toContain('>ber-dev-lm-ai<');
+  });
+
+  it('renders the unlabelled page when no host label is given', () => {
+    const html = renderPage(47821);
+    expect(html).toContain('<title>pxpipe — live dashboard</title>');
+    expect(html).not.toContain('class="hostchip"');
+  });
+
+  it('escapes the label instead of injecting it as markup', () => {
+    const html = renderPage(47821, '<img src=x onerror=alert(1)>');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img src=x');
+  });
+
+  it('prefers PXPIPE_DASH_LABEL and shortens an FQDN hostname', () => {
+    const prev = process.env.PXPIPE_DASH_LABEL;
+    try {
+      process.env.PXPIPE_DASH_LABEL = 'edi-prod';
+      expect(dashboardHostLabel()).toBe('edi-prod');
+      // An explicitly empty override opts out of the chip entirely.
+      process.env.PXPIPE_DASH_LABEL = '';
+      expect(dashboardHostLabel()).toBe('');
+      delete process.env.PXPIPE_DASH_LABEL;
+      expect(dashboardHostLabel()).toBe(os.hostname().split('.')[0]);
+    } finally {
+      if (prev === undefined) delete process.env.PXPIPE_DASH_LABEL;
+      else process.env.PXPIPE_DASH_LABEL = prev;
+    }
   });
 });
 
@@ -810,7 +868,7 @@ describe('GPT savings split', () => {
 
 describe('Gemini savings split', () => {
   beforeEach(() => {
-    setAllowedModelBases(['gemini-3.6-flash']);
+    setAllowedModelBases(['gemini']);
   });
 
   it('shows measured token savings without applying Claude dollar pricing', async () => {
@@ -1010,6 +1068,28 @@ describe('Gemini savings split', () => {
     expect(recent.recent.at(-1)?.baseline_input).toBe(4100);
     expect(recent.recent.at(-1)?.actual_input).toBe(1200);
     expect(recent.recent.at(-1)?.session_saved_so_far_delta).toBe(2900);
+  });
+
+  it('counts forward-compatible Gemini models in enabled totals without warming-up zero counts', async () => {
+    dash.update({
+      method: 'POST',
+      path: '/google-ai-studio/v1beta/models/gemini-3.8-flash:generateContent',
+      model: 'gemini-3.8-flash',
+      accountingProvider: 'google',
+      status: 200,
+      durationMs: 100,
+      usage: { input_tokens: 150, output_tokens: 20 },
+      info: {
+        compressed: true,
+        baselineTokens: 500,
+        baselineProbeStatus: 'ok',
+        imageCount: 1,
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.compressed_requests).toBe(1);
+    expect(stats.saved_input_tokens).toBe(350);
   });
 });
 
@@ -1244,5 +1324,37 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     expect(row.baseline_input).toBe(12000);
     expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
     expect(row.session_saved_so_far_delta).toBe(9900);
+  });
+});
+
+/**
+ * Regression: the dashboard's "cache hit rate (by events)" row read a summary
+ * field (`eventsWithBaseline`) that stats.ts never emitted — it emits
+ * `eventsWithUsage`. The field existed in the payload *type*, so tsc stayed
+ * quiet, and the row silently rendered "-" forever. This test walks the real
+ * path (fold -> summaryToJson -> renderStatsTableFragment) so any future
+ * rename on either side fails here instead of blanking the dashboard.
+ */
+describe('stats table: event-based cache hit rate', () => {
+  it('renders a real percentage from the summary stats.ts actually emits', async () => {
+    const { newSummary, fold, summaryToJson } = await import('../src/stats.js');
+    let s = newSummary();
+    // 3 events with usage, 2 of them cache hits -> 66.7%
+    s = fold(s, { input_tokens: 100, cache_read_tokens: 900 } as TrackEvent);
+    s = fold(s, { input_tokens: 100, cache_read_tokens: 900 } as TrackEvent);
+    s = fold(s, { input_tokens: 100, cache_read_tokens: 0 } as TrackEvent);
+    // an event carrying no usage at all must not dilute the denominator
+    s = fold(s, { cwd: '/tmp' } as TrackEvent);
+
+    const summary = summaryToJson(s);
+    expect(summary.eventsWithUsage).toBe(3);
+    expect(summary.cacheHitEvents).toBe(2);
+
+    const html = renderStatsTableFragment({ summary } as never);
+    // Pin the value to its own row: the table is a single line, so a bare
+    // "contains" would also pass on some other row's number.
+    const evRow = /<td>cache hit \(by events\)<\/td><td class="num">([^<]*)<\/td>/.exec(html);
+    expect(evRow, 'the "cache hit (by events)" row must exist').not.toBeNull();
+    expect(evRow![1]).toBe('66.7%'); // not '-', which is what the dead field produced
   });
 });

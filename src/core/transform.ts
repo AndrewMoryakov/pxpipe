@@ -34,6 +34,8 @@ import {
   renderTextToPngsWithCharLimit,
   renderCellHeight,
   renderCellWidth,
+  LINES_PER_IMAGE,
+  maxCharsPerImage,
   type RenderStyle,
 } from './render.js';
 import {
@@ -43,7 +45,13 @@ import {
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
-import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
+import {
+  collapseHistory,
+  HISTORY_SYNTHETIC_INTRO,
+  ANTHROPIC_MAX_IMAGES,
+  ANTHROPIC_HISTORY_IMAGE_BUDGET,
+} from './history.js';
+import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 import { visionTokens, type VisionPricing } from './vision-cost.js';
@@ -92,6 +100,13 @@ export interface TransformOptions {
   /** Hard upper bound on images per tool_result; source text truncated with a paging
    *  marker above this to stay under Anthropic's 100-image/request cap. Default 10. */
   maxImagesPerToolResult?: number;
+  /** Ceiling on total decoded image bytes in one request, caller images
+   *  included. The provider's hard limit is a count, not a size, so the image
+   *  cap alone lets a long session assemble a request that is legal by count and
+   *  fails by weight: production traffic degrades sharply past roughly 20 MiB
+   *  with 500s, 502s, empty 200s and stalls (#157). Groups are admitted whole,
+   *  and a group that does not fit keeps its source text. */
+  maxImageBytes?: number;
   /** Chars-per-token assumption for `isCompressionProfitable()`. Default 4. */
   charsPerToken?: number;
   /** Multi-turn amortization horizon for the history-collapse gate. N≥2 evaluates as
@@ -138,6 +153,9 @@ const DEFAULTS: Required<TransformOptions> = {
   // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
   cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
+  // Deliberately under the ~20 MiB cliff observed in production rather than at
+  // it: the measured threshold is empirical and varies by route and provider.
+  maxImageBytes: 18 * 1024 * 1024,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
@@ -191,16 +209,21 @@ const OAUTH_IDENTITIES = [
 //
 // Image token cost is the serving model's DOCUMENTED per-image price, taken
 // from its profile via `visionTokens` (src/core/vision-cost.ts) — never a
-// hardcoded provider formula. Constants bias CONSERVATIVE: CHARS_PER_TOKEN=4
-// under-estimates text savings; the gate multiplies the image cost by
+// hardcoded provider formula. Constants bias CONSERVATIVE: CHARS_PER_TOKEN
+// sits above the measured density, under-estimating text savings; the gate
+// multiplies the image cost by
 // GATE_MARGIN on top. Mispredictions leave money on the table; they never
 // generate net-loss images.
 
-/** English ~4 chars per token average (conservative for code/JSON content). */
-const CHARS_PER_TOKEN = 4;
+/** Chars-per-token for reminder/tool_result gate buckets. Was 4 (English prose
+ *  average); a 77k-request fit over production events.jsonl (2026-08, joint
+ *  text+pixel OLS via `fitCpt` in src/core/cpt-fit.ts) measured ~2.3 for the mixed
+ *  JSON/log content that actually hits this gate. 3 keeps a conservative margin
+ *  above the measurement while halving the prior under-pricing of text cost. */
+const CHARS_PER_TOKEN = 3;
 
 /** Empirical cpt for the system-slab path (Opus 4.7 tokenizer, N=391, observed 1.91).
- *  Slab-specific because reminders/tool_results have unknown shape; those stay at 4. */
+ *  Slab-specific because reminders/tool_results have unknown shape; those use CHARS_PER_TOKEN. */
 export const SLAB_CHARS_PER_TOKEN = 2.0;
 
 // Tools whose stub description keeps a live-text read-before-edit precondition
@@ -300,13 +323,41 @@ function imageTokensCost(
   return imageTokensForRows(rows, effectiveCols, imageCountCap, maxCharsPerImage, geometry);
 }
 
+/** Gate geometry for collapsed history.
+ *
+ *  Identical to {@link denseGateGeometry} unless the model profile sets
+ *  `historyStripCols` / `historyStyle`, which let a deployment render history
+ *  at a lower density than the slab without touching either default. Both are
+ *  undefined in every shipped profile, so this returns the dense geometry
+ *  unchanged out of the box. */
+function historyGateGeometry(
+  o?: Required<TransformOptions>,
+  callerOverrodeCols: boolean = false,
+): GateGeometry {
+  const dense = denseGateGeometry(o);
+  const profile = o?.model ? resolveGptProfile(o.model) : undefined;
+  if (profile?.historyStripCols === undefined && profile?.historyStyle === undefined) return dense;
+  return {
+    ...dense,
+    cols: callerOverrodeCols ? o!.cols : profile.historyStripCols ?? dense.cols,
+    style: profile.historyStyle ?? dense.style,
+  };
+}
+
 /** Gate geometry for dense tool-result, reminder, and history pages. */
 function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
+  const cols = o?.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS;
   return {
-    cols: o?.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS,
+    cols,
     maxHeightPx: profile?.maxHeightPx ?? MAX_HEIGHT_PX,
-    maxChars: DENSE_CONTENT_CHARS_PER_IMAGE,
+    // Price a page at the width we actually render at, NOT at the 312-col constant.
+    // These are the same number in the default Anthropic geometry, but a narrower
+    // COLS (env override, GPT strip profile) holds proportionally fewer chars: the
+    // old constant overstated capacity up to 3.1× at COLS=100, so the history image
+    // budget cleared a plan that then emitted 3× the images and the oversized
+    // request came back 500. Capacity must track cols or the budget is fiction.
+    maxChars: maxCharsPerImage(cols),
     style: profile?.style ?? DENSE_RENDER_STYLE,
     // No model on the request (Anthropic slab path): price at the Claude
     // profile, which is what is actually serving it.
@@ -314,13 +365,10 @@ function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
   };
 }
 
-/** Visual rows per image: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`. Derived
- *  from render.ts constants so break-even math auto-tracks cell geometry changes. */
-export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
-
-export function maxCharsPerImage(cols: number): number {
-  return Math.min(cols * LINES_PER_IMAGE, READABLE_CHARS_PER_IMAGE);
-}
+/** Re-exported from render.ts, which owns the cell geometry these derive from.
+ *  Kept exported here because the eval harnesses and gpt paths import them from
+ *  transform. Single implementation, so the page-capacity math can't fork. */
+export { LINES_PER_IMAGE, maxCharsPerImage };
 
 /** Lossless pre-render whitespace compactor (each `\n` costs ≥1 visual row):
  *  1. Strip trailing whitespace per line (preserves leading indent).
@@ -479,7 +527,7 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'image_budget',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
@@ -573,6 +621,11 @@ export interface TransformInfo {
   pinChars?: number;
   /** Pin folding threw and was skipped. The body still goes out unpinned. */
   pinError?: string;
+  /** Claude Code's volatile per-turn billing line, stripped from the body.
+   *  The proxy forwards it as a real HTTP header on the upstream request.
+   *  Any body position at-or-after the last cache_control marker renders as
+   *  user-attributed text; any earlier position busts the cached prefix. */
+  billingLine?: string;
   /** OpenAI Responses only: local o200k decomposition of the ORIGINAL request
    *  before pxpipe rewrites it. No provider count_tokens call. Categories are
    *  mutually exclusive text-token estimates; imageParts counts native images. */
@@ -600,6 +653,11 @@ export interface TransformInfo {
     collapsedFunctionPairs?: number;
     collapsedFunctionCalls?: number;
     collapsedFunctionOutputs?: number;
+    /** Item `type` values that acted as a hard barrier in the Responses
+     *  planner, with occurrence counts (`local_shell_call:12`). Every barrier
+     *  forces a page break, so a frequent type here is directly responsible
+     *  for under-filled images. Diagnostic only — never affects routing. */
+    barrierTypes?: string[];
   };
   /** Length of the static (cacheable) slab rendered into the image. */
   staticChars: number;
@@ -630,6 +688,29 @@ export interface TransformInfo {
    *  render may repeat its section source. Dashboard-only; not persisted. */
   imageSourceTexts?: Array<string | undefined>;
   toolResultImgs?: number;
+  /** Image blocks the CLIENT already sent (screenshots, pasted images, prior
+   *  tool_result images). They count against the provider's hard image cap just
+   *  like ours do, so every pxpipe imaging path must price them in — a request
+   *  whose own images already fill the cap must not get a single one from us.
+   *  Counted once, before any rewrite. See {@link imageHeadroom}. */
+  nativeImages?: number;
+  /** Imaging steps skipped because the cap was exhausted (telemetry for tuning). */
+  imageBudgetSkips?: number;
+  /** Decoded bytes of the CLIENT's own image blocks, counted once before any
+   *  rewrite. They occupy the same weight budget ours do, and they are never
+   *  removed to make room: a caller's screenshot outranks our compression. */
+  nativeImageBytes?: number;
+  /** Imaging groups skipped because the byte budget, not the count cap, was
+   *  exhausted. Distinct from {@link imageBudgetSkips} because the two have
+   *  different fixes: one wants fewer pages, the other wants smaller ones. */
+  imageByteSkips?: number;
+  /** Set when the request landed within 10% of the byte budget. Nothing was
+   *  dropped, but the next turn of the same session probably will be. */
+  imageBytesNearLimit?: boolean;
+  /** Image blocks actually present in the outgoing body — ours AND the client's.
+   *  This is the only number the provider counts. It is <= imageCount + nativeImages
+   *  because the history collapse can absorb messages that already carried images. */
+  wireImages?: number;
   /** Chars of tool docs moved to the system-text Tool Reference (not imaged). */
   toolDocsChars?: number;
   /** Codepoints missing from the atlas (rendered as blank cells). Telemetry for atlas tuning. */
@@ -637,7 +718,7 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
+  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number; image_budget?: number };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -669,6 +750,15 @@ export interface TransformInfo {
    *  proves Anthropic's prompt cache can `cache_read` (0.1×) instead of `cache_create`.
    *  A changing hash means cache-key drift is back. Only set when collapse produced images. */
   historyImageSha?: string;
+  /** Freeze-grid step the history collapse actually used, in messages. Rises when the
+   *  adaptive packer merges chunks to fit the image budget; must never fall within a
+   *  session (a finer re-cut re-keys every chunk). */
+  historyFreezeStep?: number;
+  /** The collapse re-cut the grid for page fill instead of cache freeze — only set when
+   *  the session's upstream cache was provably dead (idle past TTL, or after a reject). */
+  historyPackFill?: boolean;
+  /** The image budget could not hold the whole closed prefix; the tail stayed live text. */
+  historyBudgetTrimmed?: boolean;
   /** sha8 of the ACTUAL cacheable prefix sent this turn (tools + system +
    *  message blocks through the imaged history/slab boundary; the live tail is
    *  excluded). Read-only measurement. A change turn-over-turn within a session
@@ -679,6 +769,23 @@ export interface TransformInfo {
   /** Approx size (chars) of that cached prefix — pairs with cachePrefixSha8 so a
    *  bust reads as growth (size up) vs pure invalidation (size unchanged). */
   cachePrefixBytes?: number;
+  /** Per-layer digests of that same pinned prefix, in wire order: tool
+   *  definitions, system blocks, and the imaged head (messages up to and
+   *  including the history/slab boundary). Exactly one of these moving names
+   *  the cache-bust culprit; the aggregate cachePrefixSha8 alone cannot. */
+  cachePrefixToolsSha8?: string;
+  cachePrefixSystemSha8?: string;
+  cachePrefixHeadSha8?: string;
+  /** Digest of the span Anthropic actually caches: everything up to and
+   *  including the LAST cache_control marker. After a collapse this is a strict
+   *  subset of the boundary-scoped prefix — the newest freeze chunk re-renders
+   *  every turn by design and sits after the marker — so THIS is the digest that
+   *  must stay stable turn over turn, and the boundary one is context. */
+  cachePrefixMarkedSha8?: string;
+  cachePrefixMarkedBytes?: number;
+  /** Where that last marker sits, as `m<messageIdx>.b<blockIdx>`. A marker that
+   *  roams between turns re-cuts the cached span and busts it on its own. */
+  cachePrefixMarkerPos?: string;
   /** Why the history collapse didn't run (or did). Diagnostic only. */
   historyReason?:
     | 'no_history'
@@ -688,7 +795,12 @@ export interface TransformInfo {
     | 'below_min_tokens'
     | 'not_profitable'
     | 'too_many_images'
+    /** Rendered, then not applied: the collapse group did not fit the decoded
+     *  image-byte budget, so the original text stands. Distinct from
+     *  `too_many_images`, which is the provider's count cap. */
+    | 'image_bytes'
     | 'render_empty'
+    | 'over_budget'
     | 'collapsed';
   /** Token count of the pre-compression body from /v1/messages/count_tokens (free).
    *  Absent when probe failed — event excluded from savings rollup. */
@@ -785,6 +897,20 @@ const DYNAMIC_BLOCK_TAGS = [
   'git_status',
   'directoryStructure',
   'system-reminder',
+  // A running per-turn counter. Left in the static slab it re-keys the slab image
+  // on every single turn, which is the worst possible cache shape: the prefix is
+  // paid for as a create and never read. It was showing up in
+  // `unknownStaticTags`, which is exactly the canary that list exists to be.
+  'total_tokens',
+  // Newer Claude Code identity/automode block (#234). Left in the static slab
+  // it gets imaged along with the rest of the prefix, and the provider's
+  // subscription-quota recognition on that block breaks -> spurious 429s on
+  // every compressed request. Route it to the dynamic tail instead, same as
+  // total_tokens above.
+  'cc_automode_session_rules',
+  'cc_automode_permissions',
+  'severity',
+  'category',
 ] as const;
 
 // Known-static slab tags — suppresses first-sighting `unknownStaticTags` noise
@@ -815,6 +941,38 @@ const KNOWN_STATIC_TAGS = [
   'structuredWorkflow',
   'toolUseInstructions',
 ] as const;
+
+/** Tag-name and whitespace classifiers matching /[a-zA-Z]/,
+ *  /[a-zA-Z0-9_-]/ and /\s/. */
+function isTagNameStart(c: number): boolean {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90); // a-z A-Z
+}
+
+function isTagNameChar(c: number): boolean {
+  return (
+    (c >= 97 && c <= 122) || // a-z
+    (c >= 65 && c <= 90) || // A-Z
+    (c >= 48 && c <= 57) || // 0-9
+    c === 95 || // _
+    c === 45 // -
+  );
+}
+
+function isTagSpace(c: number): boolean {
+  if (c === 32 || (c >= 9 && c <= 13)) return true; // space, \t \n \v \f \r
+  if (c < 0xa0) return false;
+  return (
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
 
 function splitStaticDynamic(text: string): {
   staticText: string;
@@ -852,16 +1010,55 @@ function splitStaticDynamic(text: string): {
   // surfacing the tag name lets us detect it within hours of a release.
   const known = new Set<string>(DYNAMIC_BLOCK_TAGS);
   const knownStatic = new Set<string>(KNOWN_STATIC_TAGS);
-  const sniffer = /<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
   const unknown = new Set<string>();
   const staticTagContents = new Map<string, string>();
-  let s: RegExpExecArray | null;
-  while ((s = sniffer.exec(staticBuf)) !== null) {
-    const tag = s[1]!;
-    if (tag.length > 64) continue;
-    if (!known.has(tag) && !knownStatic.has(tag)) unknown.add(tag);
-    // Fold repeated tags (e.g. several <example>s) into one fingerprint.
-    staticTagContents.set(tag, (staticTagContents.get(tag) ?? '') + s[2]!);
+  // Scanned by index: matching this with a regex costs quadratic time on
+  // untrusted text, since both a lazy `[\s\S]*?` body and an `(?:\s[^>]*)?>`
+  // attribute run rescan the tail once per candidate tag.
+  const noCloser = new Set<string>();
+  let i = 0;
+  while (i < staticBuf.length) {
+    const lt = staticBuf.indexOf('<', i);
+    if (lt < 0) break;
+    let j = lt + 1;
+    if (!isTagNameStart(staticBuf.charCodeAt(j))) {
+      i = lt + 1;
+      continue;
+    }
+    j += 1;
+    while (j < staticBuf.length && isTagNameChar(staticBuf.charCodeAt(j))) j += 1;
+    // Either `<tag>` or `<tag ...>`; anything else is not an opening tag.
+    let gt: number;
+    if (staticBuf[j] === '>') {
+      gt = j;
+    } else if (j < staticBuf.length && isTagSpace(staticBuf.charCodeAt(j))) {
+      gt = staticBuf.indexOf('>', j);
+      // No `>` left, so no later opening can complete either.
+      if (gt < 0) break;
+    } else {
+      i = lt + 1;
+      continue;
+    }
+    const tag = staticBuf.slice(lt + 1, j);
+    const contentStart = gt + 1;
+    const closer = `</${tag}>`;
+    // A closer missing after one opening is missing for every later opening of
+    // the same tag, so record it and skip the repeated failed scan.
+    const end = noCloser.has(tag) ? -1 : staticBuf.indexOf(closer, contentStart);
+    if (end < 0) {
+      noCloser.add(tag);
+      i = lt + 1;
+      continue;
+    }
+    if (tag.length <= 64) {
+      if (!known.has(tag) && !knownStatic.has(tag)) unknown.add(tag);
+      // Fold repeated tags (e.g. several <example>s) into one fingerprint.
+      staticTagContents.set(
+        tag,
+        (staticTagContents.get(tag) ?? '') + staticBuf.slice(contentStart, end),
+      );
+    }
+    i = end + closer.length;
   }
 
   return {
@@ -940,13 +1137,27 @@ async function recordRecoverable(
   });
 }
 
-/** Hash the concatenated base64 of every image block on `messages[0]` (the synthetic
- *  history message). Stable across the quantized collapse window → proves Anthropic
- *  can cache_read the history prefix. Returns undefined if no images on messages[0]. */
+/** Hash the concatenated base64 of every image block on the synthetic history
+ *  message. Stable across the quantized collapse window → proves Anthropic can
+ *  cache_read the history prefix. Returns undefined if there is no such message.
+ *
+ *  The synthetic message is NOT `messages[0]` whenever a slab anchor exists:
+ *  collapseHistory returns `[...head, syntheticUser, ...tail]` and transform.ts
+ *  passes `protectedPrefix = slabAnchorIdx + 1`, so on a Claude Code request
+ *  `messages[0]` is the protected slab message. Hashing it reported SLAB image
+ *  stability under the `history_image_sha8` name — the one field meant to prove
+ *  history-image byte-identity was blind to the history images, so a drifting
+ *  collapse boundary still looked stable in telemetry (#11 attribution). Locate
+ *  the message by its banner instead, exactly like cachePrefixDigest does. */
 async function historyImageSha8(
   messages: Message[],
 ): Promise<string | undefined> {
-  const synthetic = messages[0];
+  const synthetic = messages.find(
+    (m) =>
+      Array.isArray(m.content) &&
+      (m.content[0] as TextBlock | undefined)?.type === 'text' &&
+      (m.content[0] as TextBlock).text === HISTORY_SYNTHETIC_INTRO,
+  );
   if (!synthetic || !Array.isArray(synthetic.content)) return undefined;
   let concat = '';
   for (const blk of synthetic.content) {
@@ -1034,7 +1245,19 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
  */
 async function cachePrefixDigest(
   req: { tools?: unknown; system?: unknown; messages?: unknown },
-): Promise<{ sha8: string; bytes: number } | undefined> {
+): Promise<
+  | {
+      sha8: string;
+      bytes: number;
+      toolsSha8: string;
+      systemSha8: string;
+      headSha8: string;
+      markedSha8: string;
+      markedBytes: number;
+      markerPos: string;
+    }
+  | undefined
+> {
   const msgs = Array.isArray(req.messages) ? (req.messages as Message[]) : [];
   // Boundary = latest message carrying pxpipe's imaged prefix: the history image
   // (banner) when collapse ran, else the slab message ('[End of rendered
@@ -1051,19 +1274,70 @@ async function cachePrefixDigest(
     if (isHistory || hasSlab) boundary = i;
   }
   if (boundary < 0) return undefined; // not an imaged-prefix shape — nothing pinned
-  const parts: string[] = [];
-  if (Array.isArray(req.tools)) for (const t of req.tools) parts.push(JSON.stringify(t));
+  // Component digests, in wire order. A whole-prefix hash proves THAT the cache
+  // busted but never WHICH layer moved, and the layers fail for different
+  // reasons: tools drift when the client loads a deferred tool, system drifts
+  // when volatile text (env/git status) rides inside the pinned span, and the
+  // imaged head drifts when a collapse boundary or marker placement moves.
+  // Hashing each separately turns "prefix changed" into a one-line diagnosis.
+  const toolParts: string[] = [];
+  if (Array.isArray(req.tools)) for (const t of req.tools) toolParts.push(JSON.stringify(t));
+  const sysParts: string[] = [];
   const sys = req.system;
-  if (typeof sys === 'string') parts.push(sys);
-  else if (Array.isArray(sys)) for (const b of sys) parts.push(JSON.stringify(b));
+  if (typeof sys === 'string') sysParts.push(sys);
+  else if (Array.isArray(sys)) for (const b of sys) sysParts.push(JSON.stringify(b));
+  const headParts: string[] = [];
   for (let i = 0; i <= boundary; i++) {
     const content = msgs[i]?.content;
-    if (typeof content === 'string') parts.push(content);
+    if (typeof content === 'string') headParts.push(content);
     else if (Array.isArray(content))
-      for (const b of content) parts.push(typeof b === 'string' ? b : JSON.stringify(b));
+      for (const b of content) headParts.push(typeof b === 'string' ? b : JSON.stringify(b));
   }
+  // The span Anthropic actually caches ends at the LAST cache_control marker —
+  // not at the message boundary above. Those differ by construction after a
+  // collapse: the synthetic message's newest freeze chunk re-renders every turn
+  // BY DESIGN and sits AFTER the pinned marker, so the boundary-scoped digest
+  // reports a bust on every single turn even when the cached span is perfectly
+  // stable. Digest the marker-scoped span too, and record where the marker sits:
+  // a moving marker is itself a bust cause, and telemetry could not see it.
+  let markPos = '';
+  const markedParts: string[] = [...toolParts, ...sysParts];
+  const markedUpTo: string[] = [];
+  outer: for (let i = msgs.length - 1; i >= 0; i--) {
+    const content = msgs[i]?.content;
+    if (!Array.isArray(content)) continue;
+    for (let k = content.length - 1; k >= 0; k--) {
+      const b = content[k] as { cache_control?: unknown } | undefined;
+      if (b && typeof b === 'object' && b.cache_control !== undefined) {
+        markPos = `m${i}.b${k}`;
+        for (let mi = 0; mi <= i; mi++) {
+          const c = msgs[mi]?.content;
+          if (typeof c === 'string') markedUpTo.push(c);
+          else if (Array.isArray(c))
+            for (let bk = 0; bk < c.length; bk++) {
+              if (mi === i && bk > k) break;
+              const blk = c[bk];
+              markedUpTo.push(typeof blk === 'string' ? blk : JSON.stringify(blk));
+            }
+        }
+        break outer;
+      }
+    }
+  }
+  markedParts.push(...markedUpTo);
+  const marked = markedParts.join('\x00');
+  const parts = [...toolParts, ...sysParts, ...headParts];
   const prefix = parts.join('\x00');
-  return { sha8: await sha8(prefix), bytes: prefix.length };
+  return {
+    sha8: await sha8(prefix),
+    bytes: prefix.length,
+    toolsSha8: await sha8(toolParts.join('\x00')),
+    systemSha8: await sha8(sysParts.join('\x00')),
+    headSha8: await sha8(headParts.join('\x00')),
+    markedSha8: await sha8(marked),
+    markedBytes: marked.length,
+    markerPos: markPos,
+  };
 }
 
 // Removed: extractClaudeMdSlab(). It scanned the static system text for
@@ -1076,23 +1350,24 @@ async function cachePrefixDigest(
 // appeared across the whole event log. Project instructions are now kept as
 // text structurally — see the <system-reminder> handling below.
 
-/** First user message text, capped at 4 KiB (stable thread id; hashing large pastes is wasteful). */
+/**
+ * Session identity text: the user's first prompt, skipping harness envelopes
+ * (see {@link sessionAnchorText}). Scans every user message before the first
+ * assistant turn, because a client may send its envelope as a message of its own.
+ */
 export function firstUserText(req: MessagesRequest): string {
-  const msgs = req.messages ?? [];
-  for (const m of msgs) {
-    if (m.role !== 'user') continue;
-    if (typeof m.content === 'string') return m.content.slice(0, 4096);
-    if (Array.isArray(m.content)) {
+  const texts: string[] = [];
+  for (const m of req.messages ?? []) {
+    if (m.role !== 'user') break;
+    if (typeof m.content === 'string') {
+      texts.push(m.content);
+    } else if (Array.isArray(m.content)) {
       for (const block of m.content) {
-        if (block && (block as any).type === 'text' && typeof (block as any).text === 'string') {
-          return ((block as any).text as string).slice(0, 4096);
-        }
+        if (block?.type === 'text' && typeof block.text === 'string') texts.push(block.text);
       }
     }
-    // First user message found but unreadable — return empty rather than fall through to next.
-    return '';
   }
-  return '';
+  return sessionAnchorText(texts);
 }
 
 /**
@@ -1114,14 +1389,29 @@ export function firstMessageHasSystemReminder(messages: Message[] | undefined): 
   return false;
 }
 
+/** Body of the first `<tag>…</tag>` pair, or undefined when unpaired.
+ *  Scanned by index: a lazy `[\s\S]*?` span rescans the tail for every
+ *  candidate opening, so many openings and no closer costs quadratic time.
+ *  Tag names are ASCII literals, so lowercasing suffices for a
+ *  case-insensitive match. */
+function firstTagBody(text: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const haystack = text.toLowerCase();
+  const start = haystack.indexOf(open);
+  if (start < 0) return undefined;
+  const end = haystack.indexOf(close, start + open.length);
+  if (end < 0) return undefined;
+  return text.slice(start + open.length, end);
+}
+
 /** Parse structured fields from the dynamic slab for telemetry. Read-only. */
 export function extractEnvFields(dynamicText: string): EnvFields {
   const out: EnvFields = {};
   if (!dynamicText) return out;
 
-  const envMatch = /<env>([\s\S]*?)<\/env>/i.exec(dynamicText);
-  if (envMatch) {
-    const body = envMatch[1]!;
+  const body = firstTagBody(dynamicText, 'env');
+  if (body !== undefined) {
     const cwd = /(?:^|\n)\s*Working directory:\s*(.+?)\s*(?:\n|$)/i.exec(body);
     if (cwd) out.cwd = cwd[1]!.trim();
     const gitRepo = /(?:^|\n)\s*Is directory a git repo:\s*(Yes|No)\b/i.exec(body);
@@ -1144,14 +1434,31 @@ export function extractEnvFields(dynamicText: string): EnvFields {
 }
 
 /** Strip the per-turn `x-anthropic-billing-header:` line (changes every turn;
- *  must not be baked into the image). Returned as `kept` for the system tail. */
+ *  must not be baked into the image). Returned as `kept`; re-emitted after the
+ *  final user message's markers — NOT into req.system, which always precedes
+ *  the last cache_control marker and would void the whole cached prefix.
+ *
+ *  Claude Code sends this as its own system block, so after extractSystemText
+ *  joins the blocks the line is never line 1 and a first-line-only test never
+ *  fires: on 86/86 captured bodies the header reached splitStaticDynamic, which
+ *  has no XML wrapper to key on, classified it static, and baked it into the
+ *  slab PNG. On 2.1.220 the value was session-stable (11/11 captures share
+ *  `cch=07295`) so the PNG stayed byte-identical and nothing showed. 2.1.222
+ *  added `cc_prev_req=<previous request id>`, making the line per-turn by
+ *  construction — re-rendering the slab and voiding the whole cached prefix on
+ *  every request. Match the line wherever it appears. */
 function stripBillingLine(text: string): { kept: string | null; body: string } {
-  const nl = text.indexOf('\n');
-  const first = nl === -1 ? text : text.slice(0, nl);
-  if (first.startsWith('x-anthropic-billing-header:')) {
-    return { kept: first, body: nl === -1 ? '' : text.slice(nl + 1) };
-  }
-  return { kept: null, body: text };
+  const m = /(^|\n)(x-anthropic-billing-header:[^\n]*)(\n?)/.exec(text);
+  if (!m) return { kept: null, body: text };
+  const lead = m[1]!; // '' when the line starts the text, else the preceding \n
+  const trail = m[3]!; // '\n' unless the line ends the text
+  // Excise the line plus EXACTLY ONE adjacent newline, so the surviving text is
+  // byte-identical to the same text without the header: the trailing newline
+  // when there is one (keeps the preceding break), otherwise the leading one.
+  // Taking both would splice the neighbouring lines together and re-render the
+  // slab — the very churn this function exists to prevent.
+  const cutStart = m.index + (trail ? lead.length : 0);
+  return { kept: m[2]!, body: text.slice(0, cutStart) + text.slice(m.index + m[0].length) };
 }
 
 /** Extract the `# Environment` markdown section Claude Code injects into its
@@ -1330,13 +1637,25 @@ export function truncateForBudget(
   const originalLines = lines.length;
   const originalChars = text.length;
 
+  // Reflowed text joins logical lines with the ↵ sentinel, which the renderer
+  // treats as an inline glyph that never forces a row break (see countVisualRows
+  // / wrapLines). So many ↵-segments pack into one visual row — charging one row
+  // per segment (lineRows) overstates rows ~6x and over-truncates. Charge the
+  // packed-row DELTA instead: total rows telescope to ceil(keptChars/cols),
+  // matching the renderer, while still binding the row budget for narrow columns
+  // where the char budget alone would under-truncate.
+  const reflowed = nlChar === NL_SENTINEL;
+  const packedRows = (n: number): number => Math.ceil(n / Math.max(1, cols));
+  const rowCost = (seg: string, priorChars: number, addChars: number): number =>
+    reflowed ? packedRows(priorChars + addChars) - packedRows(priorChars) : lineRows(seg, cols);
+
   if (shape === 'structured') {
     let rows = 0;
     let chars = 0;
     let cut = 0;
     for (let i = 0; i < lines.length; i++) {
-      const r = lineRows(lines[i]!, cols);
       const c = lines[i]!.length + (i > 0 ? 1 : 0);
+      const r = rowCost(lines[i]!, chars, c);
       if (rows + r > totalRowBudget || chars + c > totalCharBudget) break;
       rows += r;
       chars += c;
@@ -1371,8 +1690,8 @@ export function truncateForBudget(
   let headChars = 0;
   let headCut = 0;
   for (let i = 0; i < lines.length; i++) {
-    const r = lineRows(lines[i]!, cols);
     const c = lines[i]!.length + (i > 0 ? 1 : 0);
+    const r = rowCost(lines[i]!, headChars, c);
     if (headRows + r > headRowBudget || headChars + c > headCharBudget) break;
     headRows += r;
     headChars += c;
@@ -1383,8 +1702,8 @@ export function truncateForBudget(
   let tailChars = 0;
   let tailStart = lines.length;
   for (let i = lines.length - 1; i >= headCut; i--) {
-    const r = lineRows(lines[i]!, cols);
     const c = lines[i]!.length + (i < lines.length - 1 ? 1 : 0);
+    const r = rowCost(lines[i]!, tailChars, c);
     if (tailRows + r > tailRowBudget || tailChars + c > tailCharBudget) break;
     tailRows += r;
     tailChars += c;
@@ -1518,6 +1837,109 @@ function applyPins(req: MessagesRequest, info: TransformInfo, pins: Pin[]): void
  * Called from both the main path AND early-exit paths (below_min_chars,
  * not_profitable) — history collapse must run even when the slab skips.
  * Tolerant to missing/short message arrays (collapseHistory short-circuits). */
+/** Slack between our page estimate and the provider's hard image cap. The renderer
+ *  paginates on its own, so a candidate grid can come out one page heavier than the
+ *  estimator predicted; the request must still land under {@link ANTHROPIC_MAX_IMAGES}. */
+const HISTORY_IMAGE_SAFETY_MARGIN = 5;
+
+/**
+ * Image blocks this request may still add before the provider's hard cap.
+ *
+ * The cap counts EVERY image on the wire: the client's own (`nativeImages`) and
+ * ours (`imageCount`). Pricing only ours is how a request with 103 client images
+ * still got imaged further and came back 400 — the cap is a wire property, not a
+ * pxpipe property. Never negative; callers treat 0 as "keep it as text".
+ */
+export function imageHeadroom(info: TransformInfo): number {
+  return Math.max(
+    0,
+    ANTHROPIC_MAX_IMAGES -
+      HISTORY_IMAGE_SAFETY_MARGIN -
+      info.imageCount -
+      (info.nativeImages ?? 0),
+  );
+}
+
+/** Bytes still available for image content, caller images already deducted.
+ *
+ *  Separate from {@link imageHeadroom} because the two limits fail differently.
+ *  The count cap is the provider's documented limit and rejects with a clear
+ *  error. The byte budget is empirical: past roughly 20 MiB production requests
+ *  start failing as 500s, 502s, empty 200s and stalls, which read as flakiness
+ *  rather than as "too big". */
+export function imageByteHeadroom(info: TransformInfo, limit: number): number {
+  return Math.max(0, limit - info.imageBytes - (info.nativeImageBytes ?? 0));
+}
+
+/** True when this request finished close enough to the budget that the next turn
+ *  of the same session is likely to hit it. */
+function nearByteLimit(info: TransformInfo, limit: number): boolean {
+  return limit > 0 && info.imageBytes + (info.nativeImageBytes ?? 0) >= limit * 0.9;
+}
+
+/** Decoded bytes of the caller's own images, at both nesting levels. Runs BEFORE
+ *  any rewrite, for the same reason {@link countNativeImages} does. */
+export function countNativeImageBytes(messages: readonly Message[] | undefined): number {
+  let bytes = 0;
+  const add = (blk: unknown): void => {
+    const b = blk as ImageBlock | null;
+    if (b?.type === 'image' && typeof b.source?.data === 'string') bytes += approxBlockBytes(b);
+  };
+  for (const m of messages ?? []) {
+    if (!Array.isArray(m.content)) continue;
+    for (const blk of m.content) {
+      add(blk);
+      const tr = blk as ToolResultBlock | null;
+      if (tr?.type === 'tool_result' && Array.isArray(tr.content)) {
+        for (const inner of tr.content) add(inner);
+      }
+    }
+  }
+  return bytes;
+}
+
+/** Count image blocks already present in the caller's messages. Runs BEFORE any
+ *  rewrite, so it sees the client's images only — ours do not exist yet. */
+export function countNativeImages(messages: readonly Message[] | undefined): number {
+  let n = 0;
+  for (const m of messages ?? []) {
+    if (!Array.isArray(m.content)) continue;
+    for (const blk of m.content) {
+      const t = (blk as { type?: string } | null)?.type;
+      if (t === 'image') n++;
+      else if (t === 'tool_result') {
+        const inner = (blk as ToolResultBlock).content;
+        if (Array.isArray(inner)) {
+          for (const ib of inner) if ((ib as { type?: string } | null)?.type === 'image') n++;
+        }
+      }
+    }
+  }
+  return n;
+}
+
+/**
+ * Per-request history-grid tuning: how many images the collapse may still spend,
+ * and whether it is allowed to re-cut the grid for density.
+ *
+ * `info.imageCount` already holds every image this request emitted before the
+ * collapse (slab, tool docs, tool_results), so the remaining headroom is the hard
+ * cap minus those, minus a margin for estimator drift — and never more than the
+ * standing cost guard {@link ANTHROPIC_HISTORY_IMAGE_BUDGET}.
+ *
+ * `packFill`/`minFreezeStep` come from the session store: repack only when the
+ * upstream cache is provably dead, and never below a grid this session already
+ * froze at. See {@link noteHistoryRequest}.
+ */
+function historyGridTuning(
+  info: TransformInfo,
+): { imageBudget: number; packFill: boolean; minFreezeStep: number } {
+  const headroom = imageHeadroom(info);
+  const imageBudget = Math.max(1, Math.min(ANTHROPIC_HISTORY_IMAGE_BUDGET, headroom));
+  const session = noteHistoryRequest(info.firstUserSha8);
+  return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
+}
+
 async function runHistoryCollapseAndFinalize(
   req: MessagesRequest,
   info: TransformInfo,
@@ -1527,7 +1949,15 @@ async function runHistoryCollapseAndFinalize(
   pins: Pin[],
 ): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
   let collapsedFlag = false;
-  if (Array.isArray(req.messages) && req.messages.length > 0) {
+  // Same wire cap as every other imaging path: the collapse buys tokens with
+  // image blocks, and a request whose client images already fill the cap has
+  // none left to spend. `historyGridTuning` floors the budget at 1, so without
+  // this guard a full wire would still emit exactly one image — and 400.
+  if (imageHeadroom(info) <= 0) {
+    bumpPassthrough(info, 'image_budget');
+    info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+    info.historyReason ??= 'too_many_images';
+  } else if (Array.isArray(req.messages) && req.messages.length > 0) {
     const historyCpt = opts.charsPerToken !== undefined
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
@@ -1538,7 +1968,7 @@ async function runHistoryCollapseAndFinalize(
     // symmetric burn would have kept the slab gate in. Production data
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
-    const historyGeometry = denseGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -1555,18 +1985,40 @@ async function runHistoryCollapseAndFinalize(
     // message carrying them is protected from collapse the same way the
     // non-collapse path already keeps <system-reminder> as text below.
     const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
+    const tuning = historyGridTuning(info);
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
       {
-        cols: o.cols,
+        cols: historyGeometry.cols,
         protectedPrefix,
         reflow: o.reflow,
         style: historyGeometry.style,
         maxHeightPx: historyGeometry.maxHeightPx,
+        pageChars: historyGeometry.maxChars,
+        imageBudget: tuning.imageBudget,
+        packFill: tuning.packFill,
+        minFreezeStep: tuning.minFreezeStep,
       },
     );
-    if (histInfo.collapsedTurns > 0) {
+    recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+    if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
+    if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
+    if (tuning.packFill) info.historyPackFill = true;
+    // Atomic admission by weight. The collapse is one semantic group: applying
+    // it means every collapsed message becomes pages, so a group that does not
+    // fit the byte budget is not applied at all and the original text stands.
+    // Rendering it first and discarding it costs CPU, which is the cheap half of
+    // the trade: the alternative is estimating PNG size from character counts and
+    // being wrong on the request that mattered.
+    if (
+      histInfo.collapsedTurns > 0 &&
+      histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
+    ) {
+      bumpPassthrough(info, 'image_budget');
+      info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+      info.historyReason = 'image_bytes';
+    } else if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -1594,6 +2046,19 @@ async function runHistoryCollapseAndFinalize(
   }
   applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
+  // Ground truth, counted from the bytes we are about to send. The provider only
+  // ever sees this number, so telemetry and any future headroom math must read it
+  // and not the render counter. The collapse replaces whole messages, so a client
+  // image sitting inside the collapsed range is counted in `nativeImages` but is
+  // not on the wire, and only a count taken here sees that.
+  //
+  // This comment used to cite "95 rendered, 27 on the wire" as if the gap were a
+  // property of the design. It was not. It was tool_result imaging running before
+  // the collapse on the main path, so 68 renders were discarded together with the
+  // messages that absorbed them. With the stages ordered correctly the same shape
+  // measures 92 rendered and 92 on the wire.
+  info.wireImages = countNativeImages(req.messages);
+  if (nearByteLimit(info, o.maxImageBytes)) info.imageBytesNearLimit = true;
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info, collapsed: collapsedFlag };
 }
@@ -1614,7 +2079,7 @@ export async function transformRequest(
   // Merge caller opts over DEFAULTS, but treat explicit `undefined` as "not
   // provided" so it falls through to the default. Without this, a caller that
   // passes `{ minToolResultChars: undefined }` (common when forwarding partial
-  // options from upstream — e.g. ocproxy's handler) would silently disable the
+   // options from upstream — e.g. an upstream gateway's handler) would silently disable the
   // tool_result text-passthrough gate and route everything through the
   // renderer.
   const definedOpts = Object.fromEntries(
@@ -1657,6 +2122,12 @@ export async function transformRequest(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+
+  // Price the caller's OWN images before we rewrite anything: they occupy the
+  // same wire cap we are about to spend from. Counted once, here, because every
+  // later path (slab, tool_results, history) rewrites content in place.
+  info.nativeImages = countNativeImages(req.messages);
+  info.nativeImageBytes = countNativeImageBytes(req.messages);
 
   // 0. User-pinned instructions. Fold the transcript's pin commands, then remove
   //    them from the outbound copy — the client's own transcript is untouched, so
@@ -1706,7 +2177,22 @@ export async function transformRequest(
   // `429 rate_limit_error: "Error"` when it does not lead (#149). Lift it out
   // here so the assembly below can put it back in front.
   const { identity: keptIdentity, kept: sysRemainder } = liftIdentityBlock(rawSysRemainder);
-  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  let { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  // When another system block carries cache_control, the billing block is
+  // un-marked, so extractSystemText routes it to `kept` and the strip above
+  // never sees it — sysRemainder would re-emit it into req.system, inside the
+  // cached span. Excise it from the remainder blocks too.
+  if (Array.isArray(sysRemainder)) {
+    for (let i = sysRemainder.length - 1; i >= 0; i--) {
+      const blk = sysRemainder[i] as any;
+      if (!blk || blk.type !== 'text' || typeof blk.text !== 'string') continue;
+      const r = stripBillingLine(blk.text);
+      if (r.kept === null) continue;
+      billingLine ??= r.kept; // never emit the per-turn line twice
+      if (r.body.trim() === '') sysRemainder.splice(i, 1);
+      else sysRemainder[i] = { ...blk, text: r.body };
+    }
+  }
   // `# Environment` (working dir, git status, model ID) churns per turn but has
   // no XML wrapper, so the static/dynamic split would bake it into the slab PNG
   // and a one-file edit would re-render the whole prefix. Pull it out first; it
@@ -1854,6 +2340,18 @@ export async function transformRequest(
     return { body: pinsRewrote ? finalized.body : body, info };
   }
 
+  // The wire cap guards even the slab. Imaging it is our biggest single win, but
+  // a request whose client images already fill the provider's cap has no image
+  // left to spend: emitting one anyway turns a large-but-valid request into a
+  // hard 400. Degrade to plain text and say why.
+  if (imageHeadroom(info) <= 0) {
+    info.reason = 'image_budget';
+    bumpPassthrough(info, 'image_budget');
+    info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
+    return { body: pinsRewrote || finalized.collapsed ? finalized.body : body, info };
+  }
+
   // Break-even check guards even the slab (rare edge: tiny tool docs + tiny slab < 10k chars).
   const denseGeo = denseGateGeometry(o);
   // Use slab cpt (2.0) unless host pinned charsPerToken explicitly.
@@ -1939,6 +2437,29 @@ export async function transformRequest(
     denseGeo.style,
     denseGeo.maxHeightPx,
   );
+  // Quantitative cap, not just "is there room": the slab is many pages, and a
+  // boolean "headroom > 0" check happily emitted 15 of them into a single slot
+  // (measured: 94 client images + 400k slab -> 109 on the wire -> 400). All or
+  // nothing, because the slab is part of the cache prefix — imaging half of it
+  // would re-key that prefix on every turn whose client-image count moved.
+  const slabBytes = images.reduce((sum, img) => sum + img.png.length, 0);
+  const slabOverCount = images.length > imageHeadroom(info);
+  const slabOverBytes = slabBytes > imageByteHeadroom(info, o.maxImageBytes);
+  if (slabOverCount || slabOverBytes) {
+    info.reason = slabOverCount
+      ? `image_budget (slab needs ${images.length}, headroom ${imageHeadroom(info)})`
+      : `image_bytes (slab needs ${slabBytes}, headroom ${imageByteHeadroom(info, o.maxImageBytes)})`;
+    bumpPassthrough(info, 'image_budget');
+    if (slabOverBytes && !slabOverCount) info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+    else info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
+    if (finalized.collapsed) {
+      info.compressed = true;
+      return { body: finalized.body, info };
+    }
+    return { body: pinsRewrote ? finalized.body : body, info };
+  }
+
   const imageBlocks: ImageBlock[] = [];
   for (let i = 0; i < images.length; i++) {
     const img = images[i]!;
@@ -1983,11 +2504,13 @@ export async function transformRequest(
     if (preservedIdentity) {
       sysTail.push({ type: 'text', text: preservedIdentity });
     }
-    // Session-stable, so it sits ahead of the churny blocks below.
-
-    // billingLine is session-stable (warm reads through the anchored prefix
-    // confirm it; a per-turn value here would zero every cache read).
-    if (billingLine) sysTail.push({ type: 'text', text: billingLine });
+    // billingLine is NOT re-emitted here. req.system precedes messages[] in
+    // Anthropic's cache-prefix order, so every system block sits inside the
+    // span covered by the LAST cache_control marker (always in messages[] on
+    // this path — see cachePrefixDigest). #180/#161 put the line here believing
+    // "after the anchor"; telemetry showed 0 cache reads and 509/509 distinct
+    // cachePrefixSha8 per day. It leaves the body entirely: exported via
+    // info.billingLine and sent as a real HTTP header (src/core/proxy.ts).
     if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
     if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
@@ -2021,197 +2544,13 @@ export async function transformRequest(
       ];
     }
 
-    // 5b. Compress tool_result content across ALL user messages.
-    if (o.compressToolResults) {
-      for (const msg of req.messages ?? []) {
-        if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
-        const rewritten: ContentBlock[] = [];
-        let changed = false;
-        for (const blk of msg.content) {
-          if (blk && (blk as ToolResultBlock).type === 'tool_result') {
-            const tr = blk as ToolResultBlock;
-            // Anthropic rejects images inside is_error tool_results — leave alone.
-            if (tr.is_error === true) {
-              rewritten.push(blk);
-              continue;
-            }
-            const innerRaw = tr.content;
-            if (typeof innerRaw === 'string') {
-              // Caller fidelity override: pin this tool_result as text.
-              if (callerKeepsSharp(o.keepSharp, { kind: 'tool_result', text: innerRaw, toolUseId: tr.tool_use_id })) {
-                bumpPassthrough(info, 'kept_sharp');
-                info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
-                rewritten.push(blk);
-                continue;
-              }
-              const inner = compactSlabWhitespace(innerRaw);
-              // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
-              const innerR = maybeReflow(inner, o.reflow);
-              if (innerR.length < o.minToolResultChars) {
-                bumpPassthrough(info, 'below_threshold');
-                rewritten.push(blk);
-              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
-                bumpPassthrough(info, 'not_profitable');
-                rewritten.push(blk);
-              } else {
-                // Paging: truncate before render if it would blow the image cap.
-                const linesPerImage = Math.max(
-                  1,
-                  Math.floor((denseGeo.maxHeightPx - 2 * PAD_Y) / renderCellHeight(denseGeo.style)),
-                );
-                const paged = truncateForBudget(
-                  innerR,
-                  o.maxImagesPerToolResult,
-                  denseGeo.cols,
-                  denseGeo.maxChars,
-                  linesPerImage,
-                );
-                if (paged.truncated) {
-                  info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
-                  info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
-                }
-                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(
-                    paged.text,
-                    o.cols,
-                    true,
-                    denseGeo.style,
-                    denseGeo.maxHeightPx,
-                  );
-                (info.imagePngs ??= []).push(...rawPngs);
-                (info.imageDims ??= []).push(...rawDims);
-                for (const img of imgs) info.imageBytes += approxBlockBytes(img);
-                info.imagePixels = (info.imagePixels ?? 0) + pixels;
-                info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
-                info.imageCount += imgs.length;
-                await recordRecoverable(info, o.emitRecoverable, {
-                  kind: 'tool_result',
-                  toolUseId: tr.tool_use_id,
-                  text: innerRaw,
-                  imageCount: imgs.length,
-                });
-                info.compressedChars += innerRaw.length; // original length = what text billing would be
-                info.droppedChars = (info.droppedChars ?? 0) + droppedChars;
-                for (const [cp, n] of dcp) {
-                  droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
-                }
-                const trFactSheet = factSheetText(innerRaw);
-                rewritten.push({
-                  ...tr,
-                  content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
-                });
-                changed = true;
-                bumpBucket(info, toolResultBucket(classifyContent(inner)), innerRaw.length);
-              }
-            } else if (Array.isArray(innerRaw)) {
-              const newInner: Array<TextBlock | ImageBlock> = [];
-              let innerChanged = false;
-              for (const ib of innerRaw) {
-                const isTextBlock =
-                  ib &&
-                  (ib as TextBlock).type === 'text' &&
-                  typeof (ib as TextBlock).text === 'string';
-                if (!isTextBlock) {
-                  newInner.push(ib as TextBlock | ImageBlock);
-                  continue;
-                }
-                const innerTextRaw = (ib as TextBlock).text;
-                // Caller fidelity override: pin this tool_result part as text.
-                if (callerKeepsSharp(o.keepSharp, { kind: 'tool_result_part', text: innerTextRaw, toolUseId: tr.tool_use_id })) {
-                  bumpPassthrough(info, 'kept_sharp');
-                  info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
-                  newInner.push(ib as TextBlock | ImageBlock);
-                  continue;
-                }
-                // Lossless whitespace compaction before gate + render.
-                const innerText = compactSlabWhitespace(innerTextRaw);
-                // R3: gate/page/render on reflowed text; classify pre-reflow.
-                const innerTextR = maybeReflow(innerText, o.reflow);
-                if (innerTextR.length < o.minToolResultChars) {
-                  bumpPassthrough(info, 'below_threshold');
-                  newInner.push(ib as TextBlock | ImageBlock);
-                  continue;
-                }
-                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
-                  bumpPassthrough(info, 'not_profitable');
-                  newInner.push(ib as TextBlock | ImageBlock);
-                  continue;
-                }
-                const linesPerImage = Math.max(
-                  1,
-                  Math.floor((denseGeo.maxHeightPx - 2 * PAD_Y) / renderCellHeight(denseGeo.style)),
-                );
-                const paged = truncateForBudget(
-                  innerTextR,
-                  o.maxImagesPerToolResult,
-                  denseGeo.cols,
-                  denseGeo.maxChars,
-                  linesPerImage,
-                );
-                if (paged.truncated) {
-                  info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
-                  info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
-                }
-                const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(
-                    paged.text,
-                    o.cols,
-                    true,
-                    denseGeo.style,
-                    denseGeo.maxHeightPx,
-                  );
-                (info.imagePngs ??= []).push(...rawPngs);
-                (info.imageDims ??= []).push(...rawDims);
-                const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
-                for (let i = 0; i < imgs.length; i++) {
-                  const img = imgs[i]!;
-                  const out =
-                    i === imgs.length - 1 && srcCacheControl !== undefined
-                      ? { ...img, cache_control: srcCacheControl }
-                      : img;
-                  newInner.push(out as ImageBlock);
-                  info.imageBytes += approxBlockBytes(img);
-                }
-                const partFactSheet = factSheetText(innerTextRaw);
-                if (partFactSheet) newInner.push({ type: 'text', text: partFactSheet });
-                info.imagePixels = (info.imagePixels ?? 0) + pixels;
-                info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
-                info.imageCount += imgs.length;
-                await recordRecoverable(info, o.emitRecoverable, {
-                  kind: 'tool_result_part',
-                  toolUseId: tr.tool_use_id,
-                  text: innerTextRaw,
-                  imageCount: imgs.length,
-                });
-                info.compressedChars += innerTextRaw.length;
-                info.droppedChars = (info.droppedChars ?? 0) + droppedChars;
-                for (const [cp, n] of dcp) {
-                  droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
-                }
-                bumpBucket(info, toolResultBucket(classifyContent(innerText)), innerTextRaw.length);
-                innerChanged = true;
-              }
-              if (innerChanged) {
-                rewritten.push({ ...tr, content: newInner });
-                changed = true;
-              } else {
-                rewritten.push(blk);
-              }
-            } else {
-              rewritten.push(blk);
-            }
-          } else {
-            rewritten.push(blk);
-          }
-        }
-        if (changed) msg.content = rewritten;
-      }
-    }
   }
 
   if (toolsRewritten) req.tools = toolsRewritten;
 
-  // 6. History-image compression (always runs after per-message rewrites).
+  // 6. History-image compression. Runs BEFORE tool_result imaging (step 5b), so
+  //    the collapse reads the original textual message graph. See the ordering
+  //    invariant documented on step 5b below.
   // History is single-col dense; use slab cpt unless host pinned charsPerToken.
   // protectedPrefix excludes the slab-bearing first user message — collapsing it
   // would reduce slab images to [image] placeholders and destroy the cache anchor.
@@ -2220,7 +2559,7 @@ export async function transformRequest(
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
-    const historyGeometry = denseGateGeometry(o);
+    const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
       return isCompressionProfitableAmortized(
@@ -2229,18 +2568,40 @@ export async function transformRequest(
       );
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
+    const tuning = historyGridTuning(info);
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
       {
-        cols: o.cols,
+        cols: historyGeometry.cols,
         protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0,
         reflow: o.reflow,
         style: historyGeometry.style,
         maxHeightPx: historyGeometry.maxHeightPx,
+        pageChars: historyGeometry.maxChars,
+        imageBudget: tuning.imageBudget,
+        packFill: tuning.packFill,
+        minFreezeStep: tuning.minFreezeStep,
       },
     );
-    if (histInfo.collapsedTurns > 0) {
+    recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+    if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
+    if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
+    if (tuning.packFill) info.historyPackFill = true;
+    // Atomic admission by weight. The collapse is one semantic group: applying
+    // it means every collapsed message becomes pages, so a group that does not
+    // fit the byte budget is not applied at all and the original text stands.
+    // Rendering it first and discarding it costs CPU, which is the cheap half of
+    // the trade: the alternative is estimating PNG size from character counts and
+    // being wrong on the request that mattered.
+    if (
+      histInfo.collapsedTurns > 0 &&
+      histInfo.collapsedImageBytes > imageByteHeadroom(info, o.maxImageBytes)
+    ) {
+      bumpPassthrough(info, 'image_budget');
+      info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+      info.historyReason = 'image_bytes';
+    } else if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -2279,6 +2640,278 @@ export async function transformRequest(
     }
   }
 
+  // 5b. Compress tool_result content across ALL user messages.
+  //
+  // ORDERING INVARIANT: this runs AFTER the history collapse (step 6), never
+  // before it. Both stages are lossy, and composing them the other way lost
+  // content outright: once a tool_result has become image blocks, the collapse
+  // serializer (`blocksToText`) renders a nested image as the literal string
+  // "[image]". A tool_result that was imaged here and then absorbed by the
+  // collapse therefore reached the wire in neither form - not as text, because
+  // the text had been replaced, and not as an image, because the collapse
+  // replaces whole messages. Running the collapse first means it sees the
+  // original textual graph, and only messages that survive outside the
+  // collapsed prefix are still eligible for imaging here.
+  //
+  // Consequence to keep in mind when reading the budget calls below: the
+  // history images are already counted in `info` by the time we get here, so
+  // `imageHeadroom(info)` is the headroom left after the collapse spent its
+  // share. Out of headroom degrades to sharp text, which is the safe direction.
+  if (o.compressToolResults) {
+    for (const msg of req.messages ?? []) {
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+      const rewritten: ContentBlock[] = [];
+      let changed = false;
+      for (const blk of msg.content) {
+        if (blk && (blk as ToolResultBlock).type === 'tool_result') {
+          const tr = blk as ToolResultBlock;
+          // Anthropic rejects images inside is_error tool_results — leave alone.
+          if (tr.is_error === true) {
+            rewritten.push(blk);
+            continue;
+          }
+          const innerRaw = tr.content;
+          if (typeof innerRaw === 'string') {
+            // Caller fidelity override: pin this tool_result as text.
+            if (callerKeepsSharp(o.keepSharp, { kind: 'tool_result', text: innerRaw, toolUseId: tr.tool_use_id })) {
+              bumpPassthrough(info, 'kept_sharp');
+              info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
+              rewritten.push(blk);
+              continue;
+            }
+            // Hard wire cap: the client's own images plus ours must stay
+            // under the provider's limit, else the WHOLE request is rejected.
+            // Out of headroom → keep the text sharp; a big body beats a 400.
+            if (imageHeadroom(info) <= 0) {
+              bumpPassthrough(info, 'image_budget');
+              info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+              rewritten.push(blk);
+              continue;
+            }
+            const inner = compactSlabWhitespace(innerRaw);
+            // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
+            const innerR = maybeReflow(inner, o.reflow);
+            if (innerR.length < o.minToolResultChars) {
+              bumpPassthrough(info, 'below_threshold');
+              rewritten.push(blk);
+            } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
+              bumpPassthrough(info, 'not_profitable');
+              rewritten.push(blk);
+            } else {
+              // Paging: truncate before render if it would blow the image cap.
+              // The per-result cap is the SMALLER of the configured max and what
+              // is actually left on the wire — the headroom shrinks as earlier
+              // results spend it, so each result sees the live number.
+              const resultImageCap = Math.min(o.maxImagesPerToolResult, imageHeadroom(info));
+              const linesPerImage = Math.max(
+                1,
+                Math.floor((denseGeo.maxHeightPx - 2 * PAD_Y) / renderCellHeight(denseGeo.style)),
+              );
+              const paged = truncateForBudget(
+                innerR,
+                resultImageCap,
+                denseGeo.cols,
+                denseGeo.maxChars,
+                linesPerImage,
+              );
+              if (paged.truncated) {
+                info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
+                info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
+              }
+              const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+                await textToImageBlocks(
+                  paged.text,
+                  o.cols,
+                  true,
+                  denseGeo.style,
+                  denseGeo.maxHeightPx,
+                );
+              // Paging is budgeted at denseGeo.cols but rendering happens at
+              // o.cols; when they differ the real page count can exceed the plan.
+              // Verify against the actual render and drop OUR images rather than
+              // ship a request the provider rejects outright.
+              // Atomic admission: this tool_result is one semantic group. It
+              // is imaged whole or kept as text whole, by count and by weight
+              // alike. A half-imaged result would ship pages without the text
+              // they replaced.
+              const groupBytes = imgs.reduce((sum, img) => sum + approxBlockBytes(img), 0);
+              if (imgs.length > imageHeadroom(info)) {
+                bumpPassthrough(info, 'image_budget');
+                info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+                rewritten.push(blk);
+                continue;
+              }
+              if (groupBytes > imageByteHeadroom(info, o.maxImageBytes)) {
+                bumpPassthrough(info, 'image_budget');
+                info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+                rewritten.push(blk);
+                continue;
+              }
+              (info.imagePngs ??= []).push(...rawPngs);
+              (info.imageDims ??= []).push(...rawDims);
+              for (const img of imgs) info.imageBytes += approxBlockBytes(img);
+              info.imagePixels = (info.imagePixels ?? 0) + pixels;
+              info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
+              info.imageCount += imgs.length;
+              await recordRecoverable(info, o.emitRecoverable, {
+                kind: 'tool_result',
+                toolUseId: tr.tool_use_id,
+                text: innerRaw,
+                imageCount: imgs.length,
+              });
+              info.compressedChars += innerRaw.length; // original length = what text billing would be
+              info.droppedChars = (info.droppedChars ?? 0) + droppedChars;
+              for (const [cp, n] of dcp) {
+                droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+              }
+              const trFactSheet = factSheetText(innerRaw);
+              rewritten.push({
+                ...tr,
+                content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
+              });
+              changed = true;
+              bumpBucket(info, toolResultBucket(classifyContent(inner)), innerRaw.length);
+            }
+          } else if (Array.isArray(innerRaw)) {
+            const newInner: Array<TextBlock | ImageBlock> = [];
+            let innerChanged = false;
+            for (const ib of innerRaw) {
+              const isTextBlock =
+                ib &&
+                (ib as TextBlock).type === 'text' &&
+                typeof (ib as TextBlock).text === 'string';
+              if (!isTextBlock) {
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              const innerTextRaw = (ib as TextBlock).text;
+              // Caller fidelity override: pin this tool_result part as text.
+              if (callerKeepsSharp(o.keepSharp, { kind: 'tool_result_part', text: innerTextRaw, toolUseId: tr.tool_use_id })) {
+                bumpPassthrough(info, 'kept_sharp');
+                info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              // Hard wire cap — see the string-content path above.
+              if (imageHeadroom(info) <= 0) {
+                bumpPassthrough(info, 'image_budget');
+                info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              // Lossless whitespace compaction before gate + render.
+              const innerText = compactSlabWhitespace(innerTextRaw);
+              // R3: gate/page/render on reflowed text; classify pre-reflow.
+              const innerTextR = maybeReflow(innerText, o.reflow);
+              if (innerTextR.length < o.minToolResultChars) {
+                bumpPassthrough(info, 'below_threshold');
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
+                bumpPassthrough(info, 'not_profitable');
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              const linesPerImage = Math.max(
+                1,
+                Math.floor((denseGeo.maxHeightPx - 2 * PAD_Y) / renderCellHeight(denseGeo.style)),
+              );
+              const resultImageCap = Math.min(o.maxImagesPerToolResult, imageHeadroom(info));
+              const paged = truncateForBudget(
+                innerTextR,
+                resultImageCap,
+                denseGeo.cols,
+                denseGeo.maxChars,
+                linesPerImage,
+              );
+              if (paged.truncated) {
+                info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
+                info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
+              }
+              const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
+                await textToImageBlocks(
+                  paged.text,
+                  o.cols,
+                  true,
+                  denseGeo.style,
+                  denseGeo.maxHeightPx,
+                );
+              // Paging is budgeted at denseGeo.cols but rendering happens at
+              // o.cols; when they differ the real page count can exceed the plan.
+              // Verify against the actual render and drop OUR images rather than
+              // ship a request the provider rejects outright.
+              const partBytes = imgs.reduce((sum, img) => sum + approxBlockBytes(img), 0);
+              if (imgs.length > imageHeadroom(info)) {
+                bumpPassthrough(info, 'image_budget');
+                info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              if (partBytes > imageByteHeadroom(info, o.maxImageBytes)) {
+                bumpPassthrough(info, 'image_budget');
+                info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              (info.imagePngs ??= []).push(...rawPngs);
+              (info.imageDims ??= []).push(...rawDims);
+              const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
+              for (let i = 0; i < imgs.length; i++) {
+                const img = imgs[i]!;
+                const out =
+                  i === imgs.length - 1 && srcCacheControl !== undefined
+                    ? { ...img, cache_control: srcCacheControl }
+                    : img;
+                newInner.push(out as ImageBlock);
+                info.imageBytes += approxBlockBytes(img);
+              }
+              const partFactSheet = factSheetText(innerTextRaw);
+              if (partFactSheet) newInner.push({ type: 'text', text: partFactSheet });
+              info.imagePixels = (info.imagePixels ?? 0) + pixels;
+              info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
+              info.imageCount += imgs.length;
+              await recordRecoverable(info, o.emitRecoverable, {
+                kind: 'tool_result_part',
+                toolUseId: tr.tool_use_id,
+                text: innerTextRaw,
+                imageCount: imgs.length,
+              });
+              info.compressedChars += innerTextRaw.length;
+              info.droppedChars = (info.droppedChars ?? 0) + droppedChars;
+              for (const [cp, n] of dcp) {
+                droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+              }
+              bumpBucket(info, toolResultBucket(classifyContent(innerText)), innerTextRaw.length);
+              innerChanged = true;
+            }
+            if (innerChanged) {
+              rewritten.push({ ...tr, content: newInner });
+              changed = true;
+            } else {
+              rewritten.push(blk);
+            }
+          } else {
+            rewritten.push(blk);
+          }
+        } else {
+          rewritten.push(blk);
+        }
+      }
+      if (changed) msg.content = rewritten;
+    }
+  }
+
+  // The volatile billing line is NOT re-emitted into the body at all. There is
+  // no safe body position: req.system precedes the last cache_control marker
+  // (#180/#161: 0 cache reads, 509/509 distinct cachePrefixSha8/day), and
+  // appending after the final user message's markers renders it as
+  // user-attributed text in the conversation (the leak this replaced). It is a
+  // header by name and by nature — the proxy forwards `info.billingLine` as a
+  // real HTTP header on the upstream request (src/core/proxy.ts), where its
+  // per-turn churn (`cc_prev_req` on CLI >= 2.1.222) touches no cached bytes.
+  if (billingLine) info.billingLine = billingLine;
+
   info.compressed = true;
   // Attribution signal for prompt-cache busts (#11): digest the exact pinned
   // prefix we send (history/slab boundary; live tail excluded) AFTER all marker
@@ -2288,6 +2921,12 @@ export async function transformRequest(
     if (pfx) {
       info.cachePrefixSha8 = pfx.sha8;
       info.cachePrefixBytes = pfx.bytes;
+      info.cachePrefixToolsSha8 = pfx.toolsSha8;
+      info.cachePrefixSystemSha8 = pfx.systemSha8;
+      info.cachePrefixHeadSha8 = pfx.headSha8;
+      info.cachePrefixMarkedSha8 = pfx.markedSha8;
+      info.cachePrefixMarkedBytes = pfx.markedBytes;
+      if (pfx.markerPos) info.cachePrefixMarkerPos = pfx.markerPos;
     }
   }
   // Top dropped codepoints, capped at 20 entries to bound JSONL row size.
@@ -2305,6 +2944,9 @@ export async function transformRequest(
   }
   applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
+  // Ground truth for the main path too — see the note at the other call site.
+  info.wireImages = countNativeImages(req.messages);
+  if (nearByteLimit(info, o.maxImageBytes)) info.imageBytesNearLimit = true;
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info };
 }

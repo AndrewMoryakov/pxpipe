@@ -76,6 +76,47 @@ function stubFetch(capture: { url?: string; headers?: Headers }) {
   }) as typeof fetch;
 }
 
+describe('upstream that already ends with a provider segment', () => {
+  const BASE = 'http://harness.example.test/anthropic';
+  const send = (path: string) =>
+    createProxy({ upstream: BASE })(
+      new Request(`http://localhost${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+
+  it('does not double the segment for a prefixed path, and still appends an unprefixed one', async () => {
+    const cap: { url?: string } = {};
+    stubFetch(cap);
+    expect((await send('/anthropic/v1/messages')).status).toBe(200);
+    expect(cap.url).toBe(`${BASE}/v1/messages`);
+    expect((await send('/v1/messages')).status).toBe(200);
+    expect(cap.url).toBe(`${BASE}/v1/messages`);
+  });
+
+  it('probes count_tokens at the same deduped path as the forward', async () => {
+    const probed: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/count_tokens')) {
+        probed.push(url);
+        return new Response(JSON.stringify({ input_tokens: 1 }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({ type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    expect((await send('/anthropic/v1/messages')).status).toBe(200);
+    expect(probed.length).toBeGreaterThan(0);
+    for (const url of probed) expect(url).toBe(`${BASE}/v1/messages/count_tokens`);
+  });
+});
+
 describe('gateway end-to-end routing (stubbed fetch)', () => {
   const proxy = () =>
     createProxy({
@@ -213,7 +254,7 @@ describe('provider-prefixed passthrough routing', () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);
     await createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       openAIUpstream: 'http://openai.test',
     })(
       new Request('http://localhost/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse', {
@@ -223,7 +264,7 @@ describe('provider-prefixed passthrough routing', () => {
       }),
     );
 
-    expect(cap.url).toBe('http://ocproxy.test/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse');
+    expect(cap.url).toBe('http://gateway.test/google-ai-studio/v1beta/models/gemini-2.5:generateContent?alt=sse');
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
   });
 
@@ -231,7 +272,7 @@ describe('provider-prefixed passthrough routing', () => {
     const cap: { url?: string; headers?: Headers } = {};
     stubFetch(cap);
     await createProxy({
-      upstream: 'http://ocproxy.test',
+      upstream: 'http://gateway.test',
       apiKey: 'sk-anthropic-test',
     })(
       new Request('http://localhost/compat/v1/chat/completions', {
@@ -241,7 +282,7 @@ describe('provider-prefixed passthrough routing', () => {
       }),
     );
 
-    expect(cap.url).toBe('http://ocproxy.test/compat/v1/chat/completions');
+    expect(cap.url).toBe('http://gateway.test/compat/v1/chat/completions');
     expect(cap.headers?.get('authorization')).toBe('Bearer local-token');
     expect(cap.headers?.get('x-api-key')).toBeNull();
   });

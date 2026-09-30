@@ -63,3 +63,4 @@ eval/verbatim-15/legib/
 eval/verbatim-15/fixtures-v2/
 eval/verbatim-15/band*.png
 eval/gsm8k/novel_imgs_*/
+eval/**/agent/sessions/
