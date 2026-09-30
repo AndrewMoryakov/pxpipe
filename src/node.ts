@@ -106,8 +106,8 @@ function resolveSessionStateFile(): string | undefined {
 }
 
 /**
- * File-backed {@link SessionStateStore}. Same write-then-rename discipline as the
- * config writer above: a crash mid-write leaves the previous file intact. Mode
+ * File-backed {@link SessionStateStore}. Write-then-rename, as the model-scope
+ * sidecar does: a crash mid-write leaves the previous file intact. Mode
  * 0600 — the file holds session fingerprints (sha8 of the first user turn) and
  * counters, never prompt text, but it is still per-user state.
  */

@@ -1203,7 +1203,7 @@ export type OutboundAuth =
  * where the client speaks to the OpenAI upstream itself rather than through a
  * Messages bridge.
  *
- * Three rules, in priority order:
+ * Four rules, in priority order:
  *
  *  1. An Anthropic-shaped credential never reaches an OpenAI upstream. That is a
  *     cross-provider credential disclosure, and a guaranteed 401 on top. The
@@ -1213,13 +1213,19 @@ export type OutboundAuth =
  *     configured. A Codex user proxying through pxpipe means to spend their own
  *     subscription; silently substituting the host key bills the wrong account
  *     and usually fails, and the user has no way to see why.
- *  3. Otherwise a configured key replaces whatever arrived, and is used as the
+ *  3. On ChatGPT's Codex endpoints (`/backend-api/codex/*`) any non-Anthropic
+ *     bearer the caller sent is kept. Those endpoints only accept the caller's
+ *     ChatGPT sign-in, whose token is not always JWT-shaped; OPENAI_API_KEY is
+ *     for canonical `/v1` endpoints, and substituting it there turns a valid
+ *     signed-in session into a 401.
+ *  4. Otherwise a configured key replaces whatever arrived, and is used as the
  *     fallback when nothing arrived. This is the documented "host supplies the
  *     credential" mode.
  */
 export function resolveOpenAIRouteAuth(
   inbound: InboundCredential,
   hasConfiguredKey: boolean,
+  options: { chatGPTCodexPath?: boolean } = {},
 ): OutboundAuth {
   if (inbound === 'anthropic-bearer' || inbound === 'anthropic-key') {
     return hasConfiguredKey
@@ -1228,6 +1234,9 @@ export function resolveOpenAIRouteAuth(
   }
   if (inbound === 'oauth-jwt') {
     return { action: 'keep-inbound', reason: 'subscription-oauth-belongs-to-the-caller' };
+  }
+  if (options.chatGPTCodexPath && inbound !== 'none') {
+    return { action: 'keep-inbound', reason: 'chatgpt-codex-bearer-belongs-to-the-caller' };
   }
   if (hasConfiguredKey) {
     return { action: 'replace', reason: 'host-configured-key' };
@@ -1942,19 +1951,13 @@ let responseContentType: string | undefined;
       } else {
         // A direct OpenAI-family route. The client's own credential may be the
         // right one to forward, so decide by shape instead of by whether a host
-        // key happens to be set. See resolveOpenAIRouteAuth for the three rules.
-        const inbound = classifyInboundCredential(req.headers);
-        const decision = resolveOpenAIRouteAuth(inbound, bridgeKey !== undefined && bridgeKey !== '');
-        // Codex talks to chatgpt.com with the client's ChatGPT OAuth bearer, which
-        // is not always JWT-shaped. OPENAI_API_KEY is for canonical /v1 OpenAI
-        // endpoints only; replacing Codex's bearer makes an otherwise valid
-        // signed-in session 401.
-        const keepCodexBearer = isChatGPTCodexPath(url.pathname)
-          && decision.action === 'replace'
-          && (inbound === 'opaque-bearer' || inbound === 'api-key-bearer');
-        if (keepCodexBearer) {
-          // Leave the header filterHeaders already copied.
-        } else if (decision.action === 'drop') outHeaders.delete('authorization');
+        // key happens to be set. See resolveOpenAIRouteAuth for the four rules.
+        const decision = resolveOpenAIRouteAuth(
+          classifyInboundCredential(req.headers),
+          bridgeKey !== undefined && bridgeKey !== '',
+          { chatGPTCodexPath: isChatGPTCodexPath(url.pathname) },
+        );
+        if (decision.action === 'drop') outHeaders.delete('authorization');
         else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
         // 'keep-inbound' leaves the header filterHeaders already copied.
       }

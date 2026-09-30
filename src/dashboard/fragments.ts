@@ -218,13 +218,25 @@ type Readiness = 'validated' | 'below-bar' | 'unmeasured';
 const MODEL_READINESS: Readonly<Record<string, { status: Readiness; evidence?: string }>> = {
   // Validated — the only reader proven at the production density.
   'claude-fable-5': { status: 'validated' },
-  // Gemini 3.6/3.7 Flash are the readers upstream validated (100/100 vision
-  // reader). The family chip is shown validated to match; 3.8 Flash and other
-  // versions it covers are unlisted and fall through to unmeasured.
-  gemini: { status: 'validated' },
+  // Gemini 3.6/3.7 Flash clear the bar (README: 100/100 arithmetic, 98/98 gist,
+  // 14/15 dense hex). 3.8 Flash and other versions are unlisted → unmeasured.
   'gemini-3.6-flash': { status: 'validated' },
   'gemini-3.7-flash': { status: 'validated' },
+  // A broad chip carries its weakest covered version's risk (same rule as the
+  // gpt-5.6 chip below): the family base also enables unbenchmarked versions.
+  gemini: {
+    status: 'unmeasured',
+    evidence: 'The Gemini family chip images every Gemini version. Only 3.6 Flash and 3.7 Flash have committed benchmarks (14/15 dense hex); 3.8 Flash, Pro, 4 and later versions it also enables are unmeasured.',
+  },
   // Below-bar — benchmarked, measured under the Fable bar.
+  'claude-opus-5-5': {
+    status: 'below-bar',
+    evidence: 'Opus 5.5: 3/15 verbatim dense-hex (100/100 arithmetic, 94/98 gist, 0/16 confabulations) — below the Fable bar for exact recall.',
+  },
+  'claude-opus-5': {
+    status: 'below-bar',
+    evidence: 'Opus 5: 2/15 verbatim dense-hex (100/100 arithmetic, 94/98 gist) — below the Fable bar for exact recall.',
+  },
   'claude-opus-4-8': {
     status: 'below-bar',
     evidence: 'Opus 4.8: 0/15 verbatim dense-hex, ~7% arithmetic read-tax, silent confabulation (fixable with abstention prompting).',
@@ -299,13 +311,24 @@ export function renderModelsFragment(
     const r = readinessOf(id);
     const tip =
       r.status === 'below-bar' ? (r.evidence ?? `${label} reads pxpipe-imaged context below the Fable bar. ${IMAGED_RISK}`)
-      : r.status === 'unmeasured' ? UNMEASURED_NOTE
+      : r.status === 'unmeasured' ? (r.evidence ?? UNMEASURED_NOTE)
       : '';
     // Persistent, hover-readable explanation for any flagged chip.
     const titleAttr = tip ? ` title="${escapeHtml(tip)}"` : '';
     // below-bar = proven risk → block on ENABLE (off → on). unmeasured never
     // blocks (unknown, not proven-bad); validated never flags. Disable never prompts.
-    const confirmAttr = r.status === 'below-bar' && !lit ? ` hx-confirm="${escapeHtml(`${tip} Enable anyway?`)}"` : '';
+    // A chip lit only through a broader base (e.g. `gemini` lighting Gemini 3.8
+    // Flash) cannot be turned off alone: the toggle replaces that base with its
+    // listed siblings, so versions not listed here stop being imaged. Say so.
+    const coveringBase = lit && !active.includes(id)
+      ? active.find((base) => isModelScopeEnabled(id, [base]))
+      : undefined;
+    const confirmText = r.status === 'below-bar' && !lit
+      ? `${tip} Enable anyway?`
+      : coveringBase
+        ? `${label} is enabled by the broad "${coveringBase}" scope. Turning it off replaces "${coveringBase}" with only the other versions listed here, so any version not listed (new or future ones) stops being imaged. Continue?`
+        : '';
+    const confirmAttr = confirmText ? ` hx-confirm="${escapeHtml(confirmText)}"` : '';
     // ⚠ marker on any lit non-validated chip so the risk stays visible after enabling.
     const warnMark = r.status !== 'validated' && lit ? ' ⚠' : '';
     return (
@@ -1459,17 +1482,6 @@ const CSS = `
     border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px;
     font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .models-csv:focus { outline: none; border-color: var(--flame-ink); }
-  .models-routing { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
-  #routing-help { border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface);
-    color: var(--ink); max-width: 600px; padding: 16px 20px; }
-  #routing-help::backdrop { background: rgba(20, 12, 6, .4); }
-  #routing-help h3 { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
-  #routing-help p, #routing-help li { font-size: 12px; line-height: 1.55; color: var(--ink-2); margin: 6px 0; }
-  #routing-help ul { margin: 6px 0; padding-left: 18px; }
-  #routing-help code { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
-  #routing-help pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
-    padding: 8px 10px; margin: 8px 0; overflow-x: auto;
-    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
   .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
     border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 12px; }
   .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
@@ -1486,9 +1498,6 @@ const CSS = `
   .models-summary { cursor: pointer; color: var(--ink-2); font-size: 12px; font-weight: 600;
     margin: 0 0 8px; user-select: none; }
   .models-summary:hover { color: var(--flame-ink); }
-  .models-warning { color: var(--ink-2); background: var(--surface); border: 1px solid var(--border-strong);
-    border-left: 3px solid var(--bad); border-radius: 8px; padding: 8px 12px; font-size: 12px;
-    margin: 0 0 12px; }
 
   /* session hero */
   #current-session { scroll-margin-top: 118px; }

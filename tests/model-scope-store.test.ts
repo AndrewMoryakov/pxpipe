@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -48,6 +48,27 @@ describe('model-scope-store (Variant A persistence)', () => {
     fs.chmodSync(file, 0o644);
     savePersistedModelScope(file, ['claude-fable-5']);
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it('leaves no temp file behind after a successful save', () => {
+    savePersistedModelScope(file, ['claude-fable-5']);
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('a failed save does not throw but is reported, and keeps the previous choice', () => {
+    savePersistedModelScope(file, ['claude-fable-5']);
+    // A directory where the file should be makes the rename fail on every platform.
+    const blocked = path.join(dir, 'blocked.json');
+    fs.mkdirSync(blocked);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(() => savePersistedModelScope(blocked, ['gpt-5.5'])).not.toThrow();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not persist model scope'));
+    } finally {
+      warn.mockRestore();
+    }
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    expect(loadPersistedModelScope(file)).toEqual(['claude-fable-5']);
   });
 
   it('persists an empty list as [] — a real "compress nothing" choice, NOT null', () => {

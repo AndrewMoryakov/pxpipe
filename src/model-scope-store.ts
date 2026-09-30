@@ -55,14 +55,24 @@ export function loadPersistedModelScope(file: string): string[] | null {
  * toggle. An empty list is persisted as-is (distinct from Reset/clear).
  */
 export function savePersistedModelScope(file: string, bases: readonly string[]): void {
+  const tmp = `${file}.${process.pid}.tmp`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    // `mode` applies only when the file is created; chmod also tightens a file
-    // left behind with looser permissions by an earlier version.
-    fs.writeFileSync(file, `${JSON.stringify({ modelBases: [...bases] }, null, 2)}\n`, { mode: 0o600 });
-    fs.chmodSync(file, 0o600);
-  } catch {
-    /* best-effort: persistence is a convenience, not a correctness guarantee */
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    // Write-then-rename so a crash mid-write keeps the previous choice; the
+    // rename also replaces a file left behind with looser permissions. The
+    // explicit chmod covers a umask or filesystem that narrows `mode` on create.
+    fs.writeFileSync(tmp, `${JSON.stringify({ modelBases: [...bases] }, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    // Best-effort: persistence is a convenience, not a correctness guarantee,
+    // but a failure must be visible rather than silently losing the choice.
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* nothing to clean */
+    }
+    console.warn(`[pxpipe] could not persist model scope to ${file}: ${(err as Error).message}`);
   }
 }
 

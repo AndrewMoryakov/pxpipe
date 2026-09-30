@@ -26,7 +26,7 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Opus 5.5, Gemini 3.6 Flash, and Gemini 3.7 Flash.
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Opus 5.5, and the whole Gemini family.
  *  Opus 5.5 is on at the spaced 5x8 profile: 93/98 gist, 0/16 confabulations,
  *  100/100 arithmetic (CLAUDE_SPACED_PROFILE).
  *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:

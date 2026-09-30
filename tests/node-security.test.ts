@@ -20,17 +20,6 @@ function expectPrivateDirectory(dirPath: string): void {
   if (supportsPosixModes) expect(fs.statSync(dirPath).mode & 0o777).toBe(0o700);
 }
 
-// NTFS has no POSIX permission bits: Node reports 0o666 for every file and
-// directory on Windows, and chmodSync() only toggles the read-only flag. The
-// hardening in src/node.ts still runs there — only the assertion is moot, so
-// we check the mode where the platform can actually express it.
-const hasPosixModes = process.platform !== 'win32';
-
-function expectMode(target: string, expected: number): void {
-  if (!hasPosixModes) return;
-  expect(fs.statSync(target).mode & 0o777).toBe(expected);
-}
-
 let child: ChildProcess | undefined;
 let upstream: Server | undefined;
 let dir: string | undefined;
@@ -56,10 +45,20 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/** Keep a spawned proxy off the developer's real per-user state. Upstream
+ *  enables session-state persistence by default (~/.pxpipe/session-state.json)
+ *  and the Codex usage index scans ~/.codex; without these overrides every test
+ *  child reads that state at startup and can overwrite a live instance's pins. */
+function isolatedStateEnv(root: string): Record<string, string> {
+  return {
+    PXPIPE_SESSION_STATE: 'off',
+    CODEX_HOME: path.join(root, 'codex-home'),
+  };
+}
+
 async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   base: string;
   eventsFile: string;
-  configFile: string;
 }> {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-node-security-'));
   const port = await freePort();
@@ -91,6 +90,7 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
       HOST: '127.0.0.1',
       PXPIPE_LOG: eventsFile,
       PXPIPE_CONFIG: configFile,
+      ...isolatedStateEnv(dir),
       PXPIPE_MODELS: 'claude-fable-5',
       ANTHROPIC_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
       ...extraEnv,
@@ -117,7 +117,7 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
     };
     poll();
   });
-  return { base: `http://127.0.0.1:${port}`, eventsFile, configFile };
+  return { base: `http://127.0.0.1:${port}`, eventsFile };
 }
 
 describe('Node dashboard security', () => {
@@ -133,6 +133,7 @@ describe('Node dashboard security', () => {
         HOST: '0.0.0.0',
         PXPIPE_LOG: path.join(dir, 'events.jsonl'),
         PXPIPE_CONFIG: path.join(dir, 'config.json'),
+        ...isolatedStateEnv(dir),
         OPENAI_API_KEY: 'server-owned-test-key',
         PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS: '',
       },
@@ -159,6 +160,7 @@ describe('Node dashboard security', () => {
         HOST: '127.example.com',
         PXPIPE_LOG: path.join(dir, 'events.jsonl'),
         PXPIPE_CONFIG: path.join(dir, 'config.json'),
+        ...isolatedStateEnv(dir),
         OPENAI_API_KEY: 'server-owned-test-key',
         PXPIPE_ALLOW_NON_LOOPBACK_CREDENTIALS: '',
       },

@@ -111,6 +111,25 @@ describe('resolveOpenAIRouteAuth: inbound credential x configured key', () => {
     }
   });
 
+  // ChatGPT's Codex endpoints accept only the caller's own sign-in, whose token
+  // is not always JWT-shaped. Rule 1 still outranks it: an Anthropic credential
+  // is never kept, whatever the path.
+  const codexMatrix: Array<[InboundCredential, boolean, 'keep-inbound' | 'replace' | 'drop']> = [
+    ['anthropic-bearer', false, 'drop'],
+    ['anthropic-bearer', true, 'replace'],
+    ['anthropic-key', false, 'drop'],
+    ['anthropic-key', true, 'replace'],
+    ['oauth-jwt', true, 'keep-inbound'],
+    ['api-key-bearer', true, 'keep-inbound'],
+    ['opaque-bearer', true, 'keep-inbound'],
+    ['opaque-bearer', false, 'keep-inbound'],
+    ['none', false, 'drop'],
+    ['none', true, 'replace'],
+  ];
+  it.each(codexMatrix)('ChatGPT Codex path: %s with configured=%s -> %s', (inbound, configured, action) => {
+    expect(resolveOpenAIRouteAuth(inbound, configured, { chatGPTCodexPath: true }).action).toBe(action);
+  });
+
   it('always states a reason, so a decision can be explained', () => {
     expect(resolveOpenAIRouteAuth('oauth-jwt', true).reason).toContain('subscription');
     expect(resolveOpenAIRouteAuth('anthropic-bearer', false).reason).toContain('never-crosses');
@@ -154,6 +173,14 @@ function proxy(openAIApiKey?: string): ReturnType<typeof createProxy> {
   return createProxy(config);
 }
 
+function codexRequest(auth: Record<string, string>): Request {
+  return new Request('http://127.0.0.1:47821/backend-api/codex/responses', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...auth },
+    body: JSON.stringify({ model: 'gpt-5.6-terra', input: 'hi' }),
+  });
+}
+
 function responsesRequest(auth: Record<string, string>): Request {
   return new Request('http://127.0.0.1:47821/v1/responses', {
     method: 'POST',
@@ -161,6 +188,32 @@ function responsesRequest(auth: Record<string, string>): Request {
     body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
   });
 }
+
+describe('the policy holds on the ChatGPT Codex route', () => {
+  it.each([
+    ['a JWT sign-in', `Bearer ${JWT}`],
+    ['an opaque sign-in token', 'Bearer chatgpt-opaque-token'],
+    ['an sk- shaped token', `Bearer ${OPENAI_KEY}`],
+  ])('keeps %s even when a host key is configured', async (_label, authorization) => {
+    const seen = captureUpstream();
+    try {
+      await proxy(HOST_KEY)(codexRequest({ authorization }));
+      expect(seen.authorization).toBe(authorization);
+    } finally {
+      seen.restore();
+    }
+  });
+
+  it('still never forwards an Anthropic bearer', async () => {
+    const seen = captureUpstream();
+    try {
+      await proxy(HOST_KEY)(codexRequest({ authorization: `Bearer ${ANTHROPIC_OAUTH}` }));
+      expect(seen.authorization).toBe(`Bearer ${HOST_KEY}`);
+    } finally {
+      seen.restore();
+    }
+  });
+});
 
 describe('the policy holds on a real OpenAI route', () => {
   it('preserves subscription OAuth even when a host key is configured', async () => {

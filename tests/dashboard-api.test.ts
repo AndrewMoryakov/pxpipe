@@ -297,8 +297,9 @@ describe('serveFragment', () => {
       expect(off).toContain('GPT 5.5</button>');
       // Family chip is lit by default and, as the proxy matches scope by prefix,
       // also lights the per-version chips it covers. 3.6/3.7 Flash are validated
-      // readers; 3.8 Flash is covered but unvalidated, so it carries the ⚠ mark.
-      expect(off).toContain('Gemini (all versions) ✓</button>');
+      // readers; the family and 3.8 Flash also cover unbenchmarked versions, so
+      // they carry the ⚠ mark.
+      expect(off).toContain('Gemini (all versions) ✓ ⚠</button>');
       expect(off).toContain('Gemini 3.6 Flash ✓</button>');
       expect(off).toContain('Gemini 3.8 Flash ✓ ⚠</button>');
       // Terra and Sol remain available and ordered before GPT 5.5.
