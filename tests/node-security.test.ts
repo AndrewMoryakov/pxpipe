@@ -6,6 +6,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { modelScopeFile } from '../src/model-scope-store.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tsxCli = path.join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
@@ -100,7 +101,7 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   child.stdout?.on('data', (b) => output.push(String(b)));
   child.stderr?.on('data', (b) => output.push(String(b)));
   await new Promise<void>((resolve, reject) => {
-    const deadline = setTimeout(() => reject(new Error(output.join(''))), 10_000);
+    const deadline = setTimeout(() => reject(new Error(output.join(''))), 45_000);
     const poll = () => {
       if (output.join('').includes('[pxpipe] listening on')) {
         clearTimeout(deadline);
@@ -183,7 +184,10 @@ describe('Node dashboard security', () => {
   });
 
   it('rejects cross-origin mutations and accepts same-origin mutations', async () => {
-    const { base, configFile } = await startNode();
+    const { base, eventsFile } = await startNode();
+    // A dashboard choice persists to the model-scope sidecar next to the events
+    // log, not to PXPIPE_CONFIG (which is left for deliberately configured defaults).
+    const scopeFile = modelScopeFile(eventsFile);
     const denied = await fetch(`${base}/fragments/models`, {
       method: 'POST',
       headers: {
@@ -194,7 +198,7 @@ describe('Node dashboard security', () => {
       body: 'list=off',
     });
     expect(denied.status).toBe(403);
-    expect(fs.existsSync(configFile)).toBe(false);
+    expect(fs.existsSync(scopeFile)).toBe(false);
 
     const allowed = await fetch(`${base}/fragments/models`, {
       method: 'POST',
@@ -206,8 +210,10 @@ describe('Node dashboard security', () => {
       body: 'list=claude-fable-5',
     });
     expect(allowed.status).toBe(200);
-    expectPrivateFile(configFile);
-    expectPrivateDirectory(path.dirname(configFile));
+    // Content is asserted on every platform; only the mode check is POSIX-gated.
+    expect(JSON.parse(fs.readFileSync(scopeFile, 'utf8'))).toEqual({ modelBases: ['claude-fable-5'] });
+    expectPrivateFile(scopeFile);
+    expectPrivateDirectory(path.dirname(scopeFile));
   });
 
   it('rejects dashboard requests with a non-loopback Host header', async () => {

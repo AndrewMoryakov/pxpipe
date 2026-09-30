@@ -36,6 +36,20 @@ describe('model-scope-store (Variant A persistence)', () => {
     expect(loadPersistedModelScope(file)).toEqual(['claude-fable-5', 'gpt-5.6-terra']);
   });
 
+  // NTFS has no POSIX permission bits, so the mode can only be asserted where the
+  // platform can express it; skipIf keeps the gap visible instead of passing vacuously.
+  it.skipIf(process.platform === 'win32')('writes the scope file owner-only (0600)', () => {
+    savePersistedModelScope(file, ['claude-fable-5']);
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it.skipIf(process.platform === 'win32')('tightens an existing looser scope file to 0600', () => {
+    fs.writeFileSync(file, '{}', { mode: 0o644 });
+    fs.chmodSync(file, 0o644);
+    savePersistedModelScope(file, ['claude-fable-5']);
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  });
+
   it('persists an empty list as [] — a real "compress nothing" choice, NOT null', () => {
     savePersistedModelScope(file, []);
     // The load-bearing distinction of Variant A: [] is a persisted choice, so

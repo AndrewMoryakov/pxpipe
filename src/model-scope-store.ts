@@ -57,7 +57,10 @@ export function loadPersistedModelScope(file: string): string[] | null {
 export function savePersistedModelScope(file: string, bases: readonly string[]): void {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify({ modelBases: [...bases] }, null, 2)}\n`);
+    // `mode` applies only when the file is created; chmod also tightens a file
+    // left behind with looser permissions by an earlier version.
+    fs.writeFileSync(file, `${JSON.stringify({ modelBases: [...bases] }, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
   } catch {
     /* best-effort: persistence is a convenience, not a correctness guarantee */
   }
