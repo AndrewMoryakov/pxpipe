@@ -7,6 +7,7 @@ import { mkdir, rm, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -27,9 +28,11 @@ await mkdir(OUT, { recursive: true });
 // and invoking `node <tsc>` sidesteps both — same pattern as the smoke check
 // below, and drops the build's dependency on pnpm being the caller.
 // TS 7 no longer exports './bin/tsc', so resolve it via the bin field of the
-// (still-exported) package.json instead of a direct subpath require.
+// (still-exported) package.json instead of a direct subpath require. Resolve it
+// as a filesystem path: a `file://` URL's .pathname keeps the drive-letter slash
+// on Windows (`/C:/...`) and percent-encodes spaces, so Node cannot load it.
 const tsPkgPath = require.resolve('typescript/package.json');
-const tscBin = new URL(require('typescript/package.json').bin.tsc, `file://${tsPkgPath}`).pathname;
+const tscBin = resolve(dirname(tsPkgPath), require('typescript/package.json').bin.tsc);
 const tsc = spawnSync(process.execPath, [tscBin, '-p', 'tsconfig.json'], {
   stdio: 'inherit',
 });
