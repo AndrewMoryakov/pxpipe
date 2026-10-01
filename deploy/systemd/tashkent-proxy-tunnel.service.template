@@ -1,0 +1,33 @@
+[Unit]
+Description=SSH tunnel: expose upstream tinyproxy to pxpipe docker network
+After=network-online.target docker.service
+Wants=network-online.target
+# StartLimitIntervalSec=0 — критично. С дефолтным лимитом systemd после
+# 5 неудач за 10с уходит в failed НАВСЕГДА, и туннель не восстановится
+# после сетевой аварии без ручного вмешательства.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# ВАЖНО: адрес egress-хоста должен быть публичным или DNS-именем.
+# НЕ подставляй сюда overlay-адрес (NetBird 100.x / ZeroTier): такие адреса
+# меняются при переподключении, и unit уходит в "No route to host" навсегда.
+ExecStart=/usr/bin/ssh -N -L @EGRESS_BIND_ADDR@:@EGRESS_PROXY_PORT@:127.0.0.1:@EGRESS_PROXY_PORT@ \
+  -o ExitOnForwardFailure=yes \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o TCPKeepAlive=yes \
+  -o ConnectTimeout=15 \
+  -i @EGRESS_SSH_KEY@ @EGRESS_SSH_USER@@@EGRESS_SSH_HOST@
+Restart=always
+# Возрастающая пауза: 15с -> ... -> 300с. Без RestartMaxDelaySec частые
+# реконнекты выглядят для fail2ban на той стороне как брутфорс и получают бан.
+RestartSec=15
+RestartSteps=5
+RestartMaxDelaySec=300
+User=root
+
+[Install]
+WantedBy=multi-user.target

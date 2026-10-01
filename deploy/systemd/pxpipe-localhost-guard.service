@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore raw/PREROUTING guards for localhost-bound services
+# Before=docker.service — правила должны стоять ДО того, как docker-proxy
+# начнёт публиковать порты, иначе есть окно, когда loopback-сервисы
+# доступны снаружи.
+After=network-pre.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pxpipe-localhost-guard.sh
+
+[Install]
+WantedBy=multi-user.target

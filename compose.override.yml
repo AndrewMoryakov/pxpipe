@@ -1,0 +1,14 @@
+# Deploy-local override (untracked; survives `git reset --hard origin/master`).
+#
+# Egress через TashkentServ: IP Франкфурта заблокирован Cloudflare (403) для
+# api.anthropic.com и chatgpt.com. Весь исходящий трафик pxpipe идёт в tinyproxy
+# в Узбекистане через SSH-туннель (unit: tashkent-proxy-tunnel.service).
+# 172.30.250.1 = gateway docker-сети pxpipe-local = host-сторона туннеля.
+# NODE_USE_ENV_PROXY=1 обязателен: Node 24 (undici) иначе игнорирует HTTPS_PROXY.
+services:
+  pxpipe:
+    environment:
+      - NODE_USE_ENV_PROXY=1
+      - HTTPS_PROXY=http://172.30.250.1:3128
+      - HTTP_PROXY=http://172.30.250.1:3128
+      - NO_PROXY=localhost,127.0.0.1,172.30.250.0/24
