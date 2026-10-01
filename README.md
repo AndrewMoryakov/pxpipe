@@ -75,16 +75,31 @@ port matches only that port:
 pxpipe warp --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821' -- codex
 ```
 
-### Windows launcher and health check
+### Launchers and health check
 
-This fork includes `pxpipe-run.cmd` for launching pxpipe on Windows. After it
-starts, verify the local instance and routing with:
+This fork includes `pxpipe-run.cmd` (Windows) and `pxpipe-run.sh`
+(Linux/macOS). Both rebuild `dist/` from the current source before starting,
+so a pull or merge never leaves an old build running; a failed build stops the
+launch. Run `pnpm install` first after a pull that changes dependencies. After
+it starts, verify the local instance and routing with:
 
 ```powershell
 pwsh -File scripts/pxpipe-healthcheck.ps1
 ```
 
+```bash
+./scripts/pxpipe-healthcheck.sh
+```
+
 The endpoint reports `200` when healthy; a `503` includes a routing diagnosis.
+
+### Branches in this fork
+
+- `main` — verified work: upstream merged in plus confirmed fork changes.
+- `dev` — features that still need verification. New or unconfirmed work is
+  merged here first; it moves to `main` once it has tests and has been run
+  for real.
+- Feature branches are merged into `dev`, never straight into `main`.
 For how dashboard savings, cache tiers, and Codex rollout records are measured,
 see [the measurement and calibration audit](docs/MEASUREMENT_AUDIT.md).
 
